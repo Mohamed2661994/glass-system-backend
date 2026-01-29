@@ -3807,7 +3807,8 @@ io.on("connection", (socket) => {
   });
 });
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server + Socket running on port ${PORT}`);
 });
