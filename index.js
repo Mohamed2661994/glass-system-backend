@@ -399,10 +399,7 @@ VALUES
     for (const item of items) {
       const itemTotal =
         item.price * item.quantity - (item.discount || 0) * item.quantity;
-      const packageText =
-        invoice_type === "wholesale"
-          ? item.wholesale_package
-          : item.retail_package;
+      const packageText = item.package || "";
 
       // إضافة item للفاتورة
       await client.query(
