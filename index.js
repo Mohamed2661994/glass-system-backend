@@ -262,7 +262,12 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       apply_items_discount = false,
       manual_discount = 0,
     } = req.body;
-
+    // ✅ نخليه جملة فقط
+    if (invoice_type !== "wholesale") {
+      return res.status(400).json({
+        error: "هذا المسار مخصص لفواتير الجملة فقط",
+      });
+    }
     if (
       !branch_id ||
       !invoice_type ||
