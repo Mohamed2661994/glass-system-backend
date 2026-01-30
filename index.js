@@ -995,6 +995,38 @@ WHERE id = $12
   }
 });
 
+// 📦 فواتير جملة
+app.get("/invoices/wholesale", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM invoices
+      WHERE invoice_type = 'wholesale'
+      ORDER BY created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 🛒 فواتير قطاعي
+app.get("/invoices/retail", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM invoices
+      WHERE invoice_type = 'retail'
+      ORDER BY created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.get("/invoices/:id/edit", async (req, res) => {
   const { id } = req.params;
 
