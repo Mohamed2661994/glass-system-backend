@@ -3856,18 +3856,33 @@ app.set("io", io);
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  socket.on("register_user", ({ user_id, branch_id }) => {
-    // 🧹 يخرج من كل الرومات القديمة
-    for (const room of socket.rooms) {
-      if (room !== socket.id) {
-        socket.leave(room);
+  socket.on("register_user", async ({ user_id }) => {
+    try {
+      // 🧠 هات الفرع الحقيقي من الداتابيز
+      const result = await pool.query(
+        "SELECT branch_id FROM users WHERE id = $1",
+        [user_id],
+      );
+
+      const branch_id = result.rows[0]?.branch_id;
+
+      if (!branch_id) {
+        console.log(`User ${user_id} has no branch_id`);
+        return;
       }
+
+      // 🧹 يخرج من أي رومات قديمة
+      for (const room of socket.rooms) {
+        if (room !== socket.id) socket.leave(room);
+      }
+
+      // ✅ يدخل روم الفرع الصح
+      socket.join(`branch_${branch_id}`);
+
+      console.log(`User ${user_id} joined ONLY branch_${branch_id}`);
+    } catch (err) {
+      console.error("Socket register error:", err);
     }
-
-    // ✅ يدخل روم الفرع الصحيح فقط
-    socket.join(`branch_${branch_id}`);
-
-    console.log(`User ${user_id} joined ONLY branch_${branch_id}`);
   });
 
   socket.on("disconnect", () => {
