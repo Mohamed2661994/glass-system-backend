@@ -3735,21 +3735,47 @@ app.post("/system/factory-reset", async (req, res) => {
 
 const bcrypt = require("bcrypt");
 
-app.post("/users", async (req, res) => {
+app.post("/users", authMiddleware, async (req, res) => {
   try {
     const { username, password, branch_id } = req.body;
 
-    const hashedPassword = await bcrypt.hash(password, 10); // 🔐 تشفير
+    if (!username || !password || !branch_id) {
+      return res.status(400).json({ error: "بيانات ناقصة" });
+    }
+
+    const branchIdNum = Number(branch_id);
+    if (isNaN(branchIdNum) || branchIdNum <= 0) {
+      return res.status(400).json({ error: "branch_id غير صالح" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
 
     await pool.query(
       "INSERT INTO users (username, password, branch_id) VALUES ($1,$2,$3)",
-      [username, hashedPassword, branch_id],
+      [username, hashedPassword, branchIdNum],
     );
 
     res.json({ success: true });
   } catch (err) {
-    console.error(err);
+    console.error("CREATE USER ERROR:", err);
+
+    if (err.code === "23505") {
+      return res.status(400).json({ error: "اسم المستخدم مستخدم بالفعل" });
+    }
+
     res.status(500).json({ error: "User creation error" });
+  }
+});
+
+app.get("/users", authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, username, branch_id FROM users ORDER BY id DESC",
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET USERS ERROR:", err);
+    res.status(500).json({ error: "فشل تحميل المستخدمين" });
   }
 });
 
@@ -3798,6 +3824,7 @@ app.post("/login", async (req, res) => {
     res.status(500).json({ error: "Login error" });
   }
 });
+
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
 
