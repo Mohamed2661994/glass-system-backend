@@ -2451,11 +2451,12 @@ app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
   }
 });
 
-app.post("/cash/in/from-invoice", async (req, res) => {
+app.post("/cash/in/from-invoice", authMiddleware, async (req, res) => {
   const client = await pool.connect();
 
   try {
     const { invoice_id } = req.body;
+    const userBranchId = req.user.branch_id; // ✅ لازم السطر ده
 
     if (!invoice_id) {
       return res.status(400).json({ error: "invoice_id مطلوب" });
@@ -2486,6 +2487,11 @@ WHERE id = $1
     }
 
     const invoice = invoiceRes.rows[0];
+    // 🔐 منع ترحيل فاتورة من فرع آخر
+    if (invoice.branch_id !== userBranchId) {
+      throw new Error("غير مسموح بترحيل فاتورة من فرع آخر");
+    }
+
     if (invoice.movement_type !== "sale") {
       await client.query("COMMIT");
       return res.json({
@@ -2510,8 +2516,9 @@ WHERE id = $1
       transaction_date = CURRENT_DATE
     WHERE invoice_id = $2
       AND source_type = 'invoice'
+      AND branch_id = $3
     `,
-        [totalWithPrevious, invoice.id],
+        [totalWithPrevious, invoice.id, userBranchId],
       );
 
       await client.query("COMMIT");
@@ -2528,8 +2535,9 @@ WHERE id = $1
 FROM cash_in
 WHERE invoice_id = $1
   AND source_type = 'invoice'
+  AND branch_id = $2
       `,
-      [invoice_id],
+      [invoice_id, userBranchId],
     );
 
     const description = `تحصيل فاتورة بيع رقم ${invoice.id} `;
@@ -2548,9 +2556,16 @@ WHERE invoice_id = $1
     transaction_date = CURRENT_DATE,
     customer_name = $3
   WHERE invoice_id = $4
-    AND source_type = 'invoice';
+    AND source_type = 'invoice'
+    AND branch_id = $5
   `,
-        [invoice.paid_amount, remainingCash, invoice.customer_name, invoice.id],
+        [
+          invoice.paid_amount,
+          remainingCash,
+          invoice.customer_name,
+          invoice.id,
+          userBranchId,
+        ],
       );
 
       message = "تم تحديث اليومية بنجاح";
@@ -2575,7 +2590,7 @@ WHERE invoice_id = $1
   ($1,$2,$3,$4,$5,$6,$7,$8,'invoice',CURRENT_DATE)
   `,
         [
-          invoice.branch_id,
+          userBranchId,
           invoice.id,
           invoice.customer_id || null,
           invoice.customer_name,
@@ -2604,13 +2619,13 @@ WHERE invoice_id = $1
   }
 });
 
-app.post("/cash/in", async (req, res) => {
+app.post("/cash/in", authMiddleware, async (req, res) => {
   const client = await pool.connect();
 
   try {
     console.log("CASH IN BODY:", req.body);
+    const branch_id = req.user.branch_id; // 🔐
     const {
-      branch_id,
       transaction_date,
       customer_name,
       description,
@@ -2681,19 +2696,11 @@ app.post("/cash/in", async (req, res) => {
   }
 });
 
-app.get("/cash-in", async (req, res) => {
-  const { branch_id } = req.query;
-
+app.get("/cash-in", authMiddleware, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    let whereClause = "";
-    let values = [];
-
-    if (branch_id) {
-      whereClause = "WHERE branch_id = $1";
-      values.push(branch_id);
-    }
+    const branch_id = req.user.branch_id; // 🔐 من التوكن
 
     const result = await client.query(
       `
@@ -2710,10 +2717,10 @@ app.get("/cash-in", async (req, res) => {
         invoice_id,
         created_at
       FROM cash_in
-      ${whereClause}
+       WHERE branch_id = $1
       ORDER BY transaction_date DESC, id DESC
       `,
-      values,
+      [branch_id],
     );
 
     res.json({
@@ -2729,23 +2736,27 @@ app.get("/cash-in", async (req, res) => {
     client.release();
   }
 });
-app.delete("/cash-in/:id", async (req, res) => {
+app.delete("/cash-in/:id", authMiddleware, async (req, res) => {
   const { id } = req.params;
+  const branch_id = req.user.branch_id;
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
     const checkRes = await client.query(
-      `SELECT id FROM cash_in WHERE id = $1`,
-      [id],
+      `SELECT id FROM cash_in WHERE id = $1 AND branch_id = $2`,
+      [id, branch_id],
     );
 
     if (!checkRes.rows.length) {
       return res.status(404).json({ error: "القيد غير موجود" });
     }
 
-    await client.query(`DELETE FROM cash_in WHERE id = $1`, [id]);
+    await client.query(`DELETE FROM cash_in WHERE id = $1 AND branch_id = $2`, [
+      id,
+      branch_id,
+    ]);
 
     await client.query("COMMIT");
 
@@ -2762,10 +2773,10 @@ app.delete("/cash-in/:id", async (req, res) => {
   }
 });
 
-app.put("/cash-in/:id", async (req, res) => {
+app.put("/cash-in/:id", authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { customer_name, description, amount, transaction_date } = req.body;
-
+  const branch_id = req.user.branch_id;
   const client = await pool.connect();
 
   try {
@@ -2775,13 +2786,13 @@ app.put("/cash-in/:id", async (req, res) => {
       `
       SELECT id, source_type
       FROM cash_in
-      WHERE id = $1
+      WHERE id = $1 AND branch_id = $2
       `,
-      [id],
+      [id, branch_id],
     );
 
     if (!checkRes.rows.length) {
-      return res.status(404).json({ error: "القيد غير موجود" });
+      return res.status(403).json({ error: "غير مسموح بالتعديل" });
     }
 
     if (checkRes.rows[0].source_type !== "manual") {
@@ -2797,14 +2808,15 @@ app.put("/cash-in/:id", async (req, res) => {
         amount = $3,
         paid_amount = $3,
         transaction_date = $4::date
-      WHERE id = $5
+      WHERE id = $5 AND branch_id = $6
       `,
       [
         customer_name,
         description,
         Number(amount),
-        transaction_date, // 👈 STRING YYYY-MM-DD
+        transaction_date,
         id,
+        branch_id,
       ],
     );
 
@@ -2823,8 +2835,9 @@ app.put("/cash-in/:id", async (req, res) => {
   }
 });
 
-app.get("/cash-in/:id", async (req, res) => {
+app.get("/cash-in/:id", authMiddleware, async (req, res) => {
   const { id } = req.params;
+  const branch_id = req.user.branch_id;
   const client = await pool.connect();
 
   try {
@@ -2843,9 +2856,9 @@ app.get("/cash-in/:id", async (req, res) => {
         invoice_id,
         created_at
       FROM cash_in
-      WHERE id = $1
+      WHERE id = $1 AND branch_id = $2
       `,
-      [id],
+      [id, branch_id],
     );
 
     if (!result.rows.length) {
