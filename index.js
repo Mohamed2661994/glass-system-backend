@@ -2540,7 +2540,7 @@ WHERE invoice_id = $1
       [invoice_id, userBranchId],
     );
 
-    const description = `تحصيل فاتورة بيع رقم ${invoice.id} `;
+    const description = "فاتورة";
 
     let message = "";
 
