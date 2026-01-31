@@ -2711,7 +2711,7 @@ app.get("/cash-in", authMiddleware, async (req, res) => {
         amount,
         paid_amount,
         remaining_amount,
-        description,
+        COALESCE(notes, description) AS notes,
         to_char(transaction_date, 'YYYY-MM-DD') AS transaction_date,
         source_type,
         invoice_id,
