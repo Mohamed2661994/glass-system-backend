@@ -2240,15 +2240,16 @@ app.post("/stock/replace", async (req, res) => {
 /* ===============================
    💸 CASH OUT - إضافة إذن صرف
 ================================ */
-app.post("/cash/out", async (req, res) => {
+app.post("/cash/out", authMiddleware, async (req, res) => {
   try {
-    const { branch_id, name, amount, notes, date, entry_type } = req.body;
+    const branch_id = req.user.branch_id; // ✅ من التوكن
+    const { name, amount, notes, date, entry_type } = req.body;
     const safeEntryType =
       entry_type === "purchase" || entry_type === "expense"
         ? entry_type
         : "expense";
 
-    if (!branch_id || !name || !amount || !date) {
+    if (!name || !amount || !date) {
       return res.status(400).json({ error: "بيانات ناقصة" });
     }
 
@@ -2298,8 +2299,9 @@ app.post("/cash/out", async (req, res) => {
 /* ===============================
    ✏️ CASH OUT - تعديل إذن صرف
 ================================ */
-app.put("/cash/out/:id", async (req, res) => {
+app.put("/cash/out/:id", authMiddleware, async (req, res) => {
   try {
+    const branch_id = req.user.branch_id;
     const { id } = req.params;
     const { name, amount, notes, date, entry_type } = req.body;
     const safeEntryType =
@@ -2310,22 +2312,15 @@ app.put("/cash/out/:id", async (req, res) => {
     const result = await pool.query(
       `
       UPDATE cash_out
-      SET
-        name = $1,
-        amount = $2,
-        notes = $3,
-        transaction_date = $4,
-        entry_type = $5
-      WHERE id = $6
+      SET name=$1, amount=$2, notes=$3, transaction_date=$4, entry_type=$5
+      WHERE id=$6 AND branch_id=$7
       RETURNING *
       `,
-      [name, Number(amount), notes || null, date, safeEntryType, id],
+      [name, Number(amount), notes || null, date, safeEntryType, id, branch_id],
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        error: "إذن الصرف غير موجود",
-      });
+    if (!result.rows.length) {
+      return res.status(403).json({ error: "غير مسموح بالتعديل" });
     }
 
     res.json({
@@ -2344,18 +2339,19 @@ app.put("/cash/out/:id", async (req, res) => {
 /* ===============================
    📄 CASH OUT - عرض المنصرف
 ================================ */
-app.get("/cash/out", async (req, res) => {
+app.get("/cash/out", authMiddleware, async (req, res) => {
   try {
-    const { branch_id, from_date, to_date, limit = 50, offset = 0 } = req.query;
+    const { from_date, to_date, limit = 50, offset = 0 } = req.query;
+    const branch_id = req.user.branch_id; // ✅ الفرع من التوكن
 
-    let conditions = [];
-    let values = [];
-    let idx = 1;
+    let conditions = [`branch_id = $1`];
+    let values = [branch_id];
+    let idx = 2;
 
-    if (branch_id) {
-      conditions.push(`branch_id = $${idx++}`);
-      values.push(branch_id);
-    }
+    //if (branch_id) {
+    //conditions.push(`branch_id = $${idx++}`);
+    //values.push(branch_id);
+    // }
 
     if (from_date) {
       conditions.push(`transaction_date >= $${idx++}`);
@@ -2367,8 +2363,8 @@ app.get("/cash/out", async (req, res) => {
       values.push(to_date);
     }
 
-    const whereClause =
-      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    //const whereClause =
+    //conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const result = await pool.query(
       `
@@ -2382,10 +2378,8 @@ app.get("/cash/out", async (req, res) => {
         created_at,
          entry_type
       FROM cash_out
-      ${whereClause}
+      WHERE ${conditions.join(" AND ")}
       ORDER BY transaction_date DESC, created_at DESC, id DESC
-
-
       LIMIT $${idx++} OFFSET $${idx++}
       `,
       [...values, limit, offset],
@@ -2404,9 +2398,10 @@ app.get("/cash/out", async (req, res) => {
 /* ===============================
    🔎 CASH OUT - جلب منصرف واحد
 ================================ */
-app.get("/cash/out/:id", async (req, res) => {
+app.get("/cash/out/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
+    const branch_id = req.user.branch_id;
 
     const result = await pool.query(
       `
@@ -2419,15 +2414,13 @@ app.get("/cash/out/:id", async (req, res) => {
         to_char(transaction_date, 'YYYY-MM-DD') AS transaction_date,
         entry_type
       FROM cash_out
-      WHERE id = $1
+      WHERE id = $1 AND branch_id = $2
       `,
-      [id],
+      [id, branch_id],
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({
-        error: "إذن الصرف غير موجود",
-      });
+      return res.status(404).json({ error: "غير موجود أو غير مصرح" });
     }
 
     res.json(result.rows[0]);
@@ -2437,11 +2430,19 @@ app.get("/cash/out/:id", async (req, res) => {
   }
 });
 
-app.delete("/cash/out/:id", async (req, res) => {
+app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
   try {
+    const branch_id = req.user.branch_id;
     const { id } = req.params;
 
-    await pool.query("DELETE FROM cash_out WHERE id = $1", [id]);
+    const result = await pool.query(
+      `DELETE FROM cash_out WHERE id=$1 AND branch_id=$2 RETURNING id`,
+      [id, branch_id],
+    );
+
+    if (!result.rowCount) {
+      return res.status(403).json({ error: "غير مسموح بالحذف" });
+    }
 
     res.json({ success: true });
   } catch (err) {
