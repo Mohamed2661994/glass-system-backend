@@ -3715,7 +3715,6 @@ app.get("/system/tables", authMiddleware, async (req, res) => {
   res.json([
     { key: "cash_in", label: "وارد" },
     { key: "cash_out", label: "منصرف" },
-    { key: "daily_cash", label: "الخزنة اليومية" },
     { key: "invoice_items", label: "عناصر الفواتير" },
     { key: "invoices", label: "الفواتير" },
     { key: "stock", label: "المخزون" },
@@ -3733,10 +3732,10 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "لم يتم تحديد جداول" });
   }
 
+  // ✅ الجداول المسموح بمسحها فقط
   const allowedTables = [
     "cash_in",
     "cash_out",
-    "daily_cash",
     "invoice_items",
     "invoices",
     "stock",
@@ -3745,44 +3744,64 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
     "stock_transfers",
   ];
 
+  // ✅ فلترة الجداول القادمة من الفرونت
+  const safeTables = tables.filter((t) => allowedTables.includes(t));
+
+  if (safeTables.length === 0) {
+    return res.status(400).json({ error: "لا توجد جداول صالحة للمسح" });
+  }
+
   try {
     await client.query("BEGIN");
 
     // 🧹 الفواتير
-    if (tables.includes("invoice_items"))
+    if (safeTables.includes("invoice_items")) {
       await client.query("DELETE FROM invoice_items");
+    }
 
-    if (tables.includes("invoices")) await client.query("DELETE FROM invoices");
+    if (safeTables.includes("invoices")) {
+      await client.query("DELETE FROM invoices");
+    }
 
     // 🧹 التحويلات
-    if (tables.includes("stock_transfer_items"))
+    if (safeTables.includes("stock_transfer_items")) {
       await client.query("DELETE FROM stock_transfer_items");
+    }
 
-    if (tables.includes("stock_transfers"))
+    if (safeTables.includes("stock_transfers")) {
       await client.query("DELETE FROM stock_transfers");
+    }
 
     // 🧹 المخزون
-    if (tables.includes("stock_movements"))
+    if (safeTables.includes("stock_movements")) {
       await client.query("DELETE FROM stock_movements");
+    }
 
-    if (tables.includes("stock"))
+    if (safeTables.includes("stock")) {
+      // نصفر الكميات بدل ما نحذف السجلات
       await client.query("UPDATE stock SET quantity = 0");
+    }
 
     // 🧹 الخزنة
-    if (tables.includes("cash_in")) await client.query("DELETE FROM cash_in");
+    if (safeTables.includes("cash_in")) {
+      await client.query("DELETE FROM cash_in");
+    }
 
-    if (tables.includes("cash_out")) await client.query("DELETE FROM cash_out");
-
-    if (tables.includes("daily_cash"))
-      await client.query("DELETE FROM daily_cash");
+    if (safeTables.includes("cash_out")) {
+      await client.query("DELETE FROM cash_out");
+    }
 
     await client.query("COMMIT");
 
-    res.json({ success: true, message: "تم مسح البيانات المحددة بنجاح" });
+    res.json({
+      success: true,
+      message: "تم مسح البيانات المحددة بنجاح",
+      cleared_tables: safeTables, // 👈 مفيد للفرونت
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("FACTORY RESET ERROR:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "فشل تنفيذ عملية المسح" });
   } finally {
     client.release();
   }
