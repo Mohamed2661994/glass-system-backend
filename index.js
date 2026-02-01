@@ -3839,30 +3839,22 @@ const fs = require("fs");
 app.post("/system/backup", authMiddleware, async (req, res) => {
   try {
     const backupDir = path.join(__dirname, "backups");
-
-    // لو فولدر النسخ مش موجود يتعمل تلقائي
-    if (!fs.existsSync(backupDir)) {
-      fs.mkdirSync(backupDir);
-    }
+    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir);
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const backupFile = `backup-${timestamp}.sql`;
     const backupPath = path.join(backupDir, backupFile);
 
-    const cmd = `pg_dump -U ${process.env.DB_USER} -h ${process.env.DB_HOST} -p ${process.env.DB_PORT} ${process.env.DB_NAME} > "${backupPath}"`;
+    const cmd = `pg_dump "${process.env.DATABASE_URL}?sslmode=require" -f "${backupPath}"`;
 
-    exec(
-      cmd,
-      { env: { ...process.env, PGPASSWORD: process.env.DB_PASSWORD } },
-      (error) => {
-        if (error) {
-          console.error("BACKUP ERROR:", error);
-          return res.status(500).json({ error: "فشل إنشاء النسخة الاحتياطية" });
-        }
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        console.error("BACKUP ERROR:", stderr);
+        return res.status(500).json({ error: "فشل إنشاء النسخة الاحتياطية" });
+      }
 
-        res.json({ success: true, file: backupFile });
-      },
-    );
+      res.json({ success: true, file: backupFile });
+    });
   } catch (err) {
     console.error("BACKUP CATCH ERROR:", err);
     res.status(500).json({ error: "Backup failed" });
