@@ -3712,17 +3712,17 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
 });
 
 app.get("/system/tables", authMiddleware, async (req, res) => {
-  try {
-    res.json([
-      { key: "invoices", label: "الفواتير" },
-      { key: "stock", label: "المخزون" },
-      { key: "transfers", label: "تحويلات المخزون" },
-      { key: "cash", label: "حركات الخزنة" },
-      { key: "customers", label: "العملاء" },
-    ]);
-  } catch (err) {
-    res.status(500).json({ error: "فشل تحميل الجداول" });
-  }
+  res.json([
+    { key: "cash_in", label: "سندات قبض" },
+    { key: "cash_out", label: "سندات صرف" },
+    { key: "daily_cash", label: "الخزنة اليومية" },
+    { key: "invoice_items", label: "عناصر الفواتير" },
+    { key: "invoices", label: "الفواتير" },
+    { key: "stock", label: "المخزون" },
+    { key: "stock_movements", label: "حركات المخزون" },
+    { key: "stock_transfer_items", label: "عناصر التحويلات" },
+    { key: "stock_transfers", label: "تحويلات المخزون" },
+  ]);
 });
 
 app.post("/system/factory-reset", authMiddleware, async (req, res) => {
@@ -3733,47 +3733,36 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "لم يتم تحديد جداول" });
   }
 
+  const allowedTables = [
+    "cash_in",
+    "cash_out",
+    "daily_cash",
+    "invoice_items",
+    "invoices",
+    "stock",
+    "stock_movements",
+    "stock_transfer_items",
+    "stock_transfers",
+  ];
+
   try {
     await client.query("BEGIN");
 
     for (const table of tables) {
-      switch (table) {
-        case "invoices":
-          await client.query("DELETE FROM invoice_items");
-          await client.query("DELETE FROM invoices");
-          break;
+      if (!allowedTables.includes(table)) {
+        throw new Error(`جدول غير مسموح: ${table}`);
+      }
 
-        case "stock":
-          await client.query("DELETE FROM stock_movements");
-          await client.query("UPDATE stock SET quantity = 0");
-          break;
-
-        case "transfers":
-          await client.query("DELETE FROM stock_transfer_items");
-          await client.query("DELETE FROM stock_transfers");
-          break;
-
-        case "cash":
-          await client.query("DELETE FROM cash_in");
-          await client.query("DELETE FROM cash_out");
-          break;
-
-        case "customers":
-          await client.query("DELETE FROM customer_phones");
-          await client.query("DELETE FROM customers");
-          break;
-
-        default:
-          throw new Error(`جدول غير مسموح: ${table}`);
+      if (table === "stock") {
+        await client.query("UPDATE stock SET quantity = 0");
+      } else {
+        await client.query(`DELETE FROM ${table}`);
       }
     }
 
     await client.query("COMMIT");
 
-    res.json({
-      success: true,
-      message: "تم مسح البيانات المحددة بنجاح",
-    });
+    res.json({ success: true, message: "تم مسح البيانات المحددة بنجاح" });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("FACTORY RESET ERROR:", err);
