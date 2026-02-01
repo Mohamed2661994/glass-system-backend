@@ -3952,6 +3952,17 @@ app.post("/system/restore", authMiddleware, (req, res) => {
   );
 });
 
+app.get("/fix-admin", async (req, res) => {
+  const bcrypt = require("bcrypt");
+  const hash = await bcrypt.hash("123456", 10);
+
+  await pool.query("UPDATE users SET password = $1 WHERE username = 'admin'", [
+    hash,
+  ]);
+
+  res.send("admin password fixed");
+});
+
 /* =========================
    ⬇️ DOWNLOAD BACKUP
 ========================= */
