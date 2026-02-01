@@ -3817,6 +3817,27 @@ app.post("/users", authMiddleware, async (req, res) => {
   }
 });
 
+app.put("/users/theme", authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+  const { theme } = req.body;
+
+  if (!["light", "dark", "system"].includes(theme)) {
+    return res.status(400).json({ error: "قيمة ثيم غير صالحة" });
+  }
+
+  try {
+    await pool.query("UPDATE users SET theme = $1 WHERE id = $2", [
+      theme,
+      userId,
+    ]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("SAVE THEME ERROR:", err);
+    res.status(500).json({ error: "فشل حفظ الثيم" });
+  }
+});
+
 app.get("/users", authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
@@ -3981,6 +4002,7 @@ app.post("/login", async (req, res) => {
         id: user.id,
         username: user.username,
         branch_id: user.branch_id,
+        theme: user.theme,
       },
     });
   } catch (err) {
