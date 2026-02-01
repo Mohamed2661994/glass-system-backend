@@ -3748,17 +3748,33 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    for (const table of tables) {
-      if (!allowedTables.includes(table)) {
-        throw new Error(`جدول غير مسموح: ${table}`);
-      }
+    // 🧹 الفواتير
+    if (tables.includes("invoice_items"))
+      await client.query("DELETE FROM invoice_items");
 
-      if (table === "stock") {
-        await client.query("UPDATE stock SET quantity = 0");
-      } else {
-        await client.query(`DELETE FROM ${table}`);
-      }
-    }
+    if (tables.includes("invoices")) await client.query("DELETE FROM invoices");
+
+    // 🧹 التحويلات
+    if (tables.includes("stock_transfer_items"))
+      await client.query("DELETE FROM stock_transfer_items");
+
+    if (tables.includes("stock_transfers"))
+      await client.query("DELETE FROM stock_transfers");
+
+    // 🧹 المخزون
+    if (tables.includes("stock_movements"))
+      await client.query("DELETE FROM stock_movements");
+
+    if (tables.includes("stock"))
+      await client.query("UPDATE stock SET quantity = 0");
+
+    // 🧹 الخزنة
+    if (tables.includes("cash_in")) await client.query("DELETE FROM cash_in");
+
+    if (tables.includes("cash_out")) await client.query("DELETE FROM cash_out");
+
+    if (tables.includes("daily_cash"))
+      await client.query("DELETE FROM daily_cash");
 
     await client.query("COMMIT");
 
