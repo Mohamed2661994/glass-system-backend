@@ -3713,8 +3713,8 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
 
 app.get("/system/tables", authMiddleware, async (req, res) => {
   res.json([
-    { key: "cash_in", label: "سندات قبض" },
-    { key: "cash_out", label: "سندات صرف" },
+    { key: "cash_in", label: "وارد" },
+    { key: "cash_out", label: "منصرف" },
     { key: "daily_cash", label: "الخزنة اليومية" },
     { key: "invoice_items", label: "عناصر الفواتير" },
     { key: "invoices", label: "الفواتير" },
