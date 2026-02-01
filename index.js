@@ -3711,37 +3711,73 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
   }
 });
 
-app.post("/system/factory-reset", async (req, res) => {
+app.get("/system/tables", authMiddleware, async (req, res) => {
+  try {
+    res.json([
+      { key: "invoices", label: "الفواتير" },
+      { key: "stock", label: "المخزون" },
+      { key: "transfers", label: "تحويلات المخزون" },
+      { key: "cash", label: "حركات الخزنة" },
+      { key: "customers", label: "العملاء" },
+    ]);
+  } catch (err) {
+    res.status(500).json({ error: "فشل تحميل الجداول" });
+  }
+});
+
+app.post("/system/factory-reset", authMiddleware, async (req, res) => {
   const client = await pool.connect();
+  const { tables } = req.body;
+
+  if (!Array.isArray(tables) || tables.length === 0) {
+    return res.status(400).json({ error: "لم يتم تحديد جداول" });
+  }
 
   try {
     await client.query("BEGIN");
 
-    // 🧾 فواتير
-    await client.query("DELETE FROM invoice_items");
-    await client.query("DELETE FROM invoices");
+    for (const table of tables) {
+      switch (table) {
+        case "invoices":
+          await client.query("DELETE FROM invoice_items");
+          await client.query("DELETE FROM invoices");
+          break;
 
-    // 🏭 مخزون
-    await client.query("DELETE FROM stock_movements");
-    await client.query("DELETE FROM stock_transfer_items");
-    await client.query("DELETE FROM stock_transfers");
-    await client.query("UPDATE stock SET quantity = 0");
+        case "stock":
+          await client.query("DELETE FROM stock_movements");
+          await client.query("UPDATE stock SET quantity = 0");
+          break;
+
+        case "transfers":
+          await client.query("DELETE FROM stock_transfer_items");
+          await client.query("DELETE FROM stock_transfers");
+          break;
+
+        case "cash":
+          await client.query("DELETE FROM cash_in");
+          await client.query("DELETE FROM cash_out");
+          break;
+
+        case "customers":
+          await client.query("DELETE FROM customer_phones");
+          await client.query("DELETE FROM customers");
+          break;
+
+        default:
+          throw new Error(`جدول غير مسموح: ${table}`);
+      }
+    }
 
     await client.query("COMMIT");
 
     res.json({
       success: true,
-      message: "تمت إعادة ضبط المصنع بنجاح (تم الاحتفاظ بالأصناف)",
+      message: "تم مسح البيانات المحددة بنجاح",
     });
   } catch (err) {
     await client.query("ROLLBACK");
-
     console.error("FACTORY RESET ERROR:", err);
-
-    res.status(500).json({
-      success: false,
-      error: "فشل إعادة ضبط المصنع",
-    });
+    res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -3791,6 +3827,128 @@ app.get("/users", authMiddleware, async (req, res) => {
     console.error("GET USERS ERROR:", err);
     res.status(500).json({ error: "فشل تحميل المستخدمين" });
   }
+});
+
+const { exec } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+
+/* =========================
+   📦 CREATE BACKUP
+========================= */
+app.post("/system/backup", authMiddleware, async (req, res) => {
+  try {
+    const backupDir = path.join(__dirname, "backups");
+
+    // لو فولدر النسخ مش موجود يتعمل تلقائي
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir);
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupFile = `backup-${timestamp}.sql`;
+    const backupPath = path.join(backupDir, backupFile);
+
+    const cmd = `pg_dump -U ${process.env.DB_USER} -h ${process.env.DB_HOST} -p ${process.env.DB_PORT} ${process.env.DB_NAME} > "${backupPath}"`;
+
+    exec(
+      cmd,
+      { env: { ...process.env, PGPASSWORD: process.env.DB_PASSWORD } },
+      (error) => {
+        if (error) {
+          console.error("BACKUP ERROR:", error);
+          return res.status(500).json({ error: "فشل إنشاء النسخة الاحتياطية" });
+        }
+
+        res.json({ success: true, file: backupFile });
+      },
+    );
+  } catch (err) {
+    console.error("BACKUP CATCH ERROR:", err);
+    res.status(500).json({ error: "Backup failed" });
+  }
+});
+
+/* =========================
+   📂 LIST BACKUPS
+========================= */
+app.get("/system/backups", authMiddleware, (req, res) => {
+  try {
+    const backupDir = path.join(__dirname, "backups");
+
+    if (!fs.existsSync(backupDir)) {
+      return res.json([]);
+    }
+
+    const files = fs
+      .readdirSync(backupDir)
+      .filter((f) => f.endsWith(".sql"))
+      .sort(
+        (a, b) =>
+          fs.statSync(path.join(backupDir, b)).mtimeMs -
+          fs.statSync(path.join(backupDir, a)).mtimeMs,
+      );
+
+    res.json(files);
+  } catch (err) {
+    console.error("LIST BACKUPS ERROR:", err);
+    res.status(500).json({ error: "فشل تحميل النسخ الاحتياطية" });
+  }
+});
+
+/* =========================
+   ♻️ RESTORE BACKUP
+========================= */
+app.post("/system/restore", authMiddleware, (req, res) => {
+  const { file } = req.body;
+
+  if (!file) return res.status(400).json({ error: "اسم الملف مطلوب" });
+
+  const backupDir = path.join(__dirname, "backups");
+
+  // حماية من path traversal
+  const safeFile = path.basename(file);
+  const backupPath = path.join(backupDir, safeFile);
+
+  if (!fs.existsSync(backupPath)) {
+    return res.status(404).json({ error: "الملف غير موجود" });
+  }
+
+  // يمسح الداتا القديمة ويرجع الاستعادة نظيفة
+  const cmd = `
+  psql -U ${process.env.DB_USER} -h ${process.env.DB_HOST} -p ${process.env.DB_PORT} -d ${process.env.DB_NAME} -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" &&
+  psql -U ${process.env.DB_USER} -h ${process.env.DB_HOST} -p ${process.env.DB_PORT} ${process.env.DB_NAME} < "${backupPath}"
+  `;
+
+  exec(
+    cmd,
+    { env: { ...process.env, PGPASSWORD: process.env.DB_PASSWORD } },
+    (error) => {
+      if (error) {
+        console.error("RESTORE ERROR:", error);
+        return res.status(500).json({ error: "فشل استعادة النسخة" });
+      }
+
+      res.json({ success: true });
+    },
+  );
+});
+
+/* =========================
+   ⬇️ DOWNLOAD BACKUP
+========================= */
+app.get("/system/backup/download/:file", authMiddleware, (req, res) => {
+  const backupDir = path.join(__dirname, "backups");
+
+  // حماية من path traversal
+  const safeFile = path.basename(req.params.file);
+  const filePath = path.join(backupDir, safeFile);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "الملف غير موجود" });
+  }
+
+  res.download(filePath);
 });
 
 const jwt = require("jsonwebtoken");
