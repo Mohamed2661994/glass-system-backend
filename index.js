@@ -480,19 +480,31 @@ VALUES
 
     if (invoice_type === "wholesale" && branch_id === SHOWROOM_BRANCH_ID) {
       const title = "فاتورة جملة جديدة";
-      const message = `تم إنشاء فاتورة جملة رقم #${invoiceId} من فرع المعرض`;
 
+      const message = `تم إنشاء فاتورة جملة رقم #${invoiceId} للعميل ${customer_name || "عميل نقدي"}`;
+
+      // 🗃️ تخزين في الداتابيز
       await client.query(
-        `INSERT INTO notifications (title, message, from_user_id, to_branch_id)
-     VALUES ($1, $2, $3, $4)`,
-        [title, message, req.user.id, MAIN_WAREHOUSE_ID],
+        `INSERT INTO notifications 
+     (title, message, from_user_id, to_branch_id, type, reference_id)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          title,
+          message,
+          req.user.id,
+          MAIN_WAREHOUSE_ID,
+          "invoice_wholesale", // نوع الإشعار
+          invoiceId, // رقم الفاتورة
+        ],
       );
 
-      // 🚀 إرسال الإشعار لحظيًا
+      // 🚀 إرسال لحظي
       const io = req.app.get("io");
       io.to(`branch_${MAIN_WAREHOUSE_ID}`).emit("new_notification", {
         title,
         message,
+        type: "invoice_wholesale",
+        reference_id: invoiceId,
       });
     }
 
