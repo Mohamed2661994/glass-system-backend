@@ -2706,17 +2706,17 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
         notes
       )
       VALUES
-        (
-    $1,
-    $2::date,
-    $7,
-    $3,
-    $4,
-    $5,
-    $5,
-    0,
-    $6
-  )
+   (
+  $1,
+  $2::date,
+  $7,
+  $3,
+  $4,
+  $5::numeric,
+  $5::numeric,
+  0::numeric,
+  $6
+)
       RETURNING id
       `,
       [
