@@ -1544,7 +1544,7 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
   try {
     const customerId = req.params.id;
     const { invoice_type } = req.query;
-    const branch_id = req.user.branch_id; // 🔐 من التوكن
+    const branch_id = req.user.branch_id;
 
     if (!invoice_type) {
       return res.status(400).json({ error: "invoice_type مطلوب" });
@@ -1552,17 +1552,20 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT COALESCE(SUM(remaining_amount), 0) AS balance
+      SELECT remaining_amount
       FROM invoices
       WHERE customer_id = $1
         AND branch_id = $2
         AND invoice_type = $3
-        AND payment_status != 'paid'
+      ORDER BY created_at DESC
+      LIMIT 1
       `,
       [customerId, branch_id, invoice_type],
     );
 
-    res.json({ balance: Number(result.rows[0].balance) });
+    res.json({
+      balance: result.rows.length ? Number(result.rows[0].remaining_amount) : 0,
+    });
   } catch (err) {
     console.error("GET CUSTOMER BALANCE ERROR:", err);
     res.status(500).json({ error: "Server error" });
