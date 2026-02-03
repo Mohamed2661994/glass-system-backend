@@ -2690,6 +2690,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     }
 
     await client.query("BEGIN");
+    const safeDate = transaction_date ? new Date(transaction_date) : new Date();
 
     const result = await client.query(
       `
@@ -2708,7 +2709,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       VALUES
    (
   $1,
-  $2::date,
+  $2,
   $7,
   $3,
   $4,
@@ -2721,7 +2722,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       `,
       [
         branch_id,
-        transaction_date || new Date().toISOString().slice(0, 10), // 👈 STRING YYYY-MM-DD
+        safeDate,
         customer_name || "وارد يدوي",
         description || "",
         Number(amount),
