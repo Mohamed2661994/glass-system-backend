@@ -313,51 +313,6 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       throw new Error("تم منع إنشاء فاتورة مكررة");
     }
 
-    /* ================== إنشاء الفاتورة ================== */
-    const invoiceRes = await client.query(
-      `
-     INSERT INTO invoices (
-  branch_id,
-  invoice_type,
-  movement_type,
-  invoice_date,
-  customer_name,
-  customer_phone,
-  previous_balance,
-  subtotal,
-  manual_discount,
-  discount_total,
-  total,
-  paid_amount,
-  remaining_amount,
-  payment_status,
-  apply_items_discount
-)
-VALUES
-($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-      RETURNING id
-      `,
-      [
-        branch_id,
-        invoice_type,
-        movement_type,
-        invoice_date || new Date(),
-        customer_name,
-        customer_phone,
-        Number(previous_balance) || 0,
-        subtotal,
-        extra_discount,
-        discount_total,
-        total,
-        paid_amount,
-        remaining_amount,
-        payment_status,
-        apply_items_discount,
-      ],
-    );
-
-    const invoiceId = invoiceRes.rows[0].id;
-    // ✅ تسجيل العميل تلقائي لو فيه رقم
     let customerId = null;
 
     if (customer_name) {
@@ -392,6 +347,54 @@ VALUES
         );
       }
     }
+
+    /* ================== إنشاء الفاتورة ================== */
+    const invoiceRes = await client.query(
+      `
+     INSERT INTO invoices (
+  branch_id,
+  invoice_type,
+  movement_type,
+  invoice_date,
+  customer_id,
+  customer_name,
+  customer_phone,
+  previous_balance,
+  subtotal,
+  manual_discount,
+  discount_total,
+  total,
+  paid_amount,
+  remaining_amount,
+  payment_status,
+  apply_items_discount
+)
+VALUES
+($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      RETURNING id
+      `,
+      [
+        branch_id,
+        invoice_type,
+        movement_type,
+        invoice_date || new Date(),
+        customerId,
+        customer_name,
+        customer_phone,
+        Number(previous_balance) || 0,
+        subtotal,
+        extra_discount,
+        discount_total,
+        total,
+        paid_amount,
+        remaining_amount,
+        payment_status,
+        apply_items_discount,
+      ],
+    );
+
+    const invoiceId = invoiceRes.rows[0].id;
+    // ✅ تسجيل العميل تلقائي لو فيه رقم
 
     /* ================== المخزن ================== */
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
@@ -569,50 +572,6 @@ app.post("/invoices/retail", async (req, res) => {
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
-    /* ================== إنشاء الفاتورة ================== */
-    const invoiceRes = await client.query(
-      `
-      INSERT INTO invoices (
-        branch_id,
-        invoice_type,
-        movement_type,
-        invoice_date,
-        customer_name,
-        customer_phone,
-        previous_balance,
-        subtotal,
-        manual_discount,  
-        discount_total,
-        total,
-        paid_amount,
-        remaining_amount,
-        payment_status,
-        apply_items_discount
-      )
-      VALUES
-      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      RETURNING id
-      `,
-      [
-        branch_id,
-        movement_type,
-        invoice_date || new Date(),
-        customer_name,
-        customer_phone,
-        Number(previous_balance) || 0,
-        Number(total_before_discount),
-        Number(extra_discount || 0), // ✅ manual_discount
-        Number(items_discount) + Number(extra_discount),
-        Number(final_total),
-        Number(paid_amount),
-        remaining_amount,
-        payment_status,
-        apply_items_discount,
-      ],
-    );
-
-    const invoiceId = invoiceRes.rows[0].id;
-    // ✅ تسجيل العميل تلقائي لو فيه رقم
     let customerId = null;
 
     if (customer_name) {
@@ -642,6 +601,52 @@ app.post("/invoices/retail", async (req, res) => {
         );
       }
     }
+    /* ================== إنشاء الفاتورة ================== */
+    const invoiceRes = await client.query(
+      `
+      INSERT INTO invoices (
+        branch_id,
+        invoice_type,
+        movement_type,
+        invoice_date,
+        customer_id,
+        customer_name,
+        customer_phone,
+        previous_balance,
+        subtotal,
+        manual_discount,  
+        discount_total,
+        total,
+        paid_amount,
+        remaining_amount,
+        payment_status,
+        apply_items_discount
+      )
+      VALUES
+      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      RETURNING id
+      `,
+      [
+        branch_id,
+        movement_type,
+        invoice_date || new Date(),
+        customerId,
+        customer_name,
+        customer_phone,
+        Number(previous_balance) || 0,
+        Number(total_before_discount),
+        Number(extra_discount || 0), // ✅ manual_discount
+        Number(items_discount) + Number(extra_discount),
+        Number(final_total),
+        Number(paid_amount),
+        remaining_amount,
+        payment_status,
+        apply_items_discount,
+      ],
+    );
+
+    const invoiceId = invoiceRes.rows[0].id;
+    // ✅ تسجيل العميل تلقائي لو فيه رقم
 
     const warehouseId = getWarehouseIdByInvoiceType("retail");
 
@@ -1532,6 +1537,35 @@ app.get("/customers/:id/last-balance", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
+  try {
+    const customerId = req.params.id;
+    const { invoice_type } = req.query;
+    const branch_id = req.user.branch_id; // 🔐 من التوكن
+
+    if (!invoice_type) {
+      return res.status(400).json({ error: "invoice_type مطلوب" });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT COALESCE(SUM(remaining_amount), 0) AS balance
+      FROM invoices
+      WHERE customer_id = $1
+        AND branch_id = $2
+        AND invoice_type = $3
+        AND payment_status != 'paid'
+      `,
+      [customerId, branch_id, invoice_type],
+    );
+
+    res.json({ balance: Number(result.rows[0].balance) });
+  } catch (err) {
+    console.error("GET CUSTOMER BALANCE ERROR:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
