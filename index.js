@@ -2708,8 +2708,8 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       VALUES
         (
     $1,
-    COALESCE($2::date, CURRENT_DATE),
-    COALESCE($7, 'manual'),
+    $2::date,
+    $7,
     $3,
     $4,
     $5,
@@ -2721,7 +2721,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       `,
       [
         branch_id,
-        transaction_date || null, // 👈 STRING YYYY-MM-DD
+        transaction_date || new Date().toISOString().slice(0, 10), // 👈 STRING YYYY-MM-DD
         customer_name || "وارد يدوي",
         description || "",
         Number(amount),
