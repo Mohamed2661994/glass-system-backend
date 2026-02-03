@@ -2692,42 +2692,25 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     await client.query("BEGIN");
     const safeDate = transaction_date ? new Date(transaction_date) : new Date();
 
+    const numericAmount = Number(amount);
+
     const result = await client.query(
-      `
-      INSERT INTO cash_in
-      (
-        branch_id,
-        transaction_date,
-        source_type,
-        customer_name,
-        description,
-        amount,
-        paid_amount,
-        remaining_amount,
-        notes
-      )
-      VALUES
-   (
-  $1,
-  $2,
-  $7,
-  $3,
-  $4,
-  $5::numeric,
-  $5::numeric,
-  0::numeric,
-  $6
-)
-      RETURNING id
-      `,
+      `INSERT INTO cash_in
+   (branch_id, transaction_date, source_type, customer_name, description,
+    amount, paid_amount, remaining_amount, notes)
+   VALUES ($1::int,$2::date,$3::text,$4::text,$5::text,
+           $6::numeric,$7::numeric,$8::numeric,$9::text)
+   RETURNING id`,
       [
-        branch_id,
-        safeDate,
-        customer_name || "وارد يدوي",
-        description || "",
-        Number(amount),
-        notes || null,
-        source_type || "manual",
+        branch_id, // $1
+        safeDate, // $2
+        source_type || "manual", // $3
+        customer_name || "وارد يدوي", // $4
+        description || "", // $5
+        numericAmount, // $6
+        numericAmount, // $7
+        0, // $8
+        notes || null, // $9
       ],
     );
 
