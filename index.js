@@ -2730,6 +2730,51 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       ],
     );
 
+    // ✅ خصم سند الدفع من آخر مديونية للعميل (نظام الرصيد المرحّل)
+    if (source_type === "customer_payment" && customer_name) {
+      let paymentAmount = Number(amount);
+
+      const lastInvoiceRes = await client.query(
+        `
+    SELECT id, remaining_amount, paid_amount
+    FROM invoices
+    WHERE customer_name = $1
+      AND branch_id = $2
+      AND remaining_amount > 0
+    ORDER BY created_at DESC
+    LIMIT 1
+    `,
+        [customer_name, branch_id],
+      );
+
+      if (lastInvoiceRes.rows.length) {
+        const invoice = lastInvoiceRes.rows[0];
+
+        const newRemaining = Math.max(
+          0,
+          Number(invoice.remaining_amount) - paymentAmount,
+        );
+
+        const newPaid = Number(invoice.paid_amount) + paymentAmount;
+
+        await client.query(
+          `
+      UPDATE invoices
+      SET
+        paid_amount = $1,
+        remaining_amount = $2,
+        payment_status =
+          CASE
+            WHEN $2 <= 0 THEN 'paid'
+            ELSE 'partial'
+          END
+      WHERE id = $3
+      `,
+          [newPaid, newRemaining, invoice.id],
+        );
+      }
+    }
+
     await client.query("COMMIT");
 
     res.json({
