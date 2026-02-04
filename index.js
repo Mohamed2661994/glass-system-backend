@@ -674,7 +674,7 @@ app.post("/invoices/retail", async (req, res) => {
           invoiceId,
           item.product_id,
           item.product_name,
-          item.retail_package,
+          item.package || "",
           item.price,
           item.quantity,
           item.discount || 0,
