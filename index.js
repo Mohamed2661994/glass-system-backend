@@ -2706,11 +2706,21 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     notes
   )
   VALUES
-  ($1::int, $2::date, $3::text, $4::text, $5::text, $6::numeric, $7::numeric, 0::numeric, $8::text)
+  (
+    $1::integer,
+    $2::date,
+    $3::varchar,
+    $4::varchar,
+    $5::text,
+    $6::numeric,
+    $7::numeric,
+    0::numeric,
+    $8::text
+  )
   RETURNING id
   `,
       [
-        branch_id, // 1
+        Number(branch_id), // 1
         transaction_date || new Date().toISOString().slice(0, 10), // 2
         source_type || "manual", // 3
         customer_name || "وارد يدوي", // 4
