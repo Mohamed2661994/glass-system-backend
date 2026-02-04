@@ -2693,7 +2693,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     const safeDate = transaction_date ? new Date(transaction_date) : new Date();
 
     const numericAmount = Number(amount);
-    console.log("RUN QUERY:", queryText);
+    const zeroNumeric = 0.0; // 👈 مهم
 
     const result = await client.query(
       `INSERT INTO cash_in
@@ -2703,17 +2703,18 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
            $6::numeric,$7::numeric,$8::numeric,$9::text)
    RETURNING id`,
       [
-        branch_id, // $1
-        safeDate, // $2
-        source_type || "manual", // $3
-        customer_name || "وارد يدوي", // $4
-        description || "", // $5
+        Number(branch_id), // $1
+        safeDate.toISOString().split("T")[0], // $2
+        source_type || "manual",
+        customer_name || "وارد يدوي",
+        description || "",
         numericAmount, // $6
         numericAmount, // $7
-        0, // $8
-        notes || null, // $9
+        zeroNumeric, // $8 ✅ numeric مش integer
+        notes || null,
       ],
     );
+
     console.log("PARAMS:", params);
 
     // ✅ خصم سند الدفع من آخر مديونية للعميل (نظام الرصيد المرحّل)
