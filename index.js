@@ -1703,9 +1703,6 @@ app.delete("/invoices/:id", async (req, res) => {
       }
     }
 
-    // 🧹 نظافة
-    await client.query(`DELETE FROM stock WHERE quantity <= 0`);
-
     // 3️⃣ مسح الحركات
     await client.query(`DELETE FROM stock_movements WHERE invoice_id = $1`, [
       invoiceId,
