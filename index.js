@@ -2690,32 +2690,45 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     }
 
     await client.query("BEGIN");
-    const safeDate = transaction_date ? new Date(transaction_date) : new Date();
-
-    const numericAmount = Number(amount);
-    const zeroNumeric = 0.0; // 👈 مهم
 
     const result = await client.query(
-      `INSERT INTO cash_in
-   (branch_id, transaction_date, source_type, customer_name, description,
-    amount, paid_amount, remaining_amount, notes)
-   VALUES ($1::int,$2::date,$3::text,$4::text,$5::text,
-           $6::numeric,$7::numeric,$8::numeric,$9::text)
-   RETURNING id`,
+      `
+      INSERT INTO cash_in
+      (
+        branch_id,
+        transaction_date,
+        source_type,
+        customer_name,
+        description,
+        amount,
+        paid_amount,
+        remaining_amount,
+        notes
+      )
+      VALUES
+        (
+    $1,
+    $2::date,
+    $7,
+    $3,
+    $4,
+    $5,
+    $5,
+    0,
+    $6
+  )
+      RETURNING id
+      `,
       [
-        Number(branch_id), // $1
-        safeDate.toISOString().split("T")[0], // $2
-        source_type || "manual",
+        branch_id,
+        transaction_date || new Date().toISOString().slice(0, 10), // 👈 STRING YYYY-MM-DD
         customer_name || "وارد يدوي",
         description || "",
-        numericAmount, // $6
-        numericAmount, // $7
-        zeroNumeric, // $8 ✅ numeric مش integer
+        Number(amount),
         notes || null,
+        source_type || "manual",
       ],
     );
-
-    console.log("PARAMS:", params);
 
     // ✅ خصم سند الدفع من آخر مديونية للعميل (نظام الرصيد المرحّل)
     if (source_type === "customer_payment" && customer_name) {
