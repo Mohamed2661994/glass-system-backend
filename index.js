@@ -2760,17 +2760,17 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
 
         await client.query(
           `
-      UPDATE invoices
-      SET
-        paid_amount = $1,
-        remaining_amount = $2,
-        payment_status =
-          CASE
-            WHEN $2 <= 0 THEN 'paid'
-            ELSE 'partial'
-          END
-      WHERE id = $3
-      `,
+  UPDATE invoices
+  SET
+    paid_amount = $1::numeric,
+    remaining_amount = $2::numeric,
+    payment_status =
+      CASE
+        WHEN $2::numeric <= 0 THEN 'paid'
+        ELSE 'partial'
+      END
+  WHERE id = $3::integer
+  `,
           [newPaid, newRemaining, invoice.id],
         );
       }
