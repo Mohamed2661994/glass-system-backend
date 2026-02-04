@@ -1503,7 +1503,20 @@ app.get("/invoices/:id/print", async (req, res) => {
   const invoice = invoiceRes.rows[0];
 
   const itemsRes = await pool.query(
-    `SELECT * FROM invoice_items WHERE invoice_id = $1`,
+    `
+  SELECT
+    ii.product_id,
+    ii.product_name,
+    ii.package,
+    ii.price,
+    ii.quantity,
+    ii.discount,
+    ii.total,
+    p.manufacturer
+  FROM invoice_items ii
+  LEFT JOIN products p ON p.id = ii.product_id
+  WHERE ii.invoice_id = $1
+  `,
     [id],
   );
 
