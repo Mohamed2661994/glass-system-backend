@@ -1,6 +1,10 @@
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
+const { exec } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+const PDFDocument = require("pdfkit");
 const pool = require("./db");
 const {
   convertWholesaleToRetail,
@@ -1502,9 +1506,6 @@ WHERE id = $12
   }
 });
 
-const path = require("path");
-const PDFDocument = require("pdfkit");
-
 app.get("/invoices/:id/pdf", async (req, res) => {
   const invoiceId = req.params.id;
 
@@ -1539,8 +1540,13 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
     doc.pipe(res);
 
-    const fontPath = path.join(process.cwd(), "fonts", "Cairo-Regular.ttf");
-    doc.font(fontPath);
+    const fontPath = path.join(__dirname, "fonts", "Cairo-Regular.ttf");
+
+    if (fs.existsSync(fontPath)) {
+      doc.font(fontPath);
+    } else {
+      console.error("FONT NOT FOUND:", fontPath);
+    }
 
     doc.fontSize(14).text("فاتورة", { align: "center" }).moveDown();
 
@@ -1555,10 +1561,10 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     doc.moveDown();
 
     doc.fontSize(9);
-    doc.text("م", 420);
-    doc.text("الصنف", 260);
-    doc.text("الكمية", 170);
-    doc.text("السعر", 110);
+    doc.text("م", 360);
+    doc.text("الصنف", 220);
+    doc.text("الكمية", 150);
+    doc.text("السعر", 100);
     doc.text("الإجمالي", 50);
 
     doc.moveDown(0.5);
@@ -1575,10 +1581,10 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
       const total = Number(it.price) * Number(it.quantity);
 
-      doc.text(index++, 420, y);
-      doc.text(it.product_name, 260, y, { width: 150 });
-      doc.text(it.quantity, 170, y);
-      doc.text(it.price, 110, y);
+      doc.text(index++, 360, y);
+      doc.text(it.product_name, 220, y, { width: 120 });
+      doc.text(it.quantity, 150, y);
+      doc.text(it.price, 100, y);
       doc.text(total, 50, y);
 
       y += 18;
@@ -4104,10 +4110,6 @@ app.get("/users", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "فشل تحميل المستخدمين" });
   }
 });
-
-const { exec } = require("child_process");
-const path = require("path");
-const fs = require("fs");
 
 /* =========================
    📦 CREATE BACKUP
