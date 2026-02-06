@@ -1244,25 +1244,40 @@ app.put("/invoices/:id", async (req, res) => {
     /* =========================================
        1️⃣ رجّع المخزن (الأصناف القديمة)
     ========================================= */
-    const oldItemsRes = await client.query(
+    const movementsRes = await client.query(
       `
-      SELECT product_id, quantity
-      FROM invoice_items
-      WHERE invoice_id = $1
-      `,
+  SELECT product_id, quantity, movement_type
+  FROM stock_movements
+  WHERE invoice_id = $1
+  FOR UPDATE
+`,
       [invoiceId],
     );
 
-    for (const item of oldItemsRes.rows) {
-      await client.query(
-        `
-        UPDATE stock
-        SET quantity = quantity + $1
-        WHERE warehouse_id = $2
-          AND product_id = $3
-        `,
-        [item.quantity, warehouseId, item.product_id],
-      );
+    for (const m of movementsRes.rows) {
+      if (m.movement_type === "purchase" || m.movement_type === "transfer_in") {
+        // كان فيه زيادة → نعكسها بخصم
+        await client.query(
+          `
+      UPDATE stock
+      SET quantity = quantity - $1
+      WHERE warehouse_id = $2 AND product_id = $3
+    `,
+          [m.quantity, warehouseId, m.product_id],
+        );
+      }
+
+      if (m.movement_type === "sale" || m.movement_type === "transfer_out") {
+        // كان فيه خصم → نعكسه بإضافة
+        await client.query(
+          `
+      UPDATE stock
+      SET quantity = quantity + $1
+      WHERE warehouse_id = $2 AND product_id = $3
+    `,
+          [m.quantity, warehouseId, m.product_id],
+        );
+      }
     }
 
     /* ================================
