@@ -1502,10 +1502,8 @@ WHERE id = $12
   }
 });
 
-const puppeteer = require("puppeteer");
-
-import path from "path";
-import PDFDocument from "pdfkit";
+const path = require("path");
+const PDFDocument = require("pdfkit");
 
 app.get("/invoices/:id/pdf", async (req, res) => {
   const invoiceId = req.params.id;
@@ -1528,7 +1526,6 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     const invoice = invoiceRes.rows[0];
     const items = itemsRes.rows;
 
-    // ===== إنشاء PDF =====
     const doc = new PDFDocument({
       size: "A5",
       margin: 30,
@@ -1542,12 +1539,10 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
     doc.pipe(res);
 
-    // ===== فونت عربي (لازم) =====
     const fontPath = path.join(process.cwd(), "fonts", "Cairo-Regular.ttf");
     doc.font(fontPath);
 
-    // ===== Header =====
-    doc.fontSize(14).text("فاتورة", { align: "center" }).moveDown(0.5);
+    doc.fontSize(14).text("فاتورة", { align: "center" }).moveDown();
 
     doc.fontSize(10);
     doc.text(`رقم الفاتورة: ${invoice.id}`, { align: "right" });
@@ -1559,20 +1554,16 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
     doc.moveDown();
 
-    // ===== Table Header =====
-    const startY = doc.y;
     doc.fontSize(9);
-
-    doc.text("م", 420, startY, { align: "right" });
-    doc.text("الصنف", 260, startY, { align: "right" });
-    doc.text("الكمية", 170, startY, { align: "right" });
-    doc.text("السعر", 110, startY, { align: "right" });
-    doc.text("الإجمالي", 50, startY, { align: "right" });
+    doc.text("م", 420);
+    doc.text("الصنف", 260);
+    doc.text("الكمية", 170);
+    doc.text("السعر", 110);
+    doc.text("الإجمالي", 50);
 
     doc.moveDown(0.5);
     doc.moveTo(30, doc.y).lineTo(390, doc.y).stroke();
 
-    // ===== Items =====
     let y = doc.y + 4;
     let index = 1;
 
@@ -1584,23 +1575,20 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
       const total = Number(it.price) * Number(it.quantity);
 
-      doc.text(index++, 420, y, { align: "right" });
-      doc.text(it.product_name, 260, y, { align: "right", width: 150 });
-      doc.text(it.quantity, 170, y, { align: "right" });
-      doc.text(it.price, 110, y, { align: "right" });
-      doc.text(total, 50, y, { align: "right" });
+      doc.text(index++, 420, y);
+      doc.text(it.product_name, 260, y, { width: 150 });
+      doc.text(it.quantity, 170, y);
+      doc.text(it.price, 110, y);
+      doc.text(total, 50, y);
 
       y += 18;
     }
 
-    // ===== Footer =====
     doc.moveDown();
     doc.moveTo(30, doc.y).lineTo(390, doc.y).stroke();
 
     doc.fontSize(11);
-    doc.text(`الإجمالي: ${invoice.total_amount}`, {
-      align: "right",
-    });
+    doc.text(`الإجمالي: ${invoice.total}`, { align: "right" });
 
     doc.end();
   } catch (err) {
