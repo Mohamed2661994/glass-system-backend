@@ -5,6 +5,8 @@ const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const PDFDocument = require("pdfkit");
+const arabicReshaper = require("arabic-reshaper");
+const bidi = require("bidi-js");
 
 const pool = require("./db");
 const {
@@ -51,6 +53,11 @@ function getWarehouseIdByInvoiceType(invoice_type) {
   }
   if (invoice_type === "transfer") return null; // 👈 مهم
   throw new Error("invoice_type غير معروف");
+}
+
+function arabic(text = "") {
+  const reshaped = arabicReshaper.reshape(text);
+  return bidi.from_string(reshaped).toString();
 }
 
 async function getWholesaleWarehouseByBranch(branch_id, client = pool) {
@@ -1633,11 +1640,11 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     doc.text("السعر", COL_PRICE, y, { width: 40, align: "center" });
     doc.text("الكمية", COL_QTY, y, { width: 35, align: "center" });
     doc.text("العبوة", COL_PACK, y, { width: 45, align: "center" });
-    doc.text("الصنف", COL_NAME, y, {
+    doc.text(arabic("الصنف"), COL_NAME, y, {
       width: 190,
       align: "right",
-      lineBreak: false,
     });
+
     doc.text("م", COL_INDEX, y, { width: 20, align: "center" });
 
     doc
@@ -1685,10 +1692,9 @@ app.get("/invoices/:id/pdf", async (req, res) => {
         align: "center",
       });
 
-      doc.text(productName, COL_NAME, y, {
+      doc.text(arabic(productName), COL_NAME, y, {
         width: 190,
         align: "right",
-        lineBreak: false,
       });
 
       doc.text(index++, COL_INDEX, y, {
