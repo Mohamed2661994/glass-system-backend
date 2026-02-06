@@ -2988,14 +2988,21 @@ app.get("/cash-in/:id", authMiddleware, async (req, res) => {
 
 app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
   try {
-    const { branch_id, items } = req.body;
+    const { from_branch_id, to_branch_id, items } = req.body;
 
-    if (!branch_id || !items || !Array.isArray(items) || items.length === 0) {
+    if (
+      !from_branch_id ||
+      !to_branch_id ||
+      !items ||
+      !Array.isArray(items) ||
+      items.length === 0
+    ) {
       return res.status(400).json({ error: "بيانات ناقصة" });
     }
 
-    // 👇 مخزن الجملة للفرع
-    const wholesaleWarehouseId = await getWholesaleWarehouseByBranch(branch_id);
+    // ✅ مخزن الجملة (المصدر)
+    const wholesaleWarehouseId =
+      await getWholesaleWarehouseByBranch(from_branch_id);
 
     const previewResults = [];
 
@@ -3011,14 +3018,10 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
         continue;
       }
 
-      // 1️⃣ هات بيانات الصنف
+      // 1️⃣ بيانات الصنف
       const productRes = await pool.query(
         `
-        SELECT
-          id,
-          name,
-          wholesale_package,
-          retail_package
+        SELECT id, name, wholesale_package, retail_package
         FROM products
         WHERE id = $1 AND is_active = true
         `,
@@ -3036,7 +3039,7 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
 
       const product = productRes.rows[0];
 
-      // 2️⃣ هات رصيد الجملة
+      // 2️⃣ رصيد مخزن الجملة فقط
       const stockRes = await pool.query(
         `
         SELECT quantity
@@ -3047,7 +3050,7 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
       );
 
       const availableQuantity = stockRes.rows.length
-        ? stockRes.rows[0].quantity
+        ? Number(stockRes.rows[0].quantity)
         : 0;
 
       if (availableQuantity < quantity) {
@@ -3060,7 +3063,7 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
         continue;
       }
 
-      // 3️⃣ شغّل التحويل
+      // 3️⃣ التحويل
       try {
         const result = convertWholesaleToRetail({
           wholesale_package: product.wholesale_package,
@@ -3071,8 +3074,8 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
         previewResults.push({
           product_id,
           product_name: product.name,
-          from: `${quantity} ${product.wholesale_package}`,
-          to: `${result.retail_quantity} ${product.retail_package}`,
+          from_quantity: quantity,
+          to_quantity: result.retail_quantity,
           status: "ok",
         });
       } catch (err) {
@@ -3096,38 +3099,46 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { branch_id, items, note, created_by } = req.body;
+    const { from_branch_id, to_branch_id, items, note, created_by } = req.body;
 
-    if (!branch_id || !Array.isArray(items) || items.length === 0) {
+    if (
+      !from_branch_id ||
+      !to_branch_id ||
+      !Array.isArray(items) ||
+      items.length === 0
+    ) {
       return res.status(400).json({ error: "بيانات ناقصة" });
     }
 
     await client.query("BEGIN");
 
-    // 1️⃣ مخزن الجملة
+    // ✅ مخزن الجملة (المصدر)
     const wholesaleWarehouseId = await getWholesaleWarehouseByBranch(
-      branch_id,
+      from_branch_id,
       client,
     );
 
-    // 2️⃣ مخزن القطاعي (ثابت عندك)
-    const retailWarehouseId = 1;
+    // ✅ مخزن القطاعي (الوجهة)
+    const retailWarehouseId = await getWholesaleWarehouseByBranch(
+      to_branch_id,
+      client,
+    );
 
-    // 3️⃣ إنشاء رأس عملية التحويل
+    // 1️⃣ إنشاء رأس التحويل
     const transferRes = await client.query(
       `
       INSERT INTO stock_transfers (branch_id, created_by, note)
       VALUES ($1, $2, $3)
       RETURNING id
       `,
-      [branch_id, created_by || null, note || null],
+      [from_branch_id, created_by || null, note || null],
     );
 
     const transferId = transferRes.rows[0].id;
 
     const resultItems = [];
 
-    // 4️⃣ تنفيذ التحويل
+    // 2️⃣ تنفيذ العناصر
     for (const item of items) {
       const product_id = Number(item.product_id);
       const quantity = Number(item.quantity);
@@ -3152,7 +3163,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
 
       const product = productRes.rows[0];
 
-      // 🔹 رصيد الجملة
+      // 🔹 رصيد الجملة (قفل الصف)
       const stockRes = await client.query(
         `
         SELECT quantity
@@ -3163,7 +3174,9 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         [wholesaleWarehouseId, product_id],
       );
 
-      const available = stockRes.rows.length ? stockRes.rows[0].quantity : 0;
+      const available = stockRes.rows.length
+        ? Number(stockRes.rows[0].quantity)
+        : 0;
 
       if (available < quantity) {
         throw new Error(`INSUFFICIENT_STOCK:${product.name}`);
@@ -3176,7 +3189,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         wholesale_quantity: quantity,
       });
 
-      // 5️⃣ خصم من الجملة
+      // 3️⃣ خصم من الجملة
       await client.query(
         `
         UPDATE stock
@@ -3186,7 +3199,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         [quantity, wholesaleWarehouseId, product_id],
       );
 
-      // 6️⃣ إضافة للقطاعي
+      // 4️⃣ إضافة للقطاعي
       await client.query(
         `
         INSERT INTO stock (warehouse_id, product_id, quantity)
@@ -3197,7 +3210,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         [retailWarehouseId, product_id, conversion.retail_quantity],
       );
 
-      // 7️⃣ تسجيل تفاصيل التحويل
+      // 5️⃣ تفاصيل التحويل
       await client.query(
         `
         INSERT INTO stock_transfer_items
@@ -3209,7 +3222,6 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
           from_quantity,
           to_quantity,
           total_price
-
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7)
         `,
@@ -3220,11 +3232,11 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
           retailWarehouseId,
           quantity,
           conversion.retail_quantity,
-          item.final_price || 0, // 👈 دي أهم سطر
+          item.final_price || 0,
         ],
       );
 
-      // 8️⃣ stock movements (خروج)
+      // 6️⃣ حركة مخزون (خروج)
       await client.query(
         `
         INSERT INTO stock_movements
@@ -3248,7 +3260,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         ],
       );
 
-      // 9️⃣ stock movements (دخول)
+      // 7️⃣ حركة مخزون (دخول)
       await client.query(
         `
         INSERT INTO stock_movements
@@ -3272,18 +3284,16 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         ],
       );
 
-      // 🔹 تجهيز response
       resultItems.push({
         product_id,
         product_name: product.name,
-        from: `${quantity} ${product.wholesale_package}`,
-        to: `${conversion.retail_quantity} ${product.retail_package}`,
+        from_quantity: quantity,
+        to_quantity: conversion.retail_quantity,
       });
     }
 
     await client.query("COMMIT");
 
-    // 🔟 نفس شكل preview عشان الفرونت
     res.json({
       success: true,
       transfer_id: transferId,
@@ -3291,7 +3301,6 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
     });
   } catch (err) {
     await client.query("ROLLBACK");
-
     console.error("EXECUTE TRANSFER ERROR:", err);
 
     res.status(400).json({
