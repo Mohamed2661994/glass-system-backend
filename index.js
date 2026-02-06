@@ -8,7 +8,7 @@ const PDFDocument = require("pdfkit");
 const arabicReshaper = require("arabic-reshaper");
 const bidiFactory = require("bidi-js");
 const bidi = bidiFactory();
-const puppeteer = require("puppeteer-core");
+const puppeteer = require("puppeteer");
 const pool = require("./db");
 const {
   convertWholesaleToRetail,
@@ -1694,8 +1694,6 @@ ${items
        4) Puppeteer → PDF
     ========================= */
     const browser = await puppeteer.launch({
-      executablePath:
-        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
       headless: "new",
     });
 
