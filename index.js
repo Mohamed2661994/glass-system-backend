@@ -4,7 +4,6 @@ require("dotenv").config();
 const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
-const bidi = bidiFactory();
 const puppeteer = require("puppeteer");
 const pool = require("./db");
 const {
@@ -51,31 +50,6 @@ function getWarehouseIdByInvoiceType(invoice_type) {
   }
   if (invoice_type === "transfer") return null; // 👈 مهم
   throw new Error("invoice_type غير معروف");
-}
-
-function arabic(text = "") {
-  try {
-    if (!text) return "";
-    const reshaped = arabicReshaper.reshape(text);
-    return bidi.getDisplayText(reshaped);
-  } catch (e) {
-    console.error("Arabic render error:", e);
-    return text; // fallback
-  }
-}
-function arabicRTL(text = "") {
-  try {
-    if (!text) return "";
-
-    // 🔁 اقلب ترتيب الكلمات (مش الحروف)
-    const words = text.split(" ").reverse().join(" ");
-
-    const reshaped = arabicReshaper.reshape(words);
-    return bidi.getDisplayText(reshaped);
-  } catch (e) {
-    console.error("Arabic RTL error:", e);
-    return text;
-  }
 }
 
 async function getWholesaleWarehouseByBranch(branch_id, client = pool) {
