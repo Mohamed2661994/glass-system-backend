@@ -1697,42 +1697,68 @@ ${items
 });
 
 app.get("/invoices/:id/print", async (req, res) => {
-  const { id } = req.params;
-  if (isNaN(Number(id))) {
-    return res.status(400).json({ error: "رقم فاتورة غير صالح" });
+  // تجيب الفاتورة + items زي ما عملت
+  res.send(`
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<title>فاتورة</title>
+<style>
+  body {
+    font-family: Cairo, Arial, sans-serif;
+    direction: rtl;
+    margin: 20px;
   }
-  const invoiceRes = await pool.query(`SELECT * FROM invoices WHERE id = $1`, [
-    id,
-  ]);
-
-  if (!invoiceRes.rows.length) {
-    return res.status(404).json({ error: "فاتورة غير موجودة" });
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th, td {
+    border-bottom: 1px solid #000;
+    padding: 6px;
+    text-align: center;
+  }
+  th.name, td.name {
+    text-align: right;
   }
 
-  const invoice = invoiceRes.rows[0];
+  @media print {
+    body {
+      margin: 0;
+    }
+  }
+</style>
+</head>
+<body>
 
-  const itemsRes = await pool.query(
-    `
-  SELECT
-    ii.product_id,
-    ii.product_name,
-    ii.package,
-    ii.price,
-    ii.quantity,
-    ii.discount,
-    ii.total,
-    p.manufacturer
-  FROM invoice_items ii
-  LEFT JOIN products p ON p.id = ii.product_id
-  WHERE ii.invoice_id = $1
-  `,
-    [id],
-  );
+<h2 style="text-align:center">فاتورة</h2>
 
-  res.json({
-    ...invoice,
-    items: itemsRes.rows,
-  });
+<table>
+<thead>
+<tr>
+  <th>م</th>
+  <th class="name">الصنف</th>
+  <th>العبوة</th>
+  <th>الكمية</th>
+  <th>السعر</th>
+  <th>الإجمالي</th>
+</tr>
+</thead>
+<tbody>
+  <!-- rows -->
+</tbody>
+</table>
+
+<script>
+  window.onload = () => {
+    window.print();
+  };
+</script>
+
+</body>
+</html>
+`);
 });
 
 app.get("/customers/:id/last-balance", async (req, res) => {
