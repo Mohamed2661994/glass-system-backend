@@ -66,6 +66,20 @@ function arabic(text = "") {
     return text; // fallback
   }
 }
+function arabicRTL(text = "") {
+  try {
+    if (!text) return "";
+
+    // 🔁 اقلب ترتيب الكلمات (مش الحروف)
+    const words = text.split(" ").reverse().join(" ");
+
+    const reshaped = arabicReshaper.reshape(words);
+    return bidi.getDisplayText(reshaped);
+  } catch (e) {
+    console.error("Arabic RTL error:", e);
+    return text;
+  }
+}
 
 async function getWholesaleWarehouseByBranch(branch_id, client = pool) {
   const res = await client.query(
@@ -1647,7 +1661,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     doc.text("السعر", COL_PRICE, y, { width: 40, align: "center" });
     doc.text("الكمية", COL_QTY, y, { width: 35, align: "center" });
     doc.text("العبوة", COL_PACK, y, { width: 45, align: "center" });
-    doc.text(arabic("الصنف"), COL_NAME, y, {
+    doc.text(arabicRTL("الصنف"), COL_NAME, y, {
       width: 190,
       align: "right",
     });
@@ -1699,7 +1713,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
         align: "center",
       });
 
-      doc.text(arabic(productName), COL_NAME, y, {
+      doc.text(arabicRTL(productName), COL_NAME, y, {
         width: 190,
         align: "right",
       });
