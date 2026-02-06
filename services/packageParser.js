@@ -13,12 +13,21 @@ function cleanText(text) {
   return text.replace(/[×*]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function isJustNumber(text) {
+  return /^\d+$/.test(text);
+}
+
 function parsePackage(text) {
   if (!text || typeof text !== "string" || !text.trim()) {
     throw new Error("PACKAGE_EMPTY");
   }
 
   const normalized = cleanText(normalizeNumbers(text));
+
+  // ❌ اسم صنف / كود فقط (زي 508 – 703)
+  if (isJustNumber(normalized)) {
+    throw new Error("PACKAGE_NOT_DEFINED");
+  }
 
   /* ==================================================
      1️⃣ طقم (وحدة مغلقة)
@@ -52,10 +61,9 @@ function parsePackage(text) {
 
   /* ==================================================
      3️⃣ وحدات تجميع (شيالة / علبة)
-     ✔️ شيالة 6
-     ✔️ شيالة 6 قطع
-     ✔️ علبة 4
-     ✔️ علبة 4 قطعة
+     شيالة 6
+     علبة 4
+     شيالة 6 قطع
   ================================================== */
   if (normalized.includes("شيالة") || normalized.includes("علبة")) {
     const match = normalized.match(/(\d+)/);
@@ -75,7 +83,6 @@ function parsePackage(text) {
 
   /* ==================================================
      4️⃣ قطعة (نهائي)
-     قطعة / قطع
   ================================================== */
   if (normalized.includes("قطعة") || normalized.includes("قطع")) {
     return {
