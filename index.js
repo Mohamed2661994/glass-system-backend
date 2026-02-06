@@ -1518,7 +1518,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
   const COL_INDEX = 385;
 
   const ROW_HEIGHT = 18; // 👈 أصغر علشان 20 صنف
-  const PAGE_END_Y = 530; // 👈 آخر الصفحة
+  const PAGE_END_Y = 500; // 👈 آخر الصفحة
 
   try {
     /* =========================
