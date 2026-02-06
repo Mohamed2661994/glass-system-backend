@@ -34,9 +34,13 @@ function convertWholesaleToRetail({
   if (wholesale.unit === "set") {
     // 🟢 طقم → طقم (مباشر)
     if (retail.unit === "set") {
+      const qty = wholesale_quantity * wholesale.count;
+
       return {
         from_quantity: wholesale_quantity,
-        to_quantity: wholesale_quantity * wholesale.count,
+        to_quantity: qty,
+        retail_quantity: qty, // ✅ مهم جدًا
+        mode: "set",
       };
     }
 
@@ -52,6 +56,8 @@ function convertWholesaleToRetail({
       return {
         from_quantity: wholesale_quantity,
         to_quantity: totalPieces,
+        retail_quantity: totalPieces, // ✅
+        mode: "set_to_piece",
       };
     }
   }
