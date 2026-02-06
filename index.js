@@ -27,6 +27,9 @@ app.use(
     credentials: true,
   }),
 );
+
+app.use("/assets", express.static(path.join(__dirname, "assets")));
+
 app.use(express.json());
 
 const reportsRoutes = require("./reports/reports.routes");
@@ -1731,97 +1734,92 @@ app.get("/invoices/:id/print", async (req, res) => {
     /* =========================
        2) الحسابات
     ========================= */
-    const calcUnitPrice = (it) =>
+    const unitPrice = (it) =>
       invoice.apply_items_discount
         ? Number(it.price) - Number(it.discount || 0)
         : Number(it.price);
 
-    const calcItemTotal = (it) => calcUnitPrice(it) * Number(it.quantity || 0);
+    const itemTotal = (it) => unitPrice(it) * Number(it.quantity);
 
-    const itemsSubtotal = items.reduce((sum, it) => sum + calcItemTotal(it), 0);
-
-    const totalQty = items.reduce(
-      (sum, it) => sum + Number(it.quantity || 0),
-      0,
-    );
+    const subtotal = items.reduce((s, it) => s + itemTotal(it), 0);
+    const totalQty = items.reduce((s, it) => s + Number(it.quantity), 0);
 
     const previousBalance = Number(invoice.previous_balance) || 0;
-    const paidAmount = Number(invoice.paid_amount) || 0;
-    const extraDiscount = Number(invoice.manual_discount) || 0;
+    const discount = Number(invoice.manual_discount) || 0;
+    const paid = Number(invoice.paid_amount) || 0;
 
-    const totalWithPrevious = itemsSubtotal + previousBalance;
-    const netTotal = totalWithPrevious - extraDiscount;
-    const remaining = netTotal - paidAmount;
+    const netTotal = subtotal + previousBalance - discount;
+    const remaining = netTotal - paid;
 
     /* =========================
        3) صفوف الجدول
     ========================= */
     const rowsHtml = items
-      .map((it, index) => {
-        const productName = [it.product_name, it.manufacturer]
+      .map((it, i) => {
+        const name = [it.product_name, it.manufacturer]
           .filter(Boolean)
           .join(" ");
 
-        const packText = it.package
+        const pack = it.package
           ? it.package.replace(/كرتونة\s*/g, "").trim()
-          : "-";
+          : "";
 
         return `
-          <tr>
-            <td>${index + 1}</td>
-            <td class="name">${productName}</td>
-            <td>${packText}</td>
-            <td>${it.quantity}</td>
-            <td>${calcUnitPrice(it).toFixed(2)}</td>
-            <td>${calcItemTotal(it).toFixed(2)}</td>
-          </tr>
-        `;
+<tr>
+  <td>${i + 1}</td>
+  <td class="name">${name}</td>
+  <td>${pack}</td>
+  <td>${it.quantity}</td>
+  <td>${unitPrice(it).toFixed(2)}</td>
+  <td>${itemTotal(it).toFixed(2)}</td>
+</tr>`;
       })
       .join("");
 
     /* =========================
-       4) HTML النهائي (نفس الشكل)
+       4) HTML (نفس التصميم)
     ========================= */
     res.send(`
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-<meta charset="UTF-8" />
+<meta charset="UTF-8">
 <title>فاتورة</title>
 
 <style>
 @page {
   size: A5;
-  margin: 12mm;
+  margin: 10mm;
 }
 
 body {
   font-family: Cairo, Arial, sans-serif;
-  direction: rtl;
+  font-size: 13px;
   margin: 0;
   color: #000;
-  font-size: 13px;
 }
 
 .header {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
 }
 
-.header img {
-  width: 80px;
+.logo img {
+  width: 70px;
 }
 
-.header .info {
+.info {
   text-align: right;
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
-h2 {
+.title {
   text-align: center;
-  margin: 5px 0 10px;
+  font-weight: bold;
+  margin: 6px 0;
 }
 
 table {
@@ -1842,20 +1840,19 @@ td.name {
 }
 
 .summary {
-  margin-top: 12px;
+  margin-top: 8px;
   border-top: 1px solid #000;
   padding-top: 6px;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .summary div {
-  margin: 3px 0;
+  margin: 2px 0;
+  text-align: right;
 }
 
 @media print {
-  body {
-    margin: 0;
-  }
+  body { margin: 0; }
 }
 </style>
 </head>
@@ -1863,7 +1860,10 @@ td.name {
 <body>
 
 <div class="header">
-  <img src="/assets/logo.png" alt="logo" />
+  <div class="logo">
+    <img src="/assets/logo.png">
+  </div>
+
   <div class="info">
     <div>رقم الفاتورة: ${invoice.id}</div>
     <div>التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
@@ -1871,7 +1871,7 @@ td.name {
   </div>
 </div>
 
-<h2>فاتورة</h2>
+<div class="title">فاتورة</div>
 
 <table>
 <thead>
@@ -1891,11 +1891,11 @@ ${rowsHtml}
 
 <div class="summary">
   <div>إجمالي الكمية: ${totalQty}</div>
-  ${itemsSubtotal ? `<div>الإجمالي: ${itemsSubtotal.toFixed(2)}</div>` : ""}
+  ${subtotal ? `<div>الإجمالي: ${subtotal.toFixed(2)}</div>` : ""}
   ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
-  ${extraDiscount ? `<div>خصم: ${extraDiscount.toFixed(2)}</div>` : ""}
+  ${discount ? `<div>خصم: ${discount.toFixed(2)}</div>` : ""}
   <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
-  ${paidAmount ? `<div>المدفوع: ${paidAmount.toFixed(2)}</div>` : ""}
+  ${paid ? `<div>المدفوع: ${paid.toFixed(2)}</div>` : ""}
   ${remaining ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>` : ""}
 </div>
 
@@ -1908,7 +1908,7 @@ ${rowsHtml}
 `);
   } catch (err) {
     console.error(err);
-    res.status(500).send("Print page failed");
+    res.status(500).send("Print failed");
   }
 });
 
