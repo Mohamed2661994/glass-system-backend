@@ -1502,6 +1502,70 @@ WHERE id = $12
   }
 });
 
+const puppeteer = require("puppeteer");
+
+app.get("/invoices/:id/pdf", async (req, res) => {
+  const invoiceId = req.params.id;
+
+  try {
+    // 1️⃣ هات بيانات الفاتورة
+    const invoiceRes = await pool.query(
+      `SELECT * FROM invoices WHERE id = $1`,
+      [invoiceId],
+    );
+
+    if (!invoiceRes.rows.length) {
+      return res.status(404).send("Invoice not found");
+    }
+
+    const itemsRes = await pool.query(
+      `SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id`,
+      [invoiceId],
+    );
+
+    const invoice = invoiceRes.rows[0];
+    const items = itemsRes.rows;
+
+    // 2️⃣ HTML الفاتورة
+    const html = buildInvoiceHtml(invoice, items);
+
+    // 3️⃣ Puppeteer
+    const browser = await puppeteer.launch({
+      headless: "new",
+    });
+
+    const page = await browser.newPage();
+
+    await page.setContent(html, {
+      waitUntil: "networkidle0",
+    });
+
+    const pdf = await page.pdf({
+      format: "A5",
+      printBackground: true,
+      margin: {
+        top: "10mm",
+        bottom: "10mm",
+        left: "10mm",
+        right: "10mm",
+      },
+    });
+
+    await browser.close();
+
+    // 4️⃣ إرسال الـ PDF
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `inline; filename=invoice-${invoiceId}.pdf`,
+    });
+
+    res.send(pdf);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("PDF generation failed");
+  }
+});
+
 app.get("/invoices/:id/print", async (req, res) => {
   const { id } = req.params;
   if (isNaN(Number(id))) {
