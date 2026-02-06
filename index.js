@@ -1788,62 +1788,109 @@ app.get("/invoices/:id/print", async (req, res) => {
 <head>
 <meta charset="UTF-8" />
 <title>فاتورة</title>
-<style>
-  body {
-    font-family: Cairo, Arial, sans-serif;
-    direction: rtl;
-    margin: 20px;
-    color: #000;
-  }
-  h2 {
-    text-align: center;
-    margin-bottom: 10px;
-  }
-  .meta {
-    margin-bottom: 10px;
-    font-size: 14px;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 14px;
-  }
-  th, td {
-    border-bottom: 1px solid #000;
-    padding: 6px;
-    text-align: center;
-    white-space: nowrap;
-  }
-  th.name, td.name {
-    text-align: right;
-  }
-  .summary {
-    margin-top: 15px;
-    font-size: 14px;
-  }
-  .summary div {
-    margin: 4px 0;
-  }
 
-  @media print {
-    body {
-      margin: 0;
-    }
+<style>
+@page {
+  size: A5;
+  margin: 10mm;
+}
+
+body {
+  font-family: Cairo, Arial, sans-serif;
+  direction: rtl;
+  margin: 0;
+  color: #000;
+  font-size: 13px;
+}
+
+/* ====== Layout ====== */
+.page {
+  column-count: 2;
+  column-gap: 20px;
+}
+
+header {
+  column-span: all;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.logo {
+  width: 80px;
+}
+
+.header-info {
+  text-align: right;
+  font-size: 13px;
+}
+
+h2 {
+  text-align: center;
+  margin: 5px 0 10px;
+  column-span: all;
+}
+
+/* ====== Table ====== */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  break-inside: avoid;
+}
+
+th, td {
+  border-bottom: 1px solid #000;
+  padding: 4px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+th.name,
+td.name {
+  text-align: right;
+}
+
+/* ====== Summary ====== */
+footer {
+  column-span: all;
+  margin-top: 15px;
+  border-top: 1px solid #000;
+  padding-top: 8px;
+  font-size: 14px;
+}
+
+footer div {
+  margin: 3px 0;
+  text-align: right;
+}
+
+strong {
+  font-weight: bold;
+}
+
+@media print {
+  body {
+    margin: 0;
   }
+}
 </style>
 </head>
+
 <body>
 
-<h2>فاتورة</h2>
+<div class="page">
 
-<div class="meta">
-  <div>رقم الفاتورة: ${invoice.id}</div>
-  <div>التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
-  <div>العميل: ${invoice.customer_name || ""}</div>
-  ${
-    invoice.customer_phone ? `<div>تليفون: ${invoice.customer_phone}</div>` : ""
-  }
-</div>
+<header>
+  <img src="/assets/logo.png" class="logo" />
+  <div class="header-info">
+    <div>رقم الفاتورة: ${invoice.id}</div>
+    <div>التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
+    <div>العميل: ${invoice.customer_name || ""}</div>
+  </div>
+</header>
+
+<h2>فاتورة</h2>
 
 <table>
 <thead>
@@ -1857,34 +1904,28 @@ app.get("/invoices/:id/print", async (req, res) => {
 </tr>
 </thead>
 <tbody>
-  ${rowsHtml}
+${rowsHtml}
 </tbody>
 </table>
 
-<div class="summary">
-  <div>إجمالي الكمية: ${totalQty}</div>
-  <div>إجمالي الأصناف: ${itemsSubtotal.toFixed(2)}</div>
-  ${
-    previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""
-  }
+<footer>
+  ${itemsSubtotal ? `<div>الإجمالي: ${itemsSubtotal.toFixed(2)}</div>` : ""}
+  ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
   ${extraDiscount ? `<div>خصم: ${extraDiscount.toFixed(2)}</div>` : ""}
   <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
   ${paidAmount ? `<div>المدفوع: ${paidAmount.toFixed(2)}</div>` : ""}
-  ${
-    remaining
-      ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>`
-      : ""
-  }
+  ${remaining ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>` : ""}
+</footer>
+
 </div>
 
 <script>
-  window.onload = () => {
-    window.print();
-  };
+  window.onload = () => window.print();
 </script>
 
 </body>
 </html>
+
 `);
   } catch (err) {
     console.error(err);
