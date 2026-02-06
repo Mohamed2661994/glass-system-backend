@@ -21,8 +21,8 @@ function parsePackage(text) {
   const normalized = cleanText(normalizeNumbers(text));
 
   /* ==================================================
-     1️⃣ كرتونة أطقم
-     كرتونة 4 طقم / كرتونة 2 طقم
+     1️⃣ طقم (وحدة مغلقة)
+     كرتونة 4 طقم / 2 طقم
   ================================================== */
   if (normalized.includes("طقم")) {
     const match = normalized.match(/(\d+)?\s*طقم/);
@@ -52,12 +52,17 @@ function parsePackage(text) {
 
   /* ==================================================
      3️⃣ وحدات تجميع (شيالة / علبة)
-     شيالة 6 قطع / علبة 4 قطعة
+     ✔️ شيالة 6
+     ✔️ شيالة 6 قطع
+     ✔️ علبة 4
+     ✔️ علبة 4 قطعة
   ================================================== */
   if (normalized.includes("شيالة") || normalized.includes("علبة")) {
-    const match = normalized.match(/(\d+)\s*(قطعة|قطع)/);
+    const match = normalized.match(/(\d+)/);
 
-    if (!match) throw new Error("INVALID_CONTAINER_FORMAT");
+    if (!match) {
+      throw new Error("INVALID_CONTAINER_FORMAT");
+    }
 
     return {
       raw: text,
@@ -70,7 +75,7 @@ function parsePackage(text) {
 
   /* ==================================================
      4️⃣ قطعة (نهائي)
-     قطعة / 1 قطعة
+     قطعة / قطع
   ================================================== */
   if (normalized.includes("قطعة") || normalized.includes("قطع")) {
     return {
