@@ -1672,7 +1672,11 @@ app.get("/invoices/:id/pdf", async (req, res) => {
         align: "center",
       });
 
-      doc.text(it.package || "-", COL_PACK, y, {
+      const packText = it.package
+        ? it.package.replace(/كرتونة\s*/g, "").trim()
+        : "-";
+
+      doc.text(packText, COL_PACK, y, {
         width: 45,
         align: "center",
       });
