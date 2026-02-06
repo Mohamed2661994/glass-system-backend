@@ -83,7 +83,14 @@ function convertWholesaleToRetail({
   if (retail.unit === "container") {
     piecesPerRetailUnit = retail.count;
   }
-
+  if (retail.unit === "piece") {
+    return {
+      from_quantity: wholesale_quantity,
+      to_quantity: totalPieces,
+      retail_quantity: totalPieces,
+      mode: "dozen_to_piece",
+    };
+  }
   const retailQuantity = totalPieces / piecesPerRetailUnit;
 
   if (!Number.isInteger(retailQuantity)) {

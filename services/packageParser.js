@@ -88,13 +88,16 @@ function parsePackage(text) {
   }
 
   /* ==================================================
-     4️⃣ قطعة (نهائي)
-  ================================================== */
+   4️⃣ قطعة (نهائي)
+   قطعة / 12 قطعة / 6 قطع
+================================================== */
   if (normalized.includes("قطعة") || normalized.includes("قطع")) {
+    const match = normalized.match(/(\d+)?\s*(قطعة|قطع)/);
+
     return {
       raw: text,
       unit: "piece",
-      count: 1,
+      count: match && match[1] ? parseInt(match[1], 10) : 1,
       analyzable: true,
     };
   }
