@@ -6,7 +6,8 @@ const path = require("path");
 const fs = require("fs");
 const PDFDocument = require("pdfkit");
 const arabicReshaper = require("arabic-reshaper");
-const bidi = require("bidi-js");
+const bidiFactory = require("bidi-js");
+const bidi = bidiFactory();
 
 const pool = require("./db");
 const {
@@ -56,8 +57,14 @@ function getWarehouseIdByInvoiceType(invoice_type) {
 }
 
 function arabic(text = "") {
-  const reshaped = arabicReshaper.reshape(text);
-  return bidi.from_string(reshaped).toString();
+  try {
+    if (!text) return "";
+    const reshaped = arabicReshaper.reshape(text);
+    return bidi.getDisplayText(reshaped);
+  } catch (e) {
+    console.error("Arabic render error:", e);
+    return text; // fallback
+  }
 }
 
 async function getWholesaleWarehouseByBranch(branch_id, client = pool) {
