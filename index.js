@@ -8,7 +8,7 @@ const PDFDocument = require("pdfkit");
 const arabicReshaper = require("arabic-reshaper");
 const bidiFactory = require("bidi-js");
 const bidi = bidiFactory();
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-core");
 const pool = require("./db");
 const {
   convertWholesaleToRetail,
@@ -1700,7 +1700,7 @@ ${items
     });
 
     const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: "networkidle0" });
+    await page.setContent(html, { waitUntil: "load" });
 
     const pdfBuffer = await page.pdf({
       format: "A5",
