@@ -1510,6 +1510,9 @@ app.get("/invoices/:id/pdf", async (req, res) => {
   const invoiceId = req.params.id;
 
   try {
+    /* =========================
+       1) جلب البيانات
+    ========================= */
     const invoiceRes = await pool.query(
       `SELECT * FROM invoices WHERE id = $1`,
       [invoiceId],
@@ -1527,6 +1530,34 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     const invoice = invoiceRes.rows[0];
     const items = itemsRes.rows;
 
+    /* =========================
+       2) الحسابات (نفس React)
+    ========================= */
+    const calcUnitPrice = (it) =>
+      invoice.apply_items_discount
+        ? Number(it.price) - Number(it.discount || 0)
+        : Number(it.price);
+
+    const calcItemTotal = (it) => calcUnitPrice(it) * Number(it.quantity || 0);
+
+    const itemsSubtotal = items.reduce((sum, it) => sum + calcItemTotal(it), 0);
+
+    const totalQty = items.reduce(
+      (sum, it) => sum + Number(it.quantity || 0),
+      0,
+    );
+
+    const previousBalance = Number(invoice.previous_balance) || 0;
+    const paidAmount = Number(invoice.paid_amount) || 0;
+    const extraDiscount = Number(invoice.manual_discount) || 0;
+
+    const totalWithPrevious = itemsSubtotal + previousBalance;
+    const netTotal = totalWithPrevious - extraDiscount;
+    const remaining = netTotal - paidAmount;
+
+    /* =========================
+       3) إنشاء الـ PDF
+    ========================= */
     const doc = new PDFDocument({
       size: "A5",
       margin: 30,
@@ -1540,37 +1571,67 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
     doc.pipe(res);
 
+    /* =========================
+       4) الخط
+    ========================= */
     const fontPath = path.join(__dirname, "fonts", "Cairo-Regular.ttf");
+    doc.font(fontPath);
 
-    if (fs.existsSync(fontPath)) {
-      doc.font(fontPath);
-    } else {
-      console.error("FONT NOT FOUND:", fontPath);
+    /* =========================
+       5) اللوجو + الهيدر
+    ========================= */
+    const logoPath = path.join(__dirname, "assets", "logo.png");
+    if (fs.existsSync(logoPath)) {
+      doc.image(logoPath, 30, 25, { width: 60 });
     }
 
-    doc.fontSize(14).text("فاتورة", { align: "center" }).moveDown();
+    doc.fontSize(16).text("فاتورة", 0, 30, { align: "center" });
 
     doc.fontSize(10);
-    doc.text(`رقم الفاتورة: ${invoice.id}`, { align: "right" });
+
+    doc.text(`رقم الفاتورة: ${invoice.id}`, 320, 30, { align: "right" });
     doc.text(
       `التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}`,
+      320,
+      45,
       { align: "right" },
     );
-    doc.text(`العميل: ${invoice.customer_name || "-"}`, { align: "right" });
+    doc.text(`العميل: ${invoice.customer_name || ""}`, 320, 60, {
+      align: "right",
+    });
 
-    doc.moveDown();
+    if (invoice.customer_phone) {
+      doc.text(`تليفون: ${invoice.customer_phone}`, 320, 75, {
+        align: "right",
+      });
+    }
 
-    doc.fontSize(9);
-    doc.text("م", 360);
-    doc.text("الصنف", 220);
-    doc.text("الكمية", 150);
-    doc.text("السعر", 100);
-    doc.text("الإجمالي", 50);
+    doc.moveTo(30, 100).lineTo(390, 100).stroke();
 
-    doc.moveDown(0.5);
-    doc.moveTo(30, doc.y).lineTo(390, doc.y).stroke();
+    /* =========================
+       6) جدول العناوين
+    ========================= */
+    let y = 110;
 
-    let y = doc.y + 4;
+    doc.fontSize(10);
+
+    doc.text("الإجمالي", 40, y);
+    doc.text("السعر", 95, y);
+    doc.text("الكمية", 145, y);
+    doc.text("العبوة", 190, y);
+    doc.text("الصنف", 250, y);
+    doc.text("م", 370, y);
+
+    doc
+      .moveTo(30, y + 15)
+      .lineTo(390, y + 15)
+      .stroke();
+
+    y += 25;
+
+    /* =========================
+       7) الصفوف (مع paging)
+    ========================= */
     let index = 1;
 
     for (const it of items) {
@@ -1579,23 +1640,85 @@ app.get("/invoices/:id/pdf", async (req, res) => {
         y = 40;
       }
 
-      const total = Number(it.price) * Number(it.quantity);
+      doc.text(Math.round(calcItemTotal(it)), 40, y);
+      doc.text(Math.round(calcUnitPrice(it)), 95, y);
+      doc.text(it.quantity, 145, y);
+      doc.text(it.package || "-", 190, y);
 
-      doc.text(index++, 360, y);
-      doc.text(it.product_name, 220, y, { width: 120 });
-      doc.text(it.quantity, 150, y);
-      doc.text(it.price, 100, y);
-      doc.text(total, 50, y);
+      doc.text(
+        `${it.product_name}${it.manufacturer ? " - " + it.manufacturer : ""}`,
+        250,
+        y,
+        { width: 110, align: "right" },
+      );
+
+      doc.text(index++, 370, y);
 
       y += 18;
     }
 
-    doc.moveDown();
-    doc.moveTo(30, doc.y).lineTo(390, doc.y).stroke();
+    /* =========================
+       8) صف الإجمالي (آخر صفحة فقط)
+    ========================= */
+    y += 5;
+
+    doc.moveTo(30, y).lineTo(390, y).stroke();
+
+    y += 10;
+
+    doc.fontSize(10);
+
+    doc.text(Math.round(itemsSubtotal), 40, y);
+    doc.text("", 95, y);
+    doc.text(totalQty, 145, y);
+
+    /* =========================
+       9) ملخص الفاتورة (شرطي)
+    ========================= */
+    y += 20;
+
+    doc.moveTo(230, y).lineTo(390, y).stroke();
+
+    y += 10;
+
+    if (previousBalance !== 0) {
+      doc.text(`حساب سابق: ${previousBalance.toFixed(2)}`, 390, y, {
+        align: "right",
+      });
+      y += 14;
+    }
+
+    if (extraDiscount > 0) {
+      doc.text(`خصم: ${extraDiscount.toFixed(2)}`, 390, y, {
+        align: "right",
+      });
+      y += 14;
+    }
 
     doc.fontSize(11);
-    doc.text(`الإجمالي: ${invoice.total}`, { align: "right" });
+    doc.text(`الصافي: ${netTotal.toFixed(2)}`, 390, y, {
+      align: "right",
+    });
+    y += 14;
 
+    if (paidAmount !== 0) {
+      doc.fontSize(10);
+      doc.text(`المدفوع: ${paidAmount.toFixed(2)}`, 390, y, {
+        align: "right",
+      });
+      y += 14;
+    }
+
+    if (remaining !== 0) {
+      doc.fontSize(12);
+      doc.text(`المتبقي: ${remaining.toFixed(2)}`, 390, y, {
+        align: "right",
+      });
+    }
+
+    /* =========================
+       10) إنهاء
+    ========================= */
     doc.end();
   } catch (err) {
     console.error(err);
