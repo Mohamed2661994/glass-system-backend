@@ -16,6 +16,10 @@ function convertWholesaleToRetail({
   const wholesale = parsePackage(wholesale_package);
   const retail = parsePackage(retail_package);
 
+  if (!wholesale.analyzable || !retail.analyzable) {
+    throw new Error("PACKAGE_NOT_ANALYZABLE");
+  }
+
   /* ==================================================
      1️⃣ طقم ⇄ طقم (مغلق)
   ================================================== */

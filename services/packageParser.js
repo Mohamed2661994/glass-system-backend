@@ -26,7 +26,11 @@ function parsePackage(text) {
 
   // ❌ اسم صنف / كود فقط (زي 508 – 703)
   if (isJustNumber(normalized)) {
-    throw new Error("PACKAGE_NOT_DEFINED");
+    return {
+      raw: text,
+      unit: "unknown",
+      analyzable: false,
+    };
   }
 
   /* ==================================================

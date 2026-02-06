@@ -3080,7 +3080,7 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
           product_id,
           product_name: product.name,
           status: "rejected",
-          reason: err.message,
+          reason: err.message || "INVALID_PACKAGE",
         });
       }
     }
