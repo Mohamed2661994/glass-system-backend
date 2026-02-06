@@ -10,8 +10,8 @@ function normalizeNumbers(text) {
 }
 
 function parsePackage(text) {
-  if (!text || typeof text !== "string") {
-    throw new Error("PACKAGE_TEXT_INVALID");
+  if (!text || typeof text !== "string" || !text.trim()) {
+    throw new Error("PACKAGE_EMPTY");
   }
 
   const normalized = normalizeNumbers(text.trim());
