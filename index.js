@@ -1754,7 +1754,7 @@ app.get("/invoices/:id/print", async (req, res) => {
     const remaining = netTotal - paidAmount;
 
     /* =========================
-       3) توليد صفوف الجدول
+       3) صفوف الجدول
     ========================= */
     const rowsHtml = items
       .map((it, index) => {
@@ -1780,7 +1780,7 @@ app.get("/invoices/:id/print", async (req, res) => {
       .join("");
 
     /* =========================
-       4) HTML النهائي
+       4) HTML النهائي (نفس الشكل)
     ========================= */
     res.send(`
 <!DOCTYPE html>
@@ -1792,7 +1792,7 @@ app.get("/invoices/:id/print", async (req, res) => {
 <style>
 @page {
   size: A5;
-  margin: 10mm;
+  margin: 12mm;
 }
 
 body {
@@ -1803,25 +1803,18 @@ body {
   font-size: 13px;
 }
 
-/* ====== Layout ====== */
-.page {
-  column-count: 2;
-  column-gap: 20px;
-}
-
-header {
-  column-span: all;
+.header {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   margin-bottom: 10px;
 }
 
-.logo {
+.header img {
   width: 80px;
 }
 
-.header-info {
+.header .info {
   text-align: right;
   font-size: 13px;
 }
@@ -1829,14 +1822,11 @@ header {
 h2 {
   text-align: center;
   margin: 5px 0 10px;
-  column-span: all;
 }
 
-/* ====== Table ====== */
 table {
   width: 100%;
   border-collapse: collapse;
-  break-inside: avoid;
 }
 
 th, td {
@@ -1851,22 +1841,15 @@ td.name {
   text-align: right;
 }
 
-/* ====== Summary ====== */
-footer {
-  column-span: all;
-  margin-top: 15px;
+.summary {
+  margin-top: 12px;
   border-top: 1px solid #000;
-  padding-top: 8px;
+  padding-top: 6px;
   font-size: 14px;
 }
 
-footer div {
+.summary div {
   margin: 3px 0;
-  text-align: right;
-}
-
-strong {
-  font-weight: bold;
 }
 
 @media print {
@@ -1879,16 +1862,14 @@ strong {
 
 <body>
 
-<div class="page">
-
-<header>
-  <img src="/assets/logo.png" class="logo" />
-  <div class="header-info">
+<div class="header">
+  <img src="/assets/logo.png" alt="logo" />
+  <div class="info">
     <div>رقم الفاتورة: ${invoice.id}</div>
     <div>التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
     <div>العميل: ${invoice.customer_name || ""}</div>
   </div>
-</header>
+</div>
 
 <h2>فاتورة</h2>
 
@@ -1908,15 +1889,14 @@ ${rowsHtml}
 </tbody>
 </table>
 
-<footer>
+<div class="summary">
+  <div>إجمالي الكمية: ${totalQty}</div>
   ${itemsSubtotal ? `<div>الإجمالي: ${itemsSubtotal.toFixed(2)}</div>` : ""}
   ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
   ${extraDiscount ? `<div>خصم: ${extraDiscount.toFixed(2)}</div>` : ""}
   <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
   ${paidAmount ? `<div>المدفوع: ${paidAmount.toFixed(2)}</div>` : ""}
   ${remaining ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>` : ""}
-</footer>
-
 </div>
 
 <script>
@@ -1925,7 +1905,6 @@ ${rowsHtml}
 
 </body>
 </html>
-
 `);
   } catch (err) {
     console.error(err);
