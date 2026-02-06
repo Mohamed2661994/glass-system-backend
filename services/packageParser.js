@@ -46,7 +46,7 @@ function parsePackage(text) {
       raw: text,
       unit: "set",
       count: match && match[1] ? parseInt(match[1], 10) : 1,
-      analyzable: false,
+      analyzable: true,
     };
   }
 
