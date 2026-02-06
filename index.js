@@ -1510,6 +1510,7 @@ WHERE id = $12
 
 app.get("/invoices/:id/pdf", async (req, res) => {
   const invoiceId = req.params.id;
+
   const COL_TOTAL = 30;
   const COL_PRICE = 85;
   const COL_QTY = 130;
@@ -1532,8 +1533,17 @@ app.get("/invoices/:id/pdf", async (req, res) => {
       return res.status(404).send("Invoice not found");
     }
 
+    // ✅ نجيب manufacturer صح
     const itemsRes = await pool.query(
-      `SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id`,
+      `
+      SELECT
+        ii.*,
+        p.manufacturer
+      FROM invoice_items ii
+      LEFT JOIN products p ON p.id = ii.product_id
+      WHERE ii.invoice_id = $1
+      ORDER BY ii.id
+      `,
       [invoiceId],
     );
 
@@ -1541,7 +1551,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     const items = itemsRes.rows;
 
     /* =========================
-       2) الحسابات (نفس React)
+       2) الحسابات
     ========================= */
     const calcUnitPrice = (it) =>
       invoice.apply_items_discount
@@ -1566,12 +1576,9 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     const remaining = netTotal - paidAmount;
 
     /* =========================
-       3) إنشاء الـ PDF
+       3) إنشاء PDF
     ========================= */
-    const doc = new PDFDocument({
-      size: "A5",
-      margin: 30,
-    });
+    const doc = new PDFDocument({ size: "A5", margin: 30 });
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
@@ -1595,23 +1602,24 @@ app.get("/invoices/:id/pdf", async (req, res) => {
       doc.image(logoPath, 30, 25, { width: 60 });
     }
 
-    doc.fontSize(16).text("فاتورة", 0, 30, { align: "center" });
+    doc.fontSize(16).text(rtl("فاتورة"), 0, 30, { align: "center" });
 
     doc.fontSize(10);
-
-    doc.text(`رقم الفاتورة: ${invoice.id}`, 320, 30, { align: "right" });
+    doc.text(rtl(`رقم الفاتورة: ${invoice.id}`), 320, 30, { align: "right" });
     doc.text(
-      `التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}`,
+      rtl(
+        `التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}`,
+      ),
       320,
       45,
       { align: "right" },
     );
-    doc.text(`العميل: ${invoice.customer_name || ""}`, 320, 60, {
+    doc.text(rtl(`العميل: ${invoice.customer_name || ""}`), 320, 60, {
       align: "right",
     });
 
     if (invoice.customer_phone) {
-      doc.text(`تليفون: ${invoice.customer_phone}`, 320, 75, {
+      doc.text(rtl(`تليفون: ${invoice.customer_phone}`), 320, 75, {
         align: "right",
       });
     }
@@ -1624,28 +1632,26 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     let y = 110;
 
     doc.fontSize(10);
-
-    doc.text("الإجمالي", COL_TOTAL, y, { width: 50, align: "center" });
-    doc.text("السعر", COL_PRICE, y, { width: 40, align: "center" });
-    doc.text("الكمية", COL_QTY, y, { width: 35, align: "center" });
-    doc.text("العبوة", COL_PACK, y, { width: 45, align: "center" });
-    doc.text("الصنف", COL_NAME, y, { width: 140, align: "right" });
-    doc.text("م", COL_INDEX, y, { width: 20, align: "center" });
+    doc.text(rtl("الإجمالي"), COL_TOTAL, y, { width: 50, align: "center" });
+    doc.text(rtl("السعر"), COL_PRICE, y, { width: 40, align: "center" });
+    doc.text(rtl("الكمية"), COL_QTY, y, { width: 35, align: "center" });
+    doc.text(rtl("العبوة"), COL_PACK, y, { width: 45, align: "center" });
+    doc.text(rtl("الصنف"), COL_NAME, y, { width: 140, align: "right" });
+    doc.text(rtl("م"), COL_INDEX, y, { width: 20, align: "center" });
 
     doc
       .moveTo(30, y + 15)
       .lineTo(390, y + 15)
       .stroke();
-
     y += 25;
 
     /* =========================
-       7) الصفوف (مع paging)
+       7) الصفوف
     ========================= */
     let index = 1;
 
     for (const it of items) {
-      if (y > 360) {
+      if (y > 410) {
         doc.addPage();
         y = 40;
       }
@@ -1660,73 +1666,76 @@ app.get("/invoices/:id/pdf", async (req, res) => {
         align: "center",
       });
 
-      doc.text(it.quantity, COL_QTY, y, { width: 35, align: "center" });
+      doc.text(it.quantity, COL_QTY, y, {
+        width: 35,
+        align: "center",
+      });
 
-      doc.text(it.package || "-", COL_PACK, y, { width: 45, align: "center" });
+      doc.text(rtl(it.package || "-"), COL_PACK, y, {
+        width: 45,
+        align: "center",
+      });
 
-      doc.text(
-        `${it.product_name}${it.manufacturer ? " - " + it.manufacturer : ""}`,
-        COL_NAME,
-        y,
-        {
-          width: 140,
-          align: "right",
-          lineGap: 2, // 🔑 مهم
-        },
-      );
+      // ✅ اسم الصنف + الشركة (مترتب صح)
+      const productName = [it.product_name, it.manufacturer]
+        .filter(Boolean)
+        .join(" ");
 
-      doc.text(index++, COL_INDEX, y, { width: 20, align: "center" });
+      doc.text(rtl(productName), COL_NAME, y, {
+        width: 140,
+        align: "right",
+        lineGap: 2,
+      });
+
+      doc.text(index++, COL_INDEX, y, {
+        width: 20,
+        align: "center",
+      });
 
       y += ROW_HEIGHT;
     }
 
     /* =========================
-       8) صف الإجمالي (آخر صفحة فقط)
+       8) الإجماليات
     ========================= */
     y += 5;
-
     doc.moveTo(30, y).lineTo(390, y).stroke();
-
     y += 10;
 
     doc.fontSize(10);
-
     doc.text(Math.round(itemsSubtotal), 40, y);
-    doc.text("", 95, y);
     doc.text(totalQty, 145, y);
 
     /* =========================
-       9) ملخص الفاتورة (شرطي)
+       9) ملخص
     ========================= */
     y += 20;
-
     doc.moveTo(230, y).lineTo(390, y).stroke();
-
     y += 10;
 
     if (previousBalance !== 0) {
-      doc.text(`حساب سابق: ${previousBalance.toFixed(2)}`, 390, y, {
+      doc.text(rtl(`حساب سابق: ${previousBalance.toFixed(2)}`), 390, y, {
         align: "right",
       });
       y += 14;
     }
 
     if (extraDiscount > 0) {
-      doc.text(`خصم: ${extraDiscount.toFixed(2)}`, 390, y, {
+      doc.text(rtl(`خصم: ${extraDiscount.toFixed(2)}`), 390, y, {
         align: "right",
       });
       y += 14;
     }
 
     doc.fontSize(11);
-    doc.text(`الصافي: ${netTotal.toFixed(2)}`, 390, y, {
+    doc.text(rtl(`الصافي: ${netTotal.toFixed(2)}`), 390, y, {
       align: "right",
     });
     y += 14;
 
     if (paidAmount !== 0) {
       doc.fontSize(10);
-      doc.text(`المدفوع: ${paidAmount.toFixed(2)}`, 390, y, {
+      doc.text(rtl(`المدفوع: ${paidAmount.toFixed(2)}`), 390, y, {
         align: "right",
       });
       y += 14;
@@ -1734,7 +1743,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
     if (remaining !== 0) {
       doc.fontSize(12);
-      doc.text(`المتبقي: ${remaining.toFixed(2)}`, 390, y, {
+      doc.text(rtl(`المتبقي: ${remaining.toFixed(2)}`), 390, y, {
         align: "right",
       });
     }
