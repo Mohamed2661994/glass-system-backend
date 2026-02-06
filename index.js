@@ -1694,7 +1694,9 @@ ${items
        4) Puppeteer → PDF
     ========================= */
     const browser = await puppeteer.launch({
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      executablePath:
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      headless: "new",
     });
 
     const page = await browser.newPage();
@@ -1715,8 +1717,8 @@ ${items
 
     res.send(pdfBuffer);
   } catch (err) {
-    console.error(err);
-    res.status(500).send("PDF generation failed");
+    console.error("PUPPETEER ERROR >>>", err);
+    res.status(500).send(err.message);
   }
 });
 
