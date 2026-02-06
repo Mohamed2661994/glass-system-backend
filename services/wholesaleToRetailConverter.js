@@ -36,8 +36,12 @@ function convertWholesaleToRetail({
       throw new Error("SET_CANNOT_BE_SPLIT");
     }
 
+    const toQuantity = wholesale_quantity * wholesale.count;
+
     return {
-      retail_quantity: wholesale_quantity * wholesale.count,
+      from_quantity: wholesale_quantity,
+      to_quantity: toQuantity,
+      retail_quantity: toQuantity, // backward compatibility
       mode: "set",
     };
   }
@@ -75,7 +79,9 @@ function convertWholesaleToRetail({
   }
 
   return {
-    retail_quantity: retailQuantity,
+    from_quantity: wholesale_quantity,
+    to_quantity: retailQuantity,
+    retail_quantity: retailQuantity, // backward compatibility
     mode: "analyzed",
   };
 }
