@@ -32,23 +32,26 @@ function convertWholesaleToRetail({
      1️⃣ طقم ⇄ طقم (مغلق)
   ================================================== */
   if (wholesale.unit === "set") {
-    if (!product.set_size) {
-      throw new Error("SET_SIZE_NOT_DEFINED");
-    }
-
-    const totalPieces = wholesale_quantity * wholesale.count * product.set_size;
-
-    if (retail.unit === "piece") {
-      return {
-        from_quantity: wholesale_quantity,
-        to_quantity: totalPieces,
-      };
-    }
-
+    // 🟢 طقم → طقم (مباشر)
     if (retail.unit === "set") {
       return {
         from_quantity: wholesale_quantity,
         to_quantity: wholesale_quantity * wholesale.count,
+      };
+    }
+
+    // 🟡 طقم → قطعة / شيالة / علبة
+    // نطلع عدد القطع من retail.count
+    if (retail.unit === "piece" || retail.unit === "container") {
+      if (!retail.count || retail.count <= 0) {
+        throw new Error("RETAIL_COUNT_NOT_DEFINED");
+      }
+
+      const totalPieces = wholesale_quantity * wholesale.count * retail.count;
+
+      return {
+        from_quantity: wholesale_quantity,
+        to_quantity: totalPieces,
       };
     }
   }
