@@ -1508,6 +1508,14 @@ WHERE id = $12
 
 app.get("/invoices/:id/pdf", async (req, res) => {
   const invoiceId = req.params.id;
+  const COL_TOTAL = 30;
+  const COL_PRICE = 85;
+  const COL_QTY = 130;
+  const COL_PACK = 175;
+  const COL_NAME = 225;
+  const COL_INDEX = 385;
+
+  const ROW_HEIGHT = 22;
 
   try {
     /* =========================
@@ -1615,12 +1623,12 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
     doc.fontSize(10);
 
-    doc.text("الإجمالي", 40, y);
-    doc.text("السعر", 95, y);
-    doc.text("الكمية", 145, y);
-    doc.text("العبوة", 190, y);
-    doc.text("الصنف", 250, y);
-    doc.text("م", 370, y);
+    doc.text("الإجمالي", COL_TOTAL, y, { width: 50, align: "center" });
+    doc.text("السعر", COL_PRICE, y, { width: 40, align: "center" });
+    doc.text("الكمية", COL_QTY, y, { width: 35, align: "center" });
+    doc.text("العبوة", COL_PACK, y, { width: 45, align: "center" });
+    doc.text("الصنف", COL_NAME, y, { width: 140, align: "right" });
+    doc.text("م", COL_INDEX, y, { width: 20, align: "center" });
 
     doc
       .moveTo(30, y + 15)
@@ -1640,21 +1648,34 @@ app.get("/invoices/:id/pdf", async (req, res) => {
         y = 40;
       }
 
-      doc.text(Math.round(calcItemTotal(it)), 40, y);
-      doc.text(Math.round(calcUnitPrice(it)), 95, y);
-      doc.text(it.quantity, 145, y);
-      doc.text(it.package || "-", 190, y);
+      doc.text(Math.round(calcItemTotal(it)), COL_TOTAL, y, {
+        width: 50,
+        align: "center",
+      });
+
+      doc.text(Math.round(calcUnitPrice(it)), COL_PRICE, y, {
+        width: 40,
+        align: "center",
+      });
+
+      doc.text(it.quantity, COL_QTY, y, { width: 35, align: "center" });
+
+      doc.text(it.package || "-", COL_PACK, y, { width: 45, align: "center" });
 
       doc.text(
         `${it.product_name}${it.manufacturer ? " - " + it.manufacturer : ""}`,
-        250,
+        COL_NAME,
         y,
-        { width: 110, align: "right" },
+        {
+          width: 140,
+          align: "right",
+          lineGap: 2, // 🔑 مهم
+        },
       );
 
-      doc.text(index++, 370, y);
+      doc.text(index++, COL_INDEX, y, { width: 20, align: "center" });
 
-      y += 18;
+      y += ROW_HEIGHT;
     }
 
     /* =========================
