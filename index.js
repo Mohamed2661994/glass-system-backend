@@ -1514,7 +1514,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
   const COL_PRICE = 85;
   const COL_QTY = 130;
   const COL_PACK = 175;
-  const COL_NAME = 225;
+  const COL_NAME = 180;
   const COL_INDEX = 385;
 
   const ROW_HEIGHT = 18; // 👈 أصغر علشان 20 صنف
@@ -1633,7 +1633,11 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     doc.text("السعر", COL_PRICE, y, { width: 40, align: "center" });
     doc.text("الكمية", COL_QTY, y, { width: 35, align: "center" });
     doc.text("العبوة", COL_PACK, y, { width: 45, align: "center" });
-    doc.text("الصنف", COL_NAME, y, { width: 140, align: "right" });
+    doc.text("الصنف", COL_NAME, y, {
+      width: 190,
+      align: "right",
+      lineBreak: false,
+    });
     doc.text("م", COL_INDEX, y, { width: 20, align: "center" });
 
     doc
@@ -1682,8 +1686,9 @@ app.get("/invoices/:id/pdf", async (req, res) => {
       });
 
       doc.text(productName, COL_NAME, y, {
-        width: 140,
+        width: 190,
         align: "right",
+        lineBreak: false,
       });
 
       doc.text(index++, COL_INDEX, y, {
