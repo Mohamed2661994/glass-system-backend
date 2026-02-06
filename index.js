@@ -8,7 +8,7 @@ const PDFDocument = require("pdfkit");
 const arabicReshaper = require("arabic-reshaper");
 const bidiFactory = require("bidi-js");
 const bidi = bidiFactory();
-
+const puppeteer = require("puppeteer");
 const pool = require("./db");
 const {
   convertWholesaleToRetail,
@@ -1545,8 +1545,8 @@ app.get("/invoices/:id/pdf", async (req, res) => {
   const COL_NAME = 180;
   const COL_INDEX = 385;
 
-  const ROW_HEIGHT = 18; // 👈 أصغر علشان 20 صنف
-  const PAGE_END_Y = 500; // 👈 آخر الصفحة
+  const ROW_HEIGHT = 18;
+  const PAGE_END_Y = 500;
 
   try {
     /* =========================
@@ -1629,22 +1629,28 @@ app.get("/invoices/:id/pdf", async (req, res) => {
       doc.image(logoPath, 30, 25, { width: 60 });
     }
 
-    doc.fontSize(16).text("فاتورة", 0, 30, { align: "center" });
+    doc.fontSize(16).text(arabicRTL("فاتورة"), 0, 30, { align: "center" });
 
     doc.fontSize(10);
-    doc.text(`رقم الفاتورة: ${invoice.id}`, 390, 30, { align: "right" });
+    doc.text(arabicRTL(`رقم الفاتورة: ${invoice.id}`), 390, 30, {
+      align: "right",
+    });
+
     doc.text(
-      `التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}`,
+      arabicRTL(
+        `التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}`,
+      ),
       390,
       45,
       { align: "right" },
     );
-    doc.text(`العميل: ${invoice.customer_name || ""}`, 390, 60, {
+
+    doc.text(arabicRTL(`العميل: ${invoice.customer_name || ""}`), 390, 60, {
       align: "right",
     });
 
     if (invoice.customer_phone) {
-      doc.text(`تليفون: ${invoice.customer_phone}`, 390, 75, {
+      doc.text(arabicRTL(`تليفون: ${invoice.customer_phone}`), 390, 75, {
         align: "right",
       });
     }
@@ -1657,16 +1663,20 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     let y = 110;
 
     doc.fontSize(10);
-    doc.text("الإجمالي", COL_TOTAL, y, { width: 50, align: "center" });
-    doc.text("السعر", COL_PRICE, y, { width: 40, align: "center" });
-    doc.text("الكمية", COL_QTY, y, { width: 35, align: "center" });
-    doc.text("العبوة", COL_PACK, y, { width: 45, align: "center" });
+    doc.text(arabicRTL("الإجمالي"), COL_TOTAL, y, {
+      width: 50,
+      align: "center",
+    });
+    doc.text(arabicRTL("السعر"), COL_PRICE, y, { width: 40, align: "center" });
+    doc.text(arabicRTL("الكمية"), COL_QTY, y, { width: 35, align: "center" });
+    doc.text(arabicRTL("العبوة"), COL_PACK, y, { width: 45, align: "center" });
+
     doc.text(arabicRTL("الصنف"), COL_NAME, y, {
       width: 190,
       align: "right",
     });
 
-    doc.text("م", COL_INDEX, y, { width: 20, align: "center" });
+    doc.text(arabicRTL("م"), COL_INDEX, y, { width: 20, align: "center" });
 
     doc
       .moveTo(30, y + 15)
@@ -1675,7 +1685,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     y += 22;
 
     /* =========================
-       7) الصفوف (20 صنف)
+       7) الصفوف
     ========================= */
     let index = 1;
 
@@ -1688,6 +1698,10 @@ app.get("/invoices/:id/pdf", async (req, res) => {
       const productName = [it.product_name, it.manufacturer]
         .filter(Boolean)
         .join(" ");
+
+      const packText = it.package
+        ? it.package.replace(/كرتونة\s*/g, "").trim()
+        : "-";
 
       doc.text(Math.round(calcItemTotal(it)), COL_TOTAL, y, {
         width: 50,
@@ -1704,11 +1718,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
         align: "center",
       });
 
-      const packText = it.package
-        ? it.package.replace(/كرتونة\s*/g, "").trim()
-        : "-";
-
-      doc.text(packText, COL_PACK, y, {
+      doc.text(arabicRTL(packText), COL_PACK, y, {
         width: 45,
         align: "center",
       });
@@ -1744,28 +1754,28 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     y += 10;
 
     if (previousBalance !== 0) {
-      doc.text(`حساب سابق: ${previousBalance.toFixed(2)}`, 390, y, {
+      doc.text(arabicRTL(`حساب سابق: ${previousBalance.toFixed(2)}`), 390, y, {
         align: "right",
       });
       y += 14;
     }
 
     if (extraDiscount > 0) {
-      doc.text(`خصم: ${extraDiscount.toFixed(2)}`, 390, y, {
+      doc.text(arabicRTL(`خصم: ${extraDiscount.toFixed(2)}`), 390, y, {
         align: "right",
       });
       y += 14;
     }
 
     doc.fontSize(11);
-    doc.text(`الصافي: ${netTotal.toFixed(2)}`, 390, y, {
+    doc.text(arabicRTL(`الصافي: ${netTotal.toFixed(2)}`), 390, y, {
       align: "right",
     });
     y += 14;
 
     if (paidAmount !== 0) {
       doc.fontSize(10);
-      doc.text(`المدفوع: ${paidAmount.toFixed(2)}`, 390, y, {
+      doc.text(arabicRTL(`المدفوع: ${paidAmount.toFixed(2)}`), 390, y, {
         align: "right",
       });
       y += 14;
@@ -1773,7 +1783,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 
     if (remaining !== 0) {
       doc.fontSize(12);
-      doc.text(`المتبقي: ${remaining.toFixed(2)}`, 390, y, {
+      doc.text(arabicRTL(`المتبقي: ${remaining.toFixed(2)}`), 390, y, {
         align: "right",
       });
     }
