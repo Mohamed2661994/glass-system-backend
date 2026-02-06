@@ -15,6 +15,7 @@ function convertWholesaleToRetail({
 
   const wholesale = parsePackage(wholesale_package);
   const retail = parsePackage(retail_package);
+  const SPLITTABLE_UNITS = ["bundle", "pack", "tray", "case"];
 
   // 🟡 حالة الطقم (وحدة مغلقة)
   if (wholesale.unit === "set") {
@@ -46,7 +47,13 @@ function convertWholesaleToRetail({
 
   const totalPieces = piecesPerWholesaleUnit * wholesale_quantity;
 
-  const piecesPerRetailUnit = retail.count;
+  // const piecesPerRetailUnit = retail.count;
+  let piecesPerRetailUnit = 1;
+
+  // مسموح بالقسمة فقط لو وحدة تجميع
+  if (SPLITTABLE_UNITS.includes(retail.unit)) {
+    piecesPerRetailUnit = retail.count;
+  }
 
   const retailQuantity = totalPieces / piecesPerRetailUnit;
 
