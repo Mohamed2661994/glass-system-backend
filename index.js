@@ -3021,8 +3021,14 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
       // 1️⃣ بيانات الصنف
       const productRes = await pool.query(
         `
-        SELECT id, name, wholesale_package, retail_package
-        FROM products
+       SELECT
+  id,
+  name,
+  manufacturer,
+  wholesale_package,
+  retail_package
+FROM products
+
         WHERE id = $1 AND is_active = true
         `,
         [product_id],
@@ -3074,6 +3080,7 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
         previewResults.push({
           product_id,
           product_name: product.name,
+          manufacturer: product.manufacturer, // ✅ هنا الحل
           from_quantity: quantity,
           to_quantity: result.retail_quantity,
           status: "ok",
