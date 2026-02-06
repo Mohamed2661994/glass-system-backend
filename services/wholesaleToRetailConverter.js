@@ -9,6 +9,14 @@ function convertWholesaleToRetail({
   retail_package,
   wholesale_quantity,
 }) {
+  console.log("🔍 CONVERT INPUT:", {
+    wholesale_package,
+    retail_package,
+    wholesale_quantity,
+    type_wholesale: typeof wholesale_package,
+    type_retail: typeof retail_package,
+  });
+
   if (!wholesale_quantity || wholesale_quantity <= 0) {
     throw new Error("INVALID_QUANTITY");
   }

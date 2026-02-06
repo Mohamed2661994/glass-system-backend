@@ -18,11 +18,13 @@ function isJustNumber(text) {
 }
 
 function parsePackage(text) {
+  console.log("📦 parsePackage INPUT:", text);
   if (!text || typeof text !== "string" || !text.trim()) {
     throw new Error("PACKAGE_EMPTY");
   }
 
   const normalized = cleanText(normalizeNumbers(text));
+  console.log("🧼 normalized:", normalized);
 
   // ❌ اسم صنف / كود فقط (زي 508 – 703)
   if (isJustNumber(normalized)) {
