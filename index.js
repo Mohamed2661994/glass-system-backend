@@ -1885,27 +1885,29 @@ tbody tr:not(.total-row) td {
 .summary-row td {
   font-weight: 500;
   padding: 3px 5px;
-  border-bottom: 1px solid #000; /* خط رفيع بدل الزحمة */
+   border: none;
 }
 
 /* عمود الإجمالي */
 .summary-row td:last-child {
   text-align: center;
+   border-bottom: 1px solid #000;
+}
+/* بداية قسم الإجماليات */
+.summary-start td:last-child {
+  border-top: 1px solid #000;
+  padding-top: 6px;
 }
 
-/* فصل بصري قبل الملخص */
-.summary-start td {
-  padding-top: 8px;
-  border-top: 1px solid #000;
-}
 
 /* الصافي */
 .total-net td {
   font-weight: 700;
   font-size: 15px;
-  border-top: 1px solid #000;
-  border-bottom: none;
-  padding-top: 6px;
+}
+
+.total-net td:last-child {
+  border-bottom: 2px solid #000; /* أوضح شوية */
 }
 
 /* المدفوع */
@@ -1918,7 +1920,9 @@ tbody tr:not(.total-row) td {
   font-weight: 700;
   font-size: 15px;
 }
-
+.remaining td:last-child {
+  border-bottom: 2px solid #000;
+}
 
 /* ملخص الفاتورة */
 .summary {
