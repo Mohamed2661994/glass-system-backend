@@ -1924,6 +1924,27 @@ tbody tr:not(.total-row) td {
   border-bottom: 2px solid #000;
 }
 
+.summary-label {
+  text-align: right;
+  font-weight: 600;
+}
+
+.summary-value {
+  text-align: center;
+  border-bottom: 1px solid #000;
+  font-weight: 600;
+}
+
+/* الصافي والباقي أوضح */
+.total-net .summary-value,
+.remaining .summary-value {
+  font-weight: 700;
+  font-size: 15px;
+  border-bottom: 2px solid #000;
+}
+
+
+
 /* ملخص الفاتورة */
 .summary {
   margin-top: 10px;
@@ -1999,8 +2020,9 @@ ${
   previousBalance
     ? `
 <tr class="summary-row">
-  <td colspan="4">حساب سابق</td>
-  <td>${previousBalance.toFixed(2)}</td>
+  <td colspan="3"></td>
+  <td class="summary-label">حساب سابق</td>
+  <td class="summary-value">${previousBalance.toFixed(2)}</td>
 </tr>
 `
     : ""
@@ -2010,25 +2032,30 @@ ${
   discount
     ? `
 <tr class="summary-row">
-  <td colspan="4">خصم</td>
-  <td>- ${discount.toFixed(2)}</td>
+  <td colspan="3"></td>
+  <td class="summary-label">خصم</td>
+  <td class="summary-value">- ${discount.toFixed(2)}</td>
 </tr>
 `
     : ""
 }
 
 <tr class="summary-row total-net">
-  <td colspan="4">الصافي</td>
-  <td>${netTotal.toFixed(2)}</td>
+  <td colspan="3"></td>
+  <td class="summary-label">الصافي</td>
+  <td class="summary-value">${netTotal.toFixed(2)}</td>
 </tr>
+
 
 ${
   paid
     ? `
 <tr class="summary-row paid-row">
-  <td colspan="4">المدفوع</td>
-  <td>${paid.toFixed(2)}</td>
+  <td colspan="3"></td>
+  <td class="summary-label">المدفوع</td>
+  <td class="summary-value">${paid.toFixed(2)}</td>
 </tr>
+
 `
     : ""
 }
@@ -2037,9 +2064,11 @@ ${
   remaining
     ? `
 <tr class="summary-row remaining">
-  <td colspan="4">الباقي</td>
-  <td>${remaining.toFixed(2)}</td>
+  <td colspan="3"></td>
+  <td class="summary-label">الباقي</td>
+  <td class="summary-value">${remaining.toFixed(2)}</td>
 </tr>
+
 `
     : ""
 }
