@@ -1893,6 +1893,43 @@ tbody tr:not(.total-row) td {
  
   padding-top: 6px;
 }
+/* ====== EXACT BLUE HAND-DRAWN STYLE ====== */
+
+/* شيل أي خطوط قديمة */
+.summary-value {
+  border: none !important;
+  position: relative;
+}
+
+/* الخط الأزرق نفسه */
+.summary-value::after {
+  content: "";
+  position: absolute;
+  bottom: -2px;
+  right: 0;
+  width: 65%;
+  height: 4px;
+  background: #1e5eff;
+  border-radius: 3px;
+}
+
+/* الصافي أوضح */
+.total-net .summary-value::after {
+  width: 75%;
+  height: 5px;
+}
+
+/* المدفوع */
+.paid-row .summary-value::after {
+  width: 70%;
+  height: 5px;
+}
+
+/* الباقي */
+.remaining .summary-value::after {
+  width: 70%;
+  height: 5px;
+}
 
 
 /* الصافي */
