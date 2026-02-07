@@ -1704,26 +1704,18 @@ ${items
 
 // Endpoint لطباعة الفاتورة كصفحة HTML (المتصفح هو اللي بيطبع / يحفظ PDF)
 app.get("/invoices/:id/print", async (req, res) => {
-  // رقم الفاتورة جاي من الـ URL
   const invoiceId = req.params.id;
 
   try {
-    /* ======================================================
-       1) جلب بيانات الفاتورة الأساسية (العميل – التاريخ …)
-    ====================================================== */
     const invoiceRes = await pool.query(
       `SELECT * FROM invoices WHERE id = $1`,
       [invoiceId],
     );
 
-    // لو الفاتورة مش موجودة
     if (!invoiceRes.rows.length) {
       return res.status(404).send("Invoice not found");
     }
 
-    /* ======================================================
-       2) جلب أصناف الفاتورة + اسم المصنع من جدول المنتجات
-    ====================================================== */
     const itemsRes = await pool.query(
       `
       SELECT ii.*, p.manufacturer
@@ -1738,53 +1730,35 @@ app.get("/invoices/:id/print", async (req, res) => {
     const invoice = invoiceRes.rows[0];
     const items = itemsRes.rows;
 
-    /* ======================================================
-       3) دوال الحسابات (سعر – إجمالي – مجاميع)
-    ====================================================== */
-
-    // حساب سعر الوحدة (مع أو بدون خصم)
     const unitPrice = (it) =>
       invoice.apply_items_discount
         ? Number(it.price) - Number(it.discount || 0)
         : Number(it.price);
 
-    // إجمالي الصنف = سعر الوحدة × الكمية
     const itemTotal = (it) => unitPrice(it) * Number(it.quantity || 0);
 
-    // إجمالي كل الأصناف
     const subtotal = items.reduce((s, it) => s + itemTotal(it), 0);
-
-    // إجمالي الكميات
     const totalQty = items.reduce((s, it) => s + Number(it.quantity || 0), 0);
 
-    // قيم الفاتورة الإضافية
     const previousBalance = Number(invoice.previous_balance) || 0;
     const discount = Number(invoice.manual_discount) || 0;
     const paid = Number(invoice.paid_amount) || 0;
 
-    // الصافي والمتبقي
     const netTotal = subtotal + previousBalance - discount;
     const remaining = netTotal - paid;
 
-    /* ======================================================
-       4) تجهيز صفوف جدول الأصناف (HTML ديناميكي)
-    ====================================================== */
     const rowsHtml = items
       .map((it, i) => {
-        // تنظيف نص العبوة (إزالة كلمة كرتونة)
         const pack = it.package
           ? it.package.replace(/كرتونة\s*/g, "").trim()
           : "";
 
-        // اسم الصنف بالشكل:
-        // اسم الصنف - المصنع (العبوة)
         const name = `
           ${it.product_name}
           ${it.manufacturer ? " - " + it.manufacturer : ""}
           ${pack ? " (" + pack + ")" : ""}
         `;
 
-        // صف الجدول
         return `
 <tr>
   <td>${i + 1}</td>
@@ -1796,9 +1770,6 @@ app.get("/invoices/:id/print", async (req, res) => {
       })
       .join("");
 
-    /* ======================================================
-       5) إرسال صفحة HTML كاملة للطباعة
-    ====================================================== */
     res.send(`
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -1806,17 +1777,11 @@ app.get("/invoices/:id/print", async (req, res) => {
 <meta charset="UTF-8">
 
 <style>
-/* إعدادات حجم الورق للطباعة */
 @page {
   size: A5 portrait;
   margin: 10mm;
 }
-html, body {
-  width: 125mm;
-  height: 190mm;
-}
 
-/* الإعدادات العامة */
 body {
   font-family: Cairo, Arial, sans-serif;
   font-size: 14px;
@@ -1824,189 +1789,86 @@ body {
   color: #000;
 }
 
-/* ===== Header ===== */
 .header {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
 }
 
-/* بيانات الفاتورة */
 .info {
   text-align: right;
-  font-size: 14px;
   line-height: 1.8;
 }
 
-/* اللوجو */
 .logo img {
   width: 75px;
 }
 
-/* خط فاصل عريض */
 .hr-bold {
   border-top: 2px solid #000;
   margin: 6px 0;
 }
 
-/* الجدول */
 table {
   width: 100%;
   border-collapse: collapse;
 }
 
 th, td {
-  padding: 5px;             /* ⬅️ زودنا الارتفاع */
+  padding: 6px;
   text-align: center;
-  line-height: 1.3;         /* ⬅️ طول السطر */
 }
 
 th {
   border-bottom: 2px solid #000;
-   font-size: 14px;
 }
 
-/* اسم الصنف */
 td.name {
-  text-align: center;       /* ⬅️ في وسط الحقل */
-  white-space: normal;
-  font-size: 13px;          /* ⬅️ أكبر شوية */
-  line-height: 1.3;
+  font-size: 13px;
 }
-tbody tr:not(.total-row) td {
+
+tbody tr:not(.total-row):not(.summary-row) td {
   border-bottom: 1px solid #000;
 }
+
 .total-row td {
   font-weight: bold;
-  
 }
 
-
-
-/* عمود الإجمالي */
-.summary-row td:last-child {
-  text-align: center;
-   border-bottom: 0.px solid #000;
-}
-/* بداية قسم الإجماليات */
-.summary-start td:last-child {
- 
-  padding-top: 6px;
-}
-/* ====== EXACT BLUE HAND-DRAWN STYLE ====== */
-
-/* شيل أي خطوط قديمة */
-.summary-value {
-  border: none !important;
-  position: relative;
-}
-
-/* الخط الأزرق نفسه */
-.summary-value::after {
-  content: "";
-  position: absolute;
-  bottom: -2px;
-  right: 0;
-  width: 65%;
-  height: 4px;
-  background: #1e5eff;
-  border-radius: 3px;
-}
-
-/* الصافي أوضح */
-.total-net .summary-value::after {
-  width: 75%;
-  height: 5px;
-}
-
-/* المدفوع */
-.paid-row .summary-value::after {
-  width: 70%;
-  height: 5px;
-}
-
-/* الباقي */
-.remaining .summary-value::after {
-  width: 70%;
-  height: 5px;
-}
-
-
-/* الصافي */
-.total-net td {
-  font-weight: 700;
-  font-size: 15px;
-}
-
-.total-net td:last-child {
-  border-bottom: 2px solid #000; /* أوضح شوية */
-}
-
-/* المدفوع */
-.paid-row td {
-  font-weight: 600;
-}
-
-/* الباقي */
-.remaining td {
-  font-weight: 700;
-  font-size: 15px;
-}
-.remaining td:last-child {
-  border-bottom: 2px solid #000;
-}
-.summary-row {
-  border-bottom: 1px solid #000;   /* الخط الرفيع */
-}
+/* ===== SUMMARY CLEAN STYLE ===== */
 
 .summary-row td {
   border: none !important;
-  padding: 4px 6px;
+  padding: 6px 4px;
 }
-/* الكلام */
+
 .summary-label {
   text-align: right;
   font-weight: 600;
 }
 
-/* الرقم */
 .summary-value {
   text-align: left;
   font-weight: 600;
 }
 
-.summary-start .summary-label,
-.summary-start .summary-value {
- 
+/* فاصل خفيف بين كل سطر */
+.summary-row {
+  border-bottom: 1px solid #000;
 }
 
-/* الصافي والباقي أوضح */
-.total-net,
+/* الصافي */
+.total-net {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+/* الباقي */
 .remaining {
   font-weight: 700;
+  font-size: 15px;
 }
 
-
-
-
-/* ملخص الفاتورة */
-.summary {
-  margin-top: 10px;
-  border-top: 1px solid #000;
-  padding-top: 6px;
-  font-size: 13px;
-}
-
-.summary div {
-  margin: 3px 0;
-  text-align: left;
-}
-
-.summary strong {
-  font-weight: bold;
-}
-
-/* إزالة الهوامش وقت الطباعة */
 @media print {
   body { margin: 0; }
 }
@@ -2015,7 +1877,6 @@ tbody tr:not(.total-row) td {
 
 <body>
 
-<!-- ===== HEADER ===== -->
 <div class="header">
   <div class="info">
     <div><strong>رقم الفاتورة:</strong> ${invoice.id}</div>
@@ -2035,72 +1896,53 @@ tbody tr:not(.total-row) td {
 
 <div class="hr-bold"></div>
 
-<!-- ===== جدول الأصناف ===== -->
 <table>
-  <thead>
-    <tr>
-      <th>م</th>
-      <th class="name">الصنف</th>
-      <th>الكمية</th>
-      <th>السعر</th>
-      <th>الإجمالي</th>
-    </tr>
-  </thead>
-  <tbody>
-    ${rowsHtml}
+<thead>
+<tr>
+<th>م</th>
+<th>الصنف</th>
+<th>الكمية</th>
+<th>السعر</th>
+<th>الإجمالي</th>
+</tr>
+</thead>
 
-    <!-- صف إجمالي الكمية وإجمالي السعر -->
-   <tr class="total-row">
+<tbody>
+${rowsHtml}
 
-      <td></td>
-      <td></td>
-      <td>${totalQty}</td>
-      <td></td>
-      <td>${subtotal.toFixed(2)}</td>
-    </tr>
+<tr class="total-row">
+<td></td>
+<td></td>
+<td>${totalQty}</td>
+<td></td>
+<td>${subtotal.toFixed(2)}</td>
+</tr>
 
-    
 ${
   previousBalance
     ? `
 <tr class="summary-row">
-  <td colspan="3"></td>
-  <td class="summary-label">حساب سابق</td>
-  <td class="summary-value">${previousBalance.toFixed(2)}</td>
-</tr>
-`
-    : ""
-}
-
-${
-  discount
-    ? `
-<tr class="summary-row">
-  <td colspan="3"></td>
-  <td class="summary-label">خصم</td>
-  <td class="summary-value">- ${discount.toFixed(2)}</td>
-</tr>
-`
+<td colspan="3"></td>
+<td class="summary-label">حساب سابق</td>
+<td class="summary-value">${previousBalance.toFixed(2)}</td>
+</tr>`
     : ""
 }
 
 <tr class="summary-row total-net">
-  <td colspan="3"></td>
-  <td class="summary-label">الصافي</td>
-  <td class="summary-value">${netTotal.toFixed(2)}</td>
+<td colspan="3"></td>
+<td class="summary-label">الصافي</td>
+<td class="summary-value">${netTotal.toFixed(2)}</td>
 </tr>
-
 
 ${
   paid
     ? `
-<tr class="summary-row paid-row">
-  <td colspan="3"></td>
-  <td class="summary-label">المدفوع</td>
-  <td class="summary-value">${paid.toFixed(2)}</td>
-</tr>
-
-`
+<tr class="summary-row">
+<td colspan="3"></td>
+<td class="summary-label">المدفوع</td>
+<td class="summary-value">${paid.toFixed(2)}</td>
+</tr>`
     : ""
 }
 
@@ -2108,24 +1950,17 @@ ${
   remaining
     ? `
 <tr class="summary-row remaining">
-  <td colspan="3"></td>
-  <td class="summary-label">الباقي</td>
-  <td class="summary-value">${remaining.toFixed(2)}</td>
-</tr>
-
-`
+<td colspan="3"></td>
+<td class="summary-label">الباقي</td>
+<td class="summary-value">${remaining.toFixed(2)}</td>
+</tr>`
     : ""
 }
 
-
-  </tbody>
-   </table>
-
-
-
+</tbody>
+</table>
 
 <script>
-// فتح نافذة الطباعة تلقائيًا عند تحميل الصفحة
 window.onload = () => window.print();
 </script>
 
