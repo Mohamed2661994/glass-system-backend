@@ -1977,11 +1977,10 @@ tbody tr:not(.total-row) td {
       previousBalance
         ? `
 <tr class="summary-row">
-<td></td>
       <td></td>
-  <td colspan="4">حساب سابق</td>
-  <td></td>
-  <td>${previousBalance.toFixed(2)}</td>
+      <td colspan="4">حساب سابق</td>
+      <td></td>
+      <td>${previousBalance.toFixed(2)}</td>
 </tr>
 `
         : ""
@@ -1991,7 +1990,6 @@ ${
   discount
     ? `
 <tr class="summary-row">
-<td></td>
       <td></td>
   <td colspan="4">خصم</td>
   <td></td>
@@ -2002,7 +2000,7 @@ ${
 }
 
 <tr class="summary-row total-net">
-<td></td>
+
       <td></td>
   <td colspan="4">الصافي</td>
   <td></td>
@@ -2013,7 +2011,7 @@ ${
   paid
     ? `
 <tr class="summary-row">
-<td></td>
+
       <td></td>
   <td colspan="4">المدفوع</td>
   <td></td>
@@ -2027,7 +2025,7 @@ ${
   remaining
     ? `
 <tr class="summary-row remaining">
-<td></td>
+
       <td></td>
   <td colspan="4">الباقي</td>
   <td></td>
