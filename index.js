@@ -1831,7 +1831,8 @@ tbody tr:not(.total-row):not(.summary-row) td {
 /* ===== NEW SUMMARY BOX STYLE (الجديد الحقيقي) ===== */
 
 .summary-row td {
-  padding: 8px 6px;
+  padding: 6px 6px;
+  vertical-align: middle;
 }
 
 .summary-box-start td {
@@ -1839,14 +1840,18 @@ tbody tr:not(.total-row):not(.summary-row) td {
   padding-top: 10px;
 }
 
+/* اسم البند */
 .summary-label {
   text-align: right;
   font-weight: 600;
+  padding-right: 8px;
 }
 
+/* الرقم */
 .summary-value {
-  text-align: left;
+  text-align: left;          /* كل الأرقام شمال */
   font-weight: 600;
+  width: 80px;               /* عمود ثابت */
 }
 
 /* الصافي */
@@ -1936,7 +1941,7 @@ ${
 }
 
 ${
-  remaining
+  remaining && remaining !== netTotal
     ? `
 <tr class="summary-row remaining">
 <td colspan="3"></td>
@@ -1945,6 +1950,7 @@ ${
 </tr>`
     : ""
 }
+
 
 </tbody>
 </table>
