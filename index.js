@@ -1849,7 +1849,7 @@ th, td {
   border-bottom: 1px solid #000;
   padding: 6px;             /* ⬅️ زودنا الارتفاع */
   text-align: center;
-  line-height: 1.8;         /* ⬅️ طول السطر */
+  line-height: 1.5;         /* ⬅️ طول السطر */
 }
 
 th {
@@ -1928,7 +1928,7 @@ td.name {
     <!-- صف إجمالي الكمية وإجمالي السعر -->
     <tr style="font-weight:bold">
       <td></td>
-      <td class="name">الإجمالي</td>
+      <td></td>
       <td>${totalQty}</td>
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
