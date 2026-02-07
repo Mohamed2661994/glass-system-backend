@@ -1892,8 +1892,6 @@ td.name {
 
 <div class="hr-bold"></div>
 
-<div class="title">فاتورة</div>
-
 <table>
   <thead>
     <tr>
@@ -1908,6 +1906,7 @@ td.name {
     ${rowsHtml}
     <tr style="font-weight:bold">
       <td></td>
+      <td class="name">./td>
       <td>${totalQty}</td>
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
