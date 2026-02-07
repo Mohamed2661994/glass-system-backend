@@ -1881,6 +1881,12 @@ tbody tr:not(.total-row):not(.summary-row) td {
     <div><strong>رقم الفاتورة:</strong> ${invoice.id}</div>
     <div><strong>التاريخ:</strong> ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
     <div><strong>العميل:</strong> ${invoice.customer_name || "نقدي"}</div>
+    ${
+      invoice.customer_phone
+        ? `<div><strong>تليفون:</strong> ${invoice.customer_phone}</div>`
+        : ""
+    }
+
   </div>
   <div class="logo"><img src="/assets/logo.png"></div>
 </div>
