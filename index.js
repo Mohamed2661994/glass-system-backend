@@ -1846,7 +1846,7 @@ table {
 }
 
 th, td {
-  border-bottom: 1px solid #000;
+ 
   padding: 5px;             /* ⬅️ زودنا الارتفاع */
   text-align: center;
   line-height: 1.3;         /* ⬅️ طول السطر */
