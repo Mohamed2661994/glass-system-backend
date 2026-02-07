@@ -1577,7 +1577,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
 <style>
   body {
     font-family: 'Cairo', sans-serif;
-    font-size: 12px;
+    font-size: 14px;
     direction: rtl;
   }
   h2 {
@@ -1599,7 +1599,7 @@ app.get("/invoices/:id/pdf", async (req, res) => {
   }
   .summary {
     margin-top: 15px;
-    text-align: right;
+    text-align: left;
   }
 </style>
 </head>
@@ -1809,7 +1809,7 @@ app.get("/invoices/:id/print", async (req, res) => {
 /* الإعدادات العامة */
 body {
   font-family: Cairo, Arial, sans-serif;
-  font-size: 13px;
+  font-size: 14px;
   margin: 0;
   color: #000;
 }
@@ -1825,7 +1825,7 @@ body {
 .info {
   text-align: right;
   font-size: 14px;
-  line-height: 2;
+  line-height: 1.8;
 }
 
 /* اللوجو */
@@ -1847,17 +1847,22 @@ table {
 
 th, td {
   border-bottom: 1px solid #000;
-  padding: 4px;
+  padding: 6px;             /* ⬅️ زودنا الارتفاع */
   text-align: center;
+  line-height: 1.8;         /* ⬅️ طول السطر */
 }
 
 th {
   border-bottom: 2px solid #000;
+   font-size: 14px;
 }
 
+/* اسم الصنف */
 td.name {
-  text-align: right;
+  text-align: center;       /* ⬅️ في وسط الحقل */
   white-space: normal;
+  font-size: 15px;          /* ⬅️ أكبر شوية */
+  line-height: 1.9;
 }
 
 /* ملخص الفاتورة */
