@@ -1703,12 +1703,16 @@ app.get("/invoices/:id/print", async (req, res) => {
   const invoiceId = req.params.id;
 
   try {
+    /* =========================
+       1) جلب البيانات
+    ========================= */
     const invoiceRes = await pool.query(
       `SELECT * FROM invoices WHERE id = $1`,
       [invoiceId],
     );
-    if (!invoiceRes.rows.length)
+    if (!invoiceRes.rows.length) {
       return res.status(404).send("Invoice not found");
+    }
 
     const itemsRes = await pool.query(
       `
@@ -1724,7 +1728,9 @@ app.get("/invoices/:id/print", async (req, res) => {
     const invoice = invoiceRes.rows[0];
     const items = itemsRes.rows;
 
-    /* ===== الحسابات ===== */
+    /* =========================
+       2) الحسابات
+    ========================= */
     const unitPrice = (it) =>
       invoice.apply_items_discount
         ? Number(it.price) - Number(it.discount || 0)
@@ -1742,7 +1748,9 @@ app.get("/invoices/:id/print", async (req, res) => {
     const netTotal = subtotal + previousBalance - discount;
     const remaining = netTotal - paid;
 
-    /* ===== صفوف الجدول ===== */
+    /* =========================
+       3) صفوف الجدول
+    ========================= */
     const rowsHtml = items
       .map((it, i) => {
         const pack = it.package
@@ -1766,12 +1774,14 @@ app.get("/invoices/:id/print", async (req, res) => {
       })
       .join("");
 
+    /* =========================
+       4) HTML النهائي (مظبوط)
+    ========================= */
     res.send(`
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
-<title>فاتورة</title>
 
 <style>
 @page { size: A5; margin: 10mm; }
@@ -1783,38 +1793,37 @@ body {
   color: #000;
 }
 
+/* ===== Header ===== */
 .header {
   display: flex;
   justify-content: space-between;
-}
-
-.logo img { width: 75px; }
-
-.info { font-size: 12px; line-height: 1.6; }
-
-.hr-bold { border-top: 2px solid #000; margin: 6px 0; }
-
-.title { text-align: center; font-weight: bold; margin: 6px 0; }
-
-.content {
-  display: flex;
-  justify-content: space-between;
   align-items: flex-start;
-  gap: 10px;
 }
 
-.table-wrap { width: 70%; }
-
-.summary {
-  width: 28%;
-  font-size: 13px;
+.logo img {
+  width: 75px;
 }
 
-.summary div {
-  margin: 3px 0;
+.info {
   text-align: right;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
+/* ===== Lines ===== */
+.hr-bold {
+  border-top: 2px solid #000;
+  margin: 6px 0;
+}
+
+/* ===== Title ===== */
+.title {
+  text-align: center;
+  font-weight: bold;
+  margin: 6px 0;
+}
+
+/* ===== Table ===== */
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1826,62 +1835,90 @@ th, td {
   text-align: center;
 }
 
-th { border-bottom: 2px solid #000; }
+th {
+  border-bottom: 2px solid #000;
+}
 
-td.name { text-align: right; white-space: normal; }
+td.name {
+  text-align: right;
+  white-space: normal;
+}
 
-@media print { body { margin: 0; } }
+/* ===== Summary ===== */
+.summary {
+  margin-top: 6px;
+  border-top: 2px solid #000;
+  padding-top: 6px;
+  font-size: 13px;
+}
+
+.summary div {
+  margin: 3px 0;
+  text-align: right;
+}
+
+.summary strong {
+  font-weight: bold;
+}
+
+@media print {
+  body { margin: 0; }
+}
 </style>
 </head>
 
 <body>
 
+<!-- ===== HEADER ===== -->
 <div class="header">
-  <div class="logo"><img src="/assets/logo.png"></div>
+  <div class="logo">
+    <img src="/assets/logo.png">
+  </div>
+
   <div class="info">
     <div><strong>رقم الفاتورة:</strong> ${invoice.id}</div>
     <div><strong>التاريخ:</strong> ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
     <div><strong>العميل:</strong> ${invoice.customer_name || "نقدي"}</div>
+    ${
+      invoice.customer_phone
+        ? `<div><strong>تليفون:</strong> ${invoice.customer_phone}</div>`
+        : ""
+    }
   </div>
 </div>
 
 <div class="hr-bold"></div>
+
 <div class="title">فاتورة</div>
 
-<div class="content">
+<table>
+  <thead>
+    <tr>
+      <th>م</th>
+      <th class="name">الصنف</th>
+      <th>الكمية</th>
+      <th>السعر</th>
+      <th>الإجمالي</th>
+    </tr>
+  </thead>
+  <tbody>
+    ${rowsHtml}
+    <tr style="font-weight:bold">
+      <td></td>
+      <td class="name">الإجمالي</td>
+      <td>${totalQty}</td>
+      <td></td>
+      <td>${subtotal.toFixed(2)}</td>
+    </tr>
+  </tbody>
+</table>
 
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>م</th>
-          <th class="name">الصنف</th>
-          <th>الكمية</th>
-          <th>السعر</th>
-          <th>الإجمالي</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rowsHtml}
-        <tr style="font-weight:bold">
-          <td></td>
-          <td class="name">الإجمالي</td>
-          <td>${totalQty}</td>
-          <td></td>
-          <td>${subtotal.toFixed(2)}</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div class="summary">
-    ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
-    ${discount ? `<div>خصم: ${discount.toFixed(2)}</div>` : ""}
-    <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
-    ${paid ? `<div>المدفوع: ${paid.toFixed(2)}</div>` : ""}
-    ${remaining ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>` : ""}
-  </div>
-
+<div class="summary">
+  ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
+  ${discount ? `<div>خصم: ${discount.toFixed(2)}</div>` : ""}
+  <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
+  ${paid ? `<div>المدفوع: ${paid.toFixed(2)}</div>` : ""}
+  ${remaining ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>` : ""}
 </div>
 
 <script>
