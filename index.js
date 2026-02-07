@@ -1739,10 +1739,10 @@ app.get("/invoices/:id/print", async (req, res) => {
         ? Number(it.price) - Number(it.discount || 0)
         : Number(it.price);
 
-    const itemTotal = (it) => unitPrice(it) * Number(it.quantity);
+    const itemTotal = (it) => unitPrice(it) * Number(it.quantity || 0);
 
     const subtotal = items.reduce((s, it) => s + itemTotal(it), 0);
-    const totalQty = items.reduce((s, it) => s + Number(it.quantity), 0);
+    const totalQty = items.reduce((s, it) => s + Number(it.quantity || 0), 0);
 
     const previousBalance = Number(invoice.previous_balance) || 0;
     const discount = Number(invoice.manual_discount) || 0;
@@ -1756,19 +1756,20 @@ app.get("/invoices/:id/print", async (req, res) => {
     ========================= */
     const rowsHtml = items
       .map((it, i) => {
-        const name = [it.product_name, it.manufacturer]
-          .filter(Boolean)
-          .join(" ");
-
         const pack = it.package
           ? it.package.replace(/كرتونة\s*/g, "").trim()
           : "";
+
+        const name = `
+          ${it.product_name}
+          ${it.manufacturer ? " - " + it.manufacturer : ""}
+          ${pack ? " (" + pack + ")" : ""}
+        `;
 
         return `
 <tr>
   <td>${i + 1}</td>
   <td class="name">${name}</td>
-  <td>${pack}</td>
   <td>${it.quantity}</td>
   <td>${unitPrice(it).toFixed(2)}</td>
   <td>${itemTotal(it).toFixed(2)}</td>
@@ -1777,7 +1778,7 @@ app.get("/invoices/:id/print", async (req, res) => {
       .join("");
 
     /* =========================
-       4) HTML (نفس التصميم)
+       4) HTML النهائي (نفس التصميم)
     ========================= */
     res.send(`
 <!DOCTYPE html>
@@ -1799,6 +1800,7 @@ body {
   color: #000;
 }
 
+/* ===== Header ===== */
 .header {
   display: flex;
   justify-content: space-between;
@@ -1807,7 +1809,7 @@ body {
 }
 
 .logo img {
-  width: 70px;
+  width: 75px;
 }
 
 .info {
@@ -1816,32 +1818,46 @@ body {
   line-height: 1.6;
 }
 
+/* ===== Lines ===== */
+.hr-bold {
+  border-top: 2px solid #000;
+  margin: 6px 0;
+}
+
+/* ===== Title ===== */
 .title {
   text-align: center;
   font-weight: bold;
   margin: 6px 0;
 }
 
+/* ===== Table ===== */
 table {
   width: 100%;
   border-collapse: collapse;
 }
 
-th, td {
-  border-bottom: 1px solid #000;
-  padding: 4px;
+thead th {
+  border-bottom: 2px solid #000;
+  padding: 5px;
   text-align: center;
-  white-space: nowrap;
 }
 
-th.name,
+tbody td {
+  border-bottom: 1px solid #000;
+  padding: 5px;
+  text-align: center;
+}
+
 td.name {
   text-align: right;
+  white-space: normal;
 }
 
+/* ===== Summary ===== */
 .summary {
-  margin-top: 8px;
-  border-top: 1px solid #000;
+  margin-top: 6px;
+  border-top: 2px solid #000;
   padding-top: 6px;
   font-size: 13px;
 }
@@ -1849,6 +1865,10 @@ td.name {
 .summary div {
   margin: 2px 0;
   text-align: right;
+}
+
+.summary strong {
+  font-weight: bold;
 }
 
 @media print {
@@ -1859,17 +1879,20 @@ td.name {
 
 <body>
 
+<!-- ===== HEADER ===== -->
 <div class="header">
   <div class="logo">
     <img src="/assets/logo.png">
   </div>
 
   <div class="info">
-    <div>رقم الفاتورة: ${invoice.id}</div>
-    <div>التاريخ: ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
-    <div>العميل: ${invoice.customer_name || ""}</div>
+    <div><strong>رقم الفاتورة:</strong> ${invoice.id}</div>
+    <div><strong>التاريخ:</strong> ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
+    <div><strong>العميل:</strong> ${invoice.customer_name || "نقدي"}</div>
   </div>
 </div>
+
+<div class="hr-bold"></div>
 
 <div class="title">فاتورة</div>
 
@@ -1878,7 +1901,6 @@ td.name {
 <tr>
   <th>م</th>
   <th class="name">الصنف</th>
-  <th>العبوة</th>
   <th>الكمية</th>
   <th>السعر</th>
   <th>الإجمالي</th>
@@ -1891,10 +1913,13 @@ ${rowsHtml}
 
 <div class="summary">
   <div>إجمالي الكمية: ${totalQty}</div>
+
   ${subtotal ? `<div>الإجمالي: ${subtotal.toFixed(2)}</div>` : ""}
   ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
   ${discount ? `<div>خصم: ${discount.toFixed(2)}</div>` : ""}
+
   <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
+
   ${paid ? `<div>المدفوع: ${paid.toFixed(2)}</div>` : ""}
   ${remaining ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>` : ""}
 </div>
