@@ -131,11 +131,11 @@ app.get("/products", async (req, res) => {
         ELSE p.retail_purchase_price
       END AS price,
       p.discount_amount,
-      0COALESCE(s.quantity, 0) AS available_quantity
+     COALESCE(s.quantity, 0) AS available_quantity
     FROM products p
     LEFT JOIN stock s
-    ON s.product_id = p.id
-    AND s.warehouse_id = $2
+      ON s.product_id = p.id
+      AND s.warehouse_id = $2
     WHERE p.is_active = true
     ORDER BY p.name
     `,
