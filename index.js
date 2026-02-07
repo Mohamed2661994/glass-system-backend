@@ -1847,7 +1847,7 @@ table {
 
 th, td {
   border-bottom: 1px solid #000;
-  padding: 6px;             /* ⬅️ زودنا الارتفاع */
+  padding: 5px;             /* ⬅️ زودنا الارتفاع */
   text-align: center;
   line-height: 1.3;         /* ⬅️ طول السطر */
 }
@@ -1926,16 +1926,16 @@ td.name {
     ${rowsHtml}
 
     <!-- صف إجمالي الكمية وإجمالي السعر -->
-   
-  </tbody>
-   </table>
-<tr style="font-weight:bold">
+   <tr style="font-weight:bold">
       <td></td>
       <td></td>
       <td>${totalQty}</td>
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
     </tr>
+  </tbody>
+   </table>
+
 
 <!-- ===== ملخص الفاتورة ===== -->
 <div class="summary">
