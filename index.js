@@ -1699,21 +1699,28 @@ ${items
   }
 });
 
+// Endpoint لطباعة الفاتورة كصفحة HTML (المتصفح هو اللي بيطبع / يحفظ PDF)
 app.get("/invoices/:id/print", async (req, res) => {
+  // رقم الفاتورة جاي من الـ URL
   const invoiceId = req.params.id;
 
   try {
-    /* =========================
-       1) جلب البيانات
-    ========================= */
+    /* ======================================================
+       1) جلب بيانات الفاتورة الأساسية (العميل – التاريخ …)
+    ====================================================== */
     const invoiceRes = await pool.query(
       `SELECT * FROM invoices WHERE id = $1`,
       [invoiceId],
     );
+
+    // لو الفاتورة مش موجودة
     if (!invoiceRes.rows.length) {
       return res.status(404).send("Invoice not found");
     }
 
+    /* ======================================================
+       2) جلب أصناف الفاتورة + اسم المصنع من جدول المنتجات
+    ====================================================== */
     const itemsRes = await pool.query(
       `
       SELECT ii.*, p.manufacturer
@@ -1728,41 +1735,53 @@ app.get("/invoices/:id/print", async (req, res) => {
     const invoice = invoiceRes.rows[0];
     const items = itemsRes.rows;
 
-    /* =========================
-       2) الحسابات
-    ========================= */
+    /* ======================================================
+       3) دوال الحسابات (سعر – إجمالي – مجاميع)
+    ====================================================== */
+
+    // حساب سعر الوحدة (مع أو بدون خصم)
     const unitPrice = (it) =>
       invoice.apply_items_discount
         ? Number(it.price) - Number(it.discount || 0)
         : Number(it.price);
 
+    // إجمالي الصنف = سعر الوحدة × الكمية
     const itemTotal = (it) => unitPrice(it) * Number(it.quantity || 0);
 
+    // إجمالي كل الأصناف
     const subtotal = items.reduce((s, it) => s + itemTotal(it), 0);
+
+    // إجمالي الكميات
     const totalQty = items.reduce((s, it) => s + Number(it.quantity || 0), 0);
 
+    // قيم الفاتورة الإضافية
     const previousBalance = Number(invoice.previous_balance) || 0;
     const discount = Number(invoice.manual_discount) || 0;
     const paid = Number(invoice.paid_amount) || 0;
 
+    // الصافي والمتبقي
     const netTotal = subtotal + previousBalance - discount;
     const remaining = netTotal - paid;
 
-    /* =========================
-       3) صفوف الجدول
-    ========================= */
+    /* ======================================================
+       4) تجهيز صفوف جدول الأصناف (HTML ديناميكي)
+    ====================================================== */
     const rowsHtml = items
       .map((it, i) => {
+        // تنظيف نص العبوة (إزالة كلمة كرتونة)
         const pack = it.package
           ? it.package.replace(/كرتونة\s*/g, "").trim()
           : "";
 
+        // اسم الصنف بالشكل:
+        // اسم الصنف - المصنع (العبوة)
         const name = `
           ${it.product_name}
           ${it.manufacturer ? " - " + it.manufacturer : ""}
           ${pack ? " (" + pack + ")" : ""}
         `;
 
+        // صف الجدول
         return `
 <tr>
   <td>${i + 1}</td>
@@ -1774,9 +1793,9 @@ app.get("/invoices/:id/print", async (req, res) => {
       })
       .join("");
 
-    /* =========================
-       4) HTML النهائي (مظبوط)
-    ========================= */
+    /* ======================================================
+       5) إرسال صفحة HTML كاملة للطباعة
+    ====================================================== */
     res.send(`
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -1784,8 +1803,10 @@ app.get("/invoices/:id/print", async (req, res) => {
 <meta charset="UTF-8">
 
 <style>
+/* إعدادات حجم الورق للطباعة */
 @page { size: A5; margin: 10mm; }
 
+/* الإعدادات العامة */
 body {
   font-family: Cairo, Arial, sans-serif;
   font-size: 13px;
@@ -1799,32 +1820,26 @@ body {
   justify-content: space-between;
   align-items: flex-start;
 }
+
+/* بيانات الفاتورة */
 .info {
   text-align: right;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: 14px;
+  line-height: 2;
 }
 
+/* اللوجو */
 .logo img {
   width: 75px;
 }
 
-
-
-/* ===== Lines ===== */
+/* خط فاصل عريض */
 .hr-bold {
   border-top: 2px solid #000;
   margin: 6px 0;
 }
 
-/* ===== Title ===== */
-.title {
-  text-align: center;
-  font-weight: bold;
-  margin: 6px 0;
-}
-
-/* ===== Table ===== */
+/* الجدول */
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1845,7 +1860,7 @@ td.name {
   white-space: normal;
 }
 
-/* ===== Summary ===== */
+/* ملخص الفاتورة */
 .summary {
   margin-top: 6px;
   border-top: 2px solid #000;
@@ -1855,13 +1870,14 @@ td.name {
 
 .summary div {
   margin: 3px 0;
-  text-align: left;
+  text-align: right;
 }
 
 .summary strong {
   font-weight: bold;
 }
 
+/* إزالة الهوامش وقت الطباعة */
 @media print {
   body { margin: 0; }
 }
@@ -1872,7 +1888,6 @@ td.name {
 
 <!-- ===== HEADER ===== -->
 <div class="header">
-  
   <div class="info">
     <div><strong>رقم الفاتورة:</strong> ${invoice.id}</div>
     <div><strong>التاريخ:</strong> ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
@@ -1883,15 +1898,15 @@ td.name {
         : ""
     }
   </div>
-<div class="logo">
+
+  <div class="logo">
     <img src="/assets/logo.png">
   </div>
-  </div>
-
-
+</div>
 
 <div class="hr-bold"></div>
 
+<!-- ===== جدول الأصناف ===== -->
 <table>
   <thead>
     <tr>
@@ -1904,9 +1919,11 @@ td.name {
   </thead>
   <tbody>
     ${rowsHtml}
+
+    <!-- صف إجمالي الكمية وإجمالي السعر -->
     <tr style="font-weight:bold">
       <td></td>
-      <td class="name">./td>
+      <td class="name">الإجمالي</td>
       <td>${totalQty}</td>
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
@@ -1914,6 +1931,7 @@ td.name {
   </tbody>
 </table>
 
+<!-- ===== ملخص الفاتورة ===== -->
 <div class="summary">
   ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
   ${discount ? `<div>خصم: ${discount.toFixed(2)}</div>` : ""}
@@ -1923,7 +1941,8 @@ td.name {
 </div>
 
 <script>
-  window.onload = () => window.print();
+// فتح نافذة الطباعة تلقائيًا عند تحميل الصفحة
+window.onload = () => window.print();
 </script>
 
 </body>
