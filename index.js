@@ -1883,10 +1883,11 @@ td.name {
         : ""
     }
   </div>
-</div>
 <div class="logo">
     <img src="/assets/logo.png">
   </div>
+  </div>
+
 
 
 <div class="hr-bold"></div>
@@ -1907,7 +1908,6 @@ td.name {
     ${rowsHtml}
     <tr style="font-weight:bold">
       <td></td>
-      <td class="name">الإجمالي</td>
       <td>${totalQty}</td>
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
