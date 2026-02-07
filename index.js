@@ -1812,7 +1812,7 @@ app.get("/invoices/:id/print", async (req, res) => {
   margin: 10mm;
 }
 html, body {
-  width: 148mm;
+  width: 140mm;
   height: 210mm;
 }
 
@@ -2457,25 +2457,25 @@ app.get("/products/by-barcode/:barcode", async (req, res) => {
       // 🟢 شراء
       result = await pool.query(
         `
-        SELECT
-          p.id,
-          p.name,
-          p.wholesale_package,
-          p.retail_package,
-          p.manufacturer,
-          p.barcode,
-          CASE
-            WHEN $1 = 'wholesale' THEN p.purchase_price
-            ELSE p.retail_purchase_price
-          END AS price,
-          p.discount_amount,
-          0 AS available_quantity
-        FROM products p
-        WHERE p.barcode = $2
-          AND p.is_active = true
-        LIMIT 1
-        `,
-        [invoice_type, barcode],
+  SELECT
+    p.id,
+    p.name,
+    p.wholesale_package,
+    p.retail_package,
+    p.manufacturer,
+    p.barcode,
+    p.retail_purchase_price AS price,
+    p.discount_amount,
+    COALESCE(s.quantity, 0) AS available_quantity
+  FROM products p
+  LEFT JOIN stock s
+    ON s.product_id = p.id
+    AND s.warehouse_id = $1
+  WHERE p.barcode = $2
+    AND p.is_active = true
+  LIMIT 1
+  `,
+        [warehouseId, barcode],
       );
     }
 
