@@ -1927,21 +1927,30 @@ tbody tr:not(.total-row) td {
 .summary-label {
   text-align: right;
   font-weight: 600;
+  border-right: 1px solid #000;
+  border-left: 1px solid #000;
 }
+
 
 .summary-value {
   text-align: center;
-  border-bottom: 1px solid #000;
   font-weight: 600;
+  border-left: 1px solid #000;
+  border-right: 1px solid #000;
+  border-bottom: 1px solid #000;
+}
+.summary-start .summary-label,
+.summary-start .summary-value {
+  border-top: 1px solid #000;
 }
 
 /* الصافي والباقي أوضح */
 .total-net .summary-value,
 .remaining .summary-value {
-  font-weight: 700;
-  font-size: 15px;
   border-bottom: 2px solid #000;
+  font-weight: 700;
 }
+
 
 
 
