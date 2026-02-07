@@ -1885,7 +1885,7 @@ tbody tr:not(.total-row) td {
 .summary-row td {
   font-weight: 500;
   padding: 3px 5px;
-   border: none;
+   border: none !important;
 }
 
 /* عمود الإجمالي */
@@ -1928,28 +1928,31 @@ tbody tr:not(.total-row) td {
   text-align: right;
   font-weight: 600;
   border-right: 1px solid #000;
-  border-left: 1px solid #000;
+  border-top: 1px solid #000;
+  border-bottom: 1px solid #000;
 }
-
 
 .summary-value {
   text-align: center;
   font-weight: 600;
   border-left: 1px solid #000;
-  border-right: 1px solid #000;
+  border-top: 1px solid #000;
   border-bottom: 1px solid #000;
 }
+
 .summary-start .summary-label,
 .summary-start .summary-value {
   border-top: 1px solid #000;
 }
 
 /* الصافي والباقي أوضح */
+.total-net .summary-label,
 .total-net .summary-value,
+.remaining .summary-label,
 .remaining .summary-value {
-  border-bottom: 2px solid #000;
   font-weight: 700;
 }
+
 
 
 
