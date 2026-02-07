@@ -1846,7 +1846,6 @@ table {
 }
 
 th, td {
- 
   padding: 5px;             /* ⬅️ زودنا الارتفاع */
   text-align: center;
   line-height: 1.3;         /* ⬅️ طول السطر */
@@ -1863,6 +1862,13 @@ td.name {
   white-space: normal;
   font-size: 13px;          /* ⬅️ أكبر شوية */
   line-height: 1.3;
+}
+tbody tr:not(.total-row) td {
+  border-bottom: 1px solid #000;
+}
+.total-row td {
+  font-weight: bold;
+  border-top: 2px solid #000;
 }
 
 /* ملخص الفاتورة */
@@ -1926,7 +1932,8 @@ td.name {
     ${rowsHtml}
 
     <!-- صف إجمالي الكمية وإجمالي السعر -->
-   <tr style="font-weight:bold">
+   <tr class="total-row">
+
       <td></td>
       <td></td>
       <td>${totalQty}</td>
