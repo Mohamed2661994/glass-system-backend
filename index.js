@@ -1861,8 +1861,8 @@ th {
 td.name {
   text-align: center;       /* ⬅️ في وسط الحقل */
   white-space: normal;
-  font-size: 15px;          /* ⬅️ أكبر شوية */
-  line-height: 1.9;
+  font-size: 14px;          /* ⬅️ أكبر شوية */
+  line-height: 1.5;
 }
 
 /* ملخص الفاتورة */
