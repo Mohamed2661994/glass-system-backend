@@ -1794,7 +1794,9 @@ body {
   justify-content: space-between;
 }
 
-.logo img { width: 75px; }
+.logo img {
+  width: 75px;
+}
 
 .hr-bold {
   border-top: 2px solid #000;
@@ -1815,6 +1817,10 @@ th {
   border-bottom: 2px solid #000;
 }
 
+td.name {
+  font-size: 13px;
+}
+
 tbody tr:not(.total-row):not(.summary-row) td {
   border-bottom: 1px solid #000;
 }
@@ -1823,15 +1829,13 @@ tbody tr:not(.total-row):not(.summary-row) td {
   font-weight: bold;
 }
 
-/* ===== NEW SUMMARY BOX STYLE (الجديد الحقيقي) ===== */
+/* =========================
+   SUMMARY MINI TABLE (BLUE)
+   ========================= */
 
 .summary-row td {
-  padding: 8px 6px;
-}
-
-.summary-box-start td {
-  border-top: 2px solid #000;
-  padding-top: 10px;
+  border: none !important;
+  padding: 6px 4px;
 }
 
 .summary-label {
@@ -1844,23 +1848,19 @@ tbody tr:not(.total-row):not(.summary-row) td {
   font-weight: 600;
 }
 
+/* الخط الأزرق تحت كل سطر */
+.summary-row {
+  border-bottom: 4px solid #1e5eff;
+}
+
 /* الصافي */
-.total-net .summary-label,
-.total-net .summary-value {
-  font-size: 15px;
+.total-net {
   font-weight: 700;
 }
 
 /* الباقي */
-.remaining .summary-label,
-.remaining .summary-value {
-  font-size: 16px;
+.remaining {
   font-weight: 800;
-}
-
-/* خلفية خفيفة */
-.summary-row {
-  background: #f7f7f7;
 }
 
 @media print {
@@ -1876,8 +1876,16 @@ tbody tr:not(.total-row):not(.summary-row) td {
     <div><strong>رقم الفاتورة:</strong> ${invoice.id}</div>
     <div><strong>التاريخ:</strong> ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
     <div><strong>العميل:</strong> ${invoice.customer_name || "نقدي"}</div>
+    ${
+      invoice.customer_phone
+        ? `<div><strong>تليفون:</strong> ${invoice.customer_phone}</div>`
+        : ""
+    }
   </div>
-  <div class="logo"><img src="/assets/logo.png"></div>
+
+  <div class="logo">
+    <img src="/assets/logo.png">
+  </div>
 </div>
 
 <div class="hr-bold"></div>
@@ -1885,7 +1893,11 @@ tbody tr:not(.total-row):not(.summary-row) td {
 <table>
 <thead>
 <tr>
-<th>م</th><th>الصنف</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th>
+<th>م</th>
+<th>الصنف</th>
+<th>الكمية</th>
+<th>السعر</th>
+<th>الإجمالي</th>
 </tr>
 </thead>
 
@@ -1893,13 +1905,17 @@ tbody tr:not(.total-row):not(.summary-row) td {
 ${rowsHtml}
 
 <tr class="total-row">
-<td></td><td></td><td>${totalQty}</td><td></td><td>${subtotal.toFixed(2)}</td>
+<td></td>
+<td></td>
+<td>${totalQty}</td>
+<td></td>
+<td>${subtotal.toFixed(2)}</td>
 </tr>
 
 ${
   previousBalance
     ? `
-<tr class="summary-row summary-box-start">
+<tr class="summary-row">
 <td colspan="3"></td>
 <td class="summary-label">حساب سابق</td>
 <td class="summary-value">${previousBalance.toFixed(2)}</td>
