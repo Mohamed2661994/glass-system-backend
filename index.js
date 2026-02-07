@@ -1812,7 +1812,7 @@ app.get("/invoices/:id/print", async (req, res) => {
   margin: 10mm;
 }
 html, body {
-  width: 130mm;
+  width: 125mm;
   height: 190mm;
 }
 
