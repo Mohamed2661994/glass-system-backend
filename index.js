@@ -1799,16 +1799,17 @@ body {
   justify-content: space-between;
   align-items: flex-start;
 }
-
-.logo img {
-  width: 75px;
-}
-
 .info {
   text-align: right;
   font-size: 12px;
   line-height: 1.6;
 }
+
+.logo img {
+  width: 75px;
+}
+
+
 
 /* ===== Lines ===== */
 .hr-bold {
@@ -1854,7 +1855,7 @@ td.name {
 
 .summary div {
   margin: 3px 0;
-  text-align: right;
+  text-align: left;
 }
 
 .summary strong {
@@ -1871,10 +1872,7 @@ td.name {
 
 <!-- ===== HEADER ===== -->
 <div class="header">
-  <div class="logo">
-    <img src="/assets/logo.png">
-  </div>
-
+  
   <div class="info">
     <div><strong>رقم الفاتورة:</strong> ${invoice.id}</div>
     <div><strong>التاريخ:</strong> ${new Date(invoice.created_at).toLocaleDateString("ar-EG")}</div>
@@ -1886,6 +1884,10 @@ td.name {
     }
   </div>
 </div>
+<div class="logo">
+    <img src="/assets/logo.png">
+  </div>
+
 
 <div class="hr-bold"></div>
 
