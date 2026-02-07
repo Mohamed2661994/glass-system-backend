@@ -1813,7 +1813,7 @@ app.get("/invoices/:id/print", async (req, res) => {
 }
 html, body {
   width: 130mm;
-  height: 210mm;
+  height: 190mm;
 }
 
 /* الإعدادات العامة */
