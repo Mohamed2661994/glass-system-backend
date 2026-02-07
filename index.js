@@ -131,12 +131,15 @@ app.get("/products", async (req, res) => {
         ELSE p.retail_purchase_price
       END AS price,
       p.discount_amount,
-      0 AS available_quantity
+      0COALESCE(s.quantity, 0) AS available_quantity
     FROM products p
+    LEFT JOIN stock s
+    ON s.product_id = p.id
+    AND s.warehouse_id = $2
     WHERE p.is_active = true
     ORDER BY p.name
     `,
-        [invoice_type],
+        [invoice_type, warehouseId],
       );
     }
 
@@ -1807,6 +1810,10 @@ app.get("/invoices/:id/print", async (req, res) => {
 @page {
   size: A5 portrait;
   margin: 10mm;
+}
+html, body {
+  width: 148mm;
+  height: 210mm;
 }
 
 /* الإعدادات العامة */
