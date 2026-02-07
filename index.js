@@ -1592,7 +1592,6 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     margin-top: 10px;
   }
   th, td {
-    border-bottom: 1px solid #000;
     padding: 4px;
     text-align: center;
     white-space: nowrap;
@@ -1874,7 +1873,6 @@ td.name {
   line-height: 1.3;
 }
 tbody tr:not(.total-row) td {
-  border-bottom: 1px solid #000;
 }
 .total-row td {
   font-weight: bold;
@@ -1919,7 +1917,6 @@ tbody tr:not(.total-row) td {
   border-bottom: 2px solid #000;
 }
 .summary-row {
-  border-bottom: 1px solid #000;   /* الخط الرفيع */
 }
 
 .summary-row td {
@@ -1930,12 +1927,15 @@ tbody tr:not(.total-row) td {
 .summary-label {
   text-align: right;
   font-weight: 600;
+  border-bottom: 1px solid #000;
+  padding: 4px 6px;
 }
 
-/* الرقم */
 .summary-value {
   text-align: left;
   font-weight: 600;
+  border-bottom: 1px solid #000;
+  padding: 4px 6px;
 }
 
 .summary-start .summary-label,
@@ -1943,12 +1943,13 @@ tbody tr:not(.total-row) td {
  
 }
 
-/* الصافي والباقي أوضح */
-.total-net,
-.remaining {
+/* الصافي والباقي أوضح شوية */
+.total-net .summary-label,
+.total-net .summary-value,
+.remaining .summary-label,
+.remaining .summary-value {
   font-weight: 700;
 }
-
 
 
 
