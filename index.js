@@ -1878,24 +1878,19 @@ tbody tr:not(.total-row) td {
 }
 .total-row td {
   font-weight: bold;
-  border-top: 2px solid #000;
+  
 }
 
-/* كل صفوف الملخص */
-.summary-row td {
-  font-weight: 500;
-  padding: 3px 5px;
-   border: none !important;
-}
+
 
 /* عمود الإجمالي */
 .summary-row td:last-child {
   text-align: center;
-   border-bottom: 1px solid #000;
+   border-bottom: 0.75px solid #000;
 }
 /* بداية قسم الإجماليات */
 .summary-start td:last-child {
-  border-top: 1px solid #000;
+ 
   padding-top: 6px;
 }
 
@@ -1923,36 +1918,36 @@ tbody tr:not(.total-row) td {
 .remaining td:last-child {
   border-bottom: 2px solid #000;
 }
+.summary-row {
+  border-bottom: 1px solid #000;   /* الخط الرفيع */
+}
 
+.summary-row td {
+  border: none !important;
+  padding: 4px 6px;
+}
+/* الكلام */
 .summary-label {
   text-align: right;
   font-weight: 600;
-  border-right: 1px solid #000;
-  border-top: 1px solid #000;
-  border-bottom: 1px solid #000;
 }
 
+/* الرقم */
 .summary-value {
-  text-align: center;
+  text-align: left;
   font-weight: 600;
-  border-left: 1px solid #000;
-  border-top: 1px solid #000;
-  border-bottom: 1px solid #000;
 }
 
 .summary-start .summary-label,
 .summary-start .summary-value {
-  border-top: 1px solid #000;
+ 
 }
 
 /* الصافي والباقي أوضح */
-.total-net .summary-label,
-.total-net .summary-value,
-.remaining .summary-label,
-.remaining .summary-value {
+.total-net,
+.remaining {
   font-weight: 700;
 }
-
 
 
 
