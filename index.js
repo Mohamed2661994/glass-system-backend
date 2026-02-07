@@ -1875,7 +1875,7 @@ td.name {
 
 .summary div {
   margin: 3px 0;
-  text-align: right;
+  text-align: left;
 }
 
 .summary strong {
@@ -1928,15 +1928,14 @@ td.name {
     <!-- صف إجمالي الكمية وإجمالي السعر -->
    
   </tbody>
-   <tr style="font-weight:bold">
+   </table>
+<tr style="font-weight:bold">
       <td></td>
       <td></td>
       <td>${totalQty}</td>
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
     </tr>
-</table>
-
 
 <!-- ===== ملخص الفاتورة ===== -->
 <div class="summary">
