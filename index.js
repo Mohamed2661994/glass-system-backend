@@ -1849,7 +1849,7 @@ th, td {
   border-bottom: 1px solid #000;
   padding: 6px;             /* ⬅️ زودنا الارتفاع */
   text-align: center;
-  line-height: 1.5;         /* ⬅️ طول السطر */
+  line-height: 1.3;         /* ⬅️ طول السطر */
 }
 
 th {
@@ -1861,8 +1861,8 @@ th {
 td.name {
   text-align: center;       /* ⬅️ في وسط الحقل */
   white-space: normal;
-  font-size: 14px;          /* ⬅️ أكبر شوية */
-  line-height: 1.5;
+  font-size: 13px;          /* ⬅️ أكبر شوية */
+  line-height: 1.3;
 }
 
 /* ملخص الفاتورة */
@@ -1922,7 +1922,9 @@ td.name {
       <th>الإجمالي</th>
     </tr>
   </thead>
-  <tbody>
+  
+</table>
+<tbody>
     ${rowsHtml}
 
     <!-- صف إجمالي الكمية وإجمالي السعر -->
@@ -1934,7 +1936,6 @@ td.name {
       <td>${subtotal.toFixed(2)}</td>
     </tr>
   </tbody>
-</table>
 
 <!-- ===== ملخص الفاتورة ===== -->
 <div class="summary">
