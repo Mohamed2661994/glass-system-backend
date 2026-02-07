@@ -2026,9 +2026,9 @@ ${
     ? `
 <tr class="summary-row remaining">
 
-      <td></td>
+      
   <td colspan="4">الباقي</td>
-  <td></td>
+  
   <td>${remaining.toFixed(2)}</td>
 </tr>
 `
