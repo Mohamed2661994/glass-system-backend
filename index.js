@@ -1804,7 +1804,10 @@ app.get("/invoices/:id/print", async (req, res) => {
 
 <style>
 /* إعدادات حجم الورق للطباعة */
-@page { size: A5; margin: 10mm; }
+@page {
+  size: A5 portrait;
+  margin: 10mm;
+}
 
 /* الإعدادات العامة */
 body {
