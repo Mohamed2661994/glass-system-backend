@@ -1881,10 +1881,32 @@ tbody tr:not(.total-row) td {
   border-top: 2px solid #000;
 }
 
+.summary-row td {
+  font-weight: 600;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+.summary-row td:last-child {
+  text-align: center; /* نفس عمود الإجمالي */
+}
+
+/* الصافي يكون أوضح */
+.total-net td {
+  border-top: 1px solid #000;
+  padding-top: 6px;
+}
+
+/* الباقي يلفت النظر */
+.remaining td:last-child {
+  font-weight: 700;
+}
+
+
 /* ملخص الفاتورة */
 .summary {
-  margin-top: 6px;
-  border-top: 2px solid #000;
+  margin-top: 10px;
+  border-top: 1px solid #000;
   padding-top: 6px;
   font-size: 13px;
 }
@@ -1950,18 +1972,62 @@ tbody tr:not(.total-row) td {
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
     </tr>
+
+    ${
+      previousBalance
+        ? `
+<tr class="summary-row">
+  <td colspan="4">حساب سابق</td>
+  <td>${previousBalance.toFixed(2)}</td>
+</tr>
+`
+        : ""
+    }
+
+${
+  discount
+    ? `
+<tr class="summary-row">
+  <td colspan="4">خصم</td>
+  <td>- ${discount.toFixed(2)}</td>
+</tr>
+`
+    : ""
+}
+
+<tr class="summary-row total-net">
+  <td colspan="4">الصافي</td>
+  <td>${netTotal.toFixed(2)}</td>
+</tr>
+
+${
+  paid
+    ? `
+<tr class="summary-row">
+  <td colspan="4">المدفوع</td>
+  <td>${paid.toFixed(2)}</td>
+</tr>
+`
+    : ""
+}
+
+${
+  remaining
+    ? `
+<tr class="summary-row remaining">
+  <td colspan="4">الباقي</td>
+  <td>${remaining.toFixed(2)}</td>
+</tr>
+`
+    : ""
+}
+
+
   </tbody>
    </table>
 
 
-<!-- ===== ملخص الفاتورة ===== -->
-<div class="summary">
-  ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
-  ${discount ? `<div>خصم: ${discount.toFixed(2)}</div>` : ""}
-  <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
-  ${paid ? `<div>المدفوع: ${paid.toFixed(2)}</div>` : ""}
-  ${remaining ? `<div><strong>المتبقي: ${remaining.toFixed(2)}</strong></div>` : ""}
-</div>
+
 
 <script>
 // فتح نافذة الطباعة تلقائيًا عند تحميل الصفحة
