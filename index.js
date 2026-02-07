@@ -1922,9 +1922,7 @@ td.name {
       <th>الإجمالي</th>
     </tr>
   </thead>
-  
-</table>
-<tbody>
+  <tbody>
     ${rowsHtml}
 
     <!-- صف إجمالي الكمية وإجمالي السعر -->
@@ -1936,6 +1934,8 @@ td.name {
       <td>${subtotal.toFixed(2)}</td>
     </tr>
   </tbody>
+</table>
+
 
 <!-- ===== ملخص الفاتورة ===== -->
 <div class="summary">
