@@ -1926,14 +1926,15 @@ td.name {
     ${rowsHtml}
 
     <!-- صف إجمالي الكمية وإجمالي السعر -->
-    <tr style="font-weight:bold">
+   
+  </tbody>
+   <tr style="font-weight:bold">
       <td></td>
       <td></td>
       <td>${totalQty}</td>
       <td></td>
       <td>${subtotal.toFixed(2)}</td>
     </tr>
-  </tbody>
 </table>
 
 
