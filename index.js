@@ -156,7 +156,8 @@ app.get("/public/products", async (req, res) => {
       SELECT
         id AS product_code,
         name,
-        wholesale_price
+        wholesale_price,
+        barcode
       FROM products
       WHERE is_active = true
       ORDER BY name
