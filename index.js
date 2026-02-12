@@ -2481,6 +2481,40 @@ app.get("/products/by-barcode/:barcode", async (req, res) => {
   }
 });
 
+// 🔎 فحص وجود باركود
+app.get("/admin/products/check-barcode/:barcode", async (req, res) => {
+  try {
+    const { barcode } = req.params;
+    const { exclude_id } = req.query; // 👈 مهم وقت التعديل
+
+    if (!barcode) {
+      return res.json({ exists: false });
+    }
+
+    let query = `
+      SELECT id
+      FROM products
+      WHERE barcode = $1
+    `;
+
+    const values = [barcode];
+
+    if (exclude_id) {
+      query += ` AND id <> $2`;
+      values.push(exclude_id);
+    }
+
+    const result = await pool.query(query, values);
+
+    res.json({
+      exists: result.rows.length > 0,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.post("/stock/transfer", async (req, res) => {
   const client = await pool.connect();
   try {
