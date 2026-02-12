@@ -150,13 +150,7 @@ app.get("/products", async (req, res) => {
   }
 });
 // 🌐 Public API لعرض الأصناف لموقع خارجي
-const PUBLIC_API_KEY = "my-secret-key";
-
 app.get("/public/products", async (req, res) => {
-  if (req.headers["x-api-key"] !== PUBLIC_API_KEY) {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-
   try {
     const result = await pool.query(`
       SELECT
@@ -170,6 +164,7 @@ app.get("/public/products", async (req, res) => {
 
     res.json(result.rows);
   } catch (err) {
+    console.error("PUBLIC PRODUCTS ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
