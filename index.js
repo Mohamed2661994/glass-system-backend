@@ -157,6 +157,8 @@ app.get("/public/products", async (req, res) => {
         id AS product_code,
         name,
         wholesale_price,
+        retail_price,
+        discount_amount,
         barcode
       FROM products
       WHERE is_active = true
