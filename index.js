@@ -237,29 +237,31 @@ app.get("/customers/by-phone", async (req, res) => {
 
     const customerResult = await pool.query(
       `
-      SELECT c.id, c.name
+      SELECT c.id, c.name, cp.phone
       FROM customer_phones cp
       JOIN customers c ON c.id = cp.customer_id
-      WHERE cp.phone = $1
-      LIMIT 1
+      WHERE cp.phone ILIKE $1
+      ORDER BY cp.phone
+      LIMIT 10
       `,
-      [phone],
+      [`%${phone}%`],
     );
 
-    if (customerResult.rows.length === 0) return res.json(null);
+    if (customerResult.rows.length === 0) return res.json([]);
 
-    const customer = customerResult.rows[0];
+    // Build unique customers with their phones
+    const customersMap = new Map();
+    for (const row of customerResult.rows) {
+      if (!customersMap.has(row.id)) {
+        customersMap.set(row.id, {
+          id: row.id,
+          name: row.name,
+          phone: row.phone,
+        });
+      }
+    }
 
-    const phonesResult = await pool.query(
-      `SELECT phone FROM customer_phones WHERE customer_id = $1`,
-      [customer.id],
-    );
-
-    res.json({
-      id: customer.id,
-      name: customer.name,
-      phones: phonesResult.rows,
-    });
+    res.json(Array.from(customersMap.values()));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
