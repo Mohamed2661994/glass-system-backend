@@ -4691,6 +4691,84 @@ function authMiddleware(req, res, next) {
   }
 }
 
+/* ===============================
+   🔔 NOTIFICATIONS - جلب إشعارات الفرع
+================================ */
+app.get("/notifications", authMiddleware, async (req, res) => {
+  try {
+    const branch_id = req.user.branch_id;
+    const { unread_only } = req.query;
+
+    let query = `
+      SELECT id, title, message, type, reference_id, is_read, created_at
+      FROM notifications
+      WHERE to_branch_id = $1
+    `;
+    const values = [branch_id];
+
+    if (unread_only === "true") {
+      query += ` AND is_read = false`;
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT 50`;
+
+    const result = await pool.query(query, values);
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    console.error("GET NOTIFICATIONS ERROR:", err);
+    res.status(500).json({ error: "فشل تحميل الإشعارات" });
+  }
+});
+
+/* ===============================
+   🔔 NOTIFICATIONS - عدد غير المقروءة
+================================ */
+app.get("/notifications/unread-count", authMiddleware, async (req, res) => {
+  try {
+    const branch_id = req.user.branch_id;
+    const result = await pool.query(
+      `SELECT COUNT(*) AS count FROM notifications WHERE to_branch_id = $1 AND is_read = false`,
+      [branch_id]
+    );
+    res.json({ success: true, count: parseInt(result.rows[0].count) });
+  } catch (err) {
+    console.error("UNREAD COUNT ERROR:", err);
+    res.status(500).json({ error: "خطأ" });
+  }
+});
+
+/* ===============================
+   🔔 NOTIFICATIONS - تعليم الكل كمقروء
+================================ */
+app.put("/notifications/read-all", authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE notifications SET is_read = true WHERE to_branch_id = $1 AND is_read = false`,
+      [req.user.branch_id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("READ ALL ERROR:", err);
+    res.status(500).json({ error: "خطأ" });
+  }
+});
+
+/* ===============================
+   🔔 NOTIFICATIONS - تعليم كمقروء
+================================ */
+app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE notifications SET is_read = true WHERE id = $1 AND to_branch_id = $2`,
+      [req.params.id, req.user.branch_id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("MARK READ ERROR:", err);
+    res.status(500).json({ error: "خطأ" });
+  }
+});
+
 const http = require("http");
 const { Server } = require("socket.io");
 
