@@ -2113,6 +2113,7 @@ app.get("/invoices", async (req, res) => {
         subtotal,
         discount_total,
         total,
+        previous_balance,
         paid_amount,
         remaining_amount,
         payment_status,
