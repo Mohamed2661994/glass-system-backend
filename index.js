@@ -3894,10 +3894,9 @@ app.get("/stock-transfers/summary/by-date", async (req, res) => {
       COALESCE(SUM(sti.from_quantity), 0) AS total_quantity
     FROM stock_transfer_items sti
     JOIN stock_transfers st ON st.id = sti.transfer_id
-    WHERE st.created_at >= ($1::date AT TIME ZONE 'Africa/Cairo')
-      AND st.created_at <  (($1::date + INTERVAL '1 day') AT TIME ZONE 'Africa/Cairo')
+    WHERE (st.created_at AT TIME ZONE 'Africa/Cairo')::date = $1::date
       AND sti.status = 'active'
-     AND st.status = 'active'
+      AND st.status = 'active'
 
     `,
     [date],
@@ -3942,8 +3941,7 @@ app.get("/stock-transfers/by-date", async (req, res) => {
       JOIN products p ON p.id = sti.product_id
       JOIN warehouses fw ON fw.id = sti.from_warehouse_id
       JOIN warehouses tw ON tw.id = sti.to_warehouse_id
-      WHERE st.created_at >= ($1::date AT TIME ZONE 'Africa/Cairo')
-        AND st.created_at <  (($1::date + INTERVAL '1 day') AT TIME ZONE 'Africa/Cairo')
+      WHERE (st.created_at AT TIME ZONE 'Africa/Cairo')::date = $1::date
       ORDER BY st.created_at ASC, sti.id ASC
       `,
       [date],
