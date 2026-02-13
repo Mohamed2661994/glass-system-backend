@@ -4744,10 +4744,14 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT || 3001;
 
 // Auto-migration: add apply_items_discount to customers if missing
-pool.query(`
+pool
+  .query(
+    `
   ALTER TABLE customers
   ADD COLUMN IF NOT EXISTS apply_items_discount BOOLEAN DEFAULT true
-`).catch(() => {});
+`,
+  )
+  .catch(() => {});
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server + Socket running on port ${PORT}`);
