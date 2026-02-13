@@ -4700,9 +4700,11 @@ app.get("/notifications", authMiddleware, async (req, res) => {
     const { unread_only } = req.query;
 
     let query = `
-      SELECT id, title, message, type, reference_id, is_read, created_at
-      FROM notifications
-      WHERE to_branch_id = $1
+      SELECT n.id, n.title, n.message, n.type, n.reference_id, n.is_read, n.created_at
+      FROM notifications n
+      JOIN users u ON u.id = n.from_user_id
+      WHERE n.to_branch_id = $1
+        AND u.branch_id != $1
     `;
     const values = [branch_id];
 
@@ -4727,8 +4729,10 @@ app.get("/notifications/unread-count", authMiddleware, async (req, res) => {
   try {
     const branch_id = req.user.branch_id;
     const result = await pool.query(
-      `SELECT COUNT(*) AS count FROM notifications WHERE to_branch_id = $1 AND is_read = false`,
-      [branch_id]
+      `SELECT COUNT(*) AS count FROM notifications n
+       JOIN users u ON u.id = n.from_user_id
+       WHERE n.to_branch_id = $1 AND n.is_read = false AND u.branch_id != $1`,
+      [branch_id],
     );
     res.json({ success: true, count: parseInt(result.rows[0].count) });
   } catch (err) {
@@ -4744,7 +4748,7 @@ app.put("/notifications/read-all", authMiddleware, async (req, res) => {
   try {
     await pool.query(
       `UPDATE notifications SET is_read = true WHERE to_branch_id = $1 AND is_read = false`,
-      [req.user.branch_id]
+      [req.user.branch_id],
     );
     res.json({ success: true });
   } catch (err) {
@@ -4760,7 +4764,7 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
   try {
     await pool.query(
       `UPDATE notifications SET is_read = true WHERE id = $1 AND to_branch_id = $2`,
-      [req.params.id, req.user.branch_id]
+      [req.params.id, req.user.branch_id],
     );
     res.json({ success: true });
   } catch (err) {
