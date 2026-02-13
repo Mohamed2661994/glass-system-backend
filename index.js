@@ -179,7 +179,7 @@ app.get("/customers/search", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT c.id, c.name,
+      SELECT c.id, c.name, c.apply_items_discount,
              (SELECT phone FROM customer_phones 
               WHERE customer_id = c.id 
               ORDER BY id ASC LIMIT 1) AS phone
@@ -237,7 +237,7 @@ app.get("/customers/by-phone", async (req, res) => {
 
     const customerResult = await pool.query(
       `
-      SELECT c.id, c.name, cp.phone
+      SELECT c.id, c.name, c.apply_items_discount, cp.phone
       FROM customer_phones cp
       JOIN customers c ON c.id = cp.customer_id
       WHERE cp.phone ILIKE $1
@@ -257,6 +257,7 @@ app.get("/customers/by-phone", async (req, res) => {
           id: row.id,
           name: row.name,
           phone: row.phone,
+          apply_items_discount: row.apply_items_discount,
         });
       }
     }
@@ -380,6 +381,12 @@ app.post("/invoices", authMiddleware, async (req, res) => {
           [customerId, customer_phone],
         );
       }
+
+      // Update customer discount preference
+      await client.query(
+        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
+        [apply_items_discount, customerId],
+      );
     }
 
     /* ================== إنشاء الفاتورة ================== */
@@ -634,6 +641,12 @@ app.post("/invoices/retail", async (req, res) => {
           [customerId, customer_phone],
         );
       }
+
+      // Update customer discount preference
+      await client.query(
+        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
+        [apply_items_discount, customerId],
+      );
     }
     /* ================== إنشاء الفاتورة ================== */
     const invoiceRes = await client.query(
@@ -4729,6 +4742,12 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 3001;
+
+// Auto-migration: add apply_items_discount to customers if missing
+pool.query(`
+  ALTER TABLE customers
+  ADD COLUMN IF NOT EXISTS apply_items_discount BOOLEAN DEFAULT true
+`).catch(() => {});
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server + Socket running on port ${PORT}`);
