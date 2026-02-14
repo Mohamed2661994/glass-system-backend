@@ -93,37 +93,68 @@ pool
 
 // 📦 إضافة variant_id لجدول stock
 pool
-  .query(`ALTER TABLE stock ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`)
+  .query(
+    `ALTER TABLE stock ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
+  )
   .then(() => console.log("✅ stock.variant_id column ready"))
   .catch((e) => console.error("❌ stock.variant_id error:", e.message));
 
 // 📦 إضافة variant_id لجدول stock_movements
 pool
-  .query(`ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`)
+  .query(
+    `ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
+  )
   .then(() => console.log("✅ stock_movements.variant_id column ready"))
-  .catch((e) => console.error("❌ stock_movements.variant_id error:", e.message));
+  .catch((e) =>
+    console.error("❌ stock_movements.variant_id error:", e.message),
+  );
 
 // 📦 إضافة variant_id لجدول invoice_items
 pool
-  .query(`ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`)
+  .query(
+    `ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
+  )
   .then(() => console.log("✅ invoice_items.variant_id column ready"))
   .catch((e) => console.error("❌ invoice_items.variant_id error:", e.message));
 
 // 📦 تحديث unique constraint على stock (warehouse_id, product_id, variant_id)
 pool
-  .query(`
+  .query(
+    `
     DO $$
     BEGIN
-      -- حذف القيد القديم لو موجود
+      -- حذف القيد القديم لو موجود (unique)
       IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_id_product_id_key') THEN
         ALTER TABLE stock DROP CONSTRAINT stock_warehouse_id_product_id_key;
       END IF;
-      -- إنشاء القيد الجديد لو مش موجود
-      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_product_variant_unique') THEN
+
+      -- حذف الـ primary key القديم لو مبني على (warehouse_id, product_id) بدون variant_id
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+        WHERE c.conrelid = 'stock'::regclass
+          AND c.contype = 'p'
+        GROUP BY c.oid
+        HAVING COUNT(*) = 2
+           AND BOOL_AND(a.attname IN ('warehouse_id','product_id'))
+      ) THEN
+        ALTER TABLE stock DROP CONSTRAINT stock_pkey;
+        -- إضافة primary key جديد يشمل variant_id
+        ALTER TABLE stock ADD PRIMARY KEY (warehouse_id, product_id, variant_id);
+      END IF;
+
+      -- إنشاء القيد الجديد لو مش موجود (احتياطي)
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_product_variant_unique')
+         AND NOT EXISTS (
+           SELECT 1 FROM pg_constraint
+           WHERE conrelid = 'stock'::regclass AND contype = 'p'
+         )
+      THEN
         ALTER TABLE stock ADD CONSTRAINT stock_warehouse_product_variant_unique UNIQUE (warehouse_id, product_id, variant_id);
       END IF;
     END $$;
-  `)
+  `,
+  )
   .then(() => console.log("✅ stock unique constraint updated"))
   .catch((e) => console.error("❌ stock constraint error:", e.message));
 
@@ -890,7 +921,14 @@ app.post("/invoices/retail", async (req, res) => {
         (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
         VALUES ($1,$2,$3,$4,$5,$6)
         `,
-        [invoiceId, warehouseId, item.product_id, variantId, item.quantity, movement_type],
+        [
+          invoiceId,
+          warehouseId,
+          item.product_id,
+          variantId,
+          item.quantity,
+          movement_type,
+        ],
       );
     }
 
@@ -977,7 +1015,12 @@ app.put("/invoices/retail/:id", async (req, res) => {
           SET quantity = quantity + $1
           WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
           `,
-          [oldItem.quantity, warehouseId, oldItem.product_id, oldItem.variant_id],
+          [
+            oldItem.quantity,
+            warehouseId,
+            oldItem.product_id,
+            oldItem.variant_id,
+          ],
         );
       } else {
         await client.query(
@@ -986,7 +1029,12 @@ app.put("/invoices/retail/:id", async (req, res) => {
           SET quantity = quantity - $1
           WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
           `,
-          [oldItem.quantity, warehouseId, oldItem.product_id, oldItem.variant_id],
+          [
+            oldItem.quantity,
+            warehouseId,
+            oldItem.product_id,
+            oldItem.variant_id,
+          ],
         );
       }
     }
@@ -1092,7 +1140,14 @@ app.put("/invoices/retail/:id", async (req, res) => {
         (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
         VALUES ($1,$2,$3,$4,$5,$6)
         `,
-        [invoiceId, warehouseId, item.product_id, variantId, item.quantity, movement_type],
+        [
+          invoiceId,
+          warehouseId,
+          item.product_id,
+          variantId,
+          item.quantity,
+          movement_type,
+        ],
       );
     }
 
@@ -1566,7 +1621,14 @@ app.put("/invoices/:id", async (req, res) => {
         (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
         VALUES ($1,$2,$3,$4,$5,$6)
         `,
-        [invoiceId, warehouseId, item.product_id, variantId, item.quantity, movement_type],
+        [
+          invoiceId,
+          warehouseId,
+          item.product_id,
+          variantId,
+          item.quantity,
+          movement_type,
+        ],
       );
     }
 

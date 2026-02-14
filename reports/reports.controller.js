@@ -69,10 +69,15 @@ exports.getInventorySummary = async (req, res) => {
       const vid = Number(row.variant_id) || 0;
       let pkgLabel;
       if (vid === 0) {
-        pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(" / ") || "-";
+        pkgLabel =
+          [row.wholesale_package, row.retail_package]
+            .filter(Boolean)
+            .join(" / ") || "-";
       } else {
         const v = variantsById[vid];
-        pkgLabel = v ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ") : "-";
+        pkgLabel = v
+          ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ")
+          : "-";
       }
       return { ...row, package_name: pkgLabel };
     });
@@ -211,10 +216,15 @@ exports.getLowStock = async (req, res) => {
       const vid = Number(row.variant_id) || 0;
       let pkgLabel;
       if (vid === 0) {
-        pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(" / ") || "-";
+        pkgLabel =
+          [row.wholesale_package, row.retail_package]
+            .filter(Boolean)
+            .join(" / ") || "-";
       } else {
         const v = variantsById[vid];
-        pkgLabel = v ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ") : "-";
+        pkgLabel = v
+          ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ")
+          : "-";
       }
       return { ...row, package_name: pkgLabel };
     });
@@ -328,11 +338,17 @@ exports.getInventoryDetails = async (req, res) => {
       let pkgLabel;
       let purchasePrice = row.purchase_price;
       if (vid === 0) {
-        pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(" / ") || "-";
+        pkgLabel =
+          [row.wholesale_package, row.retail_package]
+            .filter(Boolean)
+            .join(" / ") || "-";
       } else {
         const v = variantsById[vid];
         if (v) {
-          pkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ") || "-";
+          pkgLabel =
+            [v.wholesale_package, v.retail_package]
+              .filter(Boolean)
+              .join(" / ") || "-";
           purchasePrice = v.purchase_price;
         } else {
           pkgLabel = "-";
