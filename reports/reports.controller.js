@@ -38,6 +38,15 @@ exports.getInventorySummary = async (req, res) => {
 
       COALESCE(s.quantity, 0) AS current_stock,
 
+      -- العبوات المستخدمة في الحركات
+      (
+        SELECT string_agg(DISTINCT ii.package, '، ')
+        FROM stock_movements sm2
+        JOIN invoice_items ii ON ii.invoice_id = sm2.invoice_id AND ii.product_id = sm2.product_id
+        WHERE sm2.product_id = p.id AND sm2.warehouse_id = s.warehouse_id
+        AND ii.package IS NOT NULL AND ii.package != ''
+      ) AS packages,
+
       (
         COALESCE(SUM(
           CASE 
