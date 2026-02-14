@@ -44,7 +44,9 @@ app.get("/", (req, res) => {
 });
 
 // 📋 إنشاء جدول سجل النشاط لو مش موجود
-pool.query(`
+pool
+  .query(
+    `
   CREATE TABLE IF NOT EXISTS user_activity (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
@@ -53,8 +55,32 @@ pool.query(`
     ip_address VARCHAR(100),
     created_at TIMESTAMP DEFAULT NOW()
   )
-`).then(() => console.log("✅ user_activity table ready"))
+`,
+  )
+  .then(() => console.log("✅ user_activity table ready"))
   .catch((e) => console.error("❌ user_activity table error:", e.message));
+
+// 📦 إنشاء جدول الأكواد الفرعية (عبوات بديلة) لو مش موجود
+pool
+  .query(
+    `
+  CREATE TABLE IF NOT EXISTS product_variants (
+    id SERIAL PRIMARY KEY,
+    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    label VARCHAR(255),
+    barcode VARCHAR(100),
+    wholesale_package VARCHAR(255),
+    retail_package VARCHAR(255),
+    purchase_price NUMERIC DEFAULT 0,
+    retail_purchase_price NUMERIC DEFAULT 0,
+    wholesale_price NUMERIC DEFAULT 0,
+    retail_price NUMERIC DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`,
+  )
+  .then(() => console.log("✅ product_variants table ready"))
+  .catch((e) => console.error("❌ product_variants table error:", e.message));
 
 function getWarehouseIdByInvoiceType(invoice_type) {
   if (invoice_type === "retail") {
@@ -159,6 +185,26 @@ app.get("/products", async (req, res) => {
     res.json(productsResult.rows);
   } catch (error) {
     console.error(error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// جلب الأكواد الفرعية لمجموعة أصناف (لاستخدام الفواتير)
+app.get("/products/variants", async (req, res) => {
+  try {
+    const { product_ids } = req.query;
+    if (!product_ids) return res.json([]);
+
+    const ids = product_ids.split(",").map(Number).filter(Boolean);
+    if (ids.length === 0) return res.json([]);
+
+    const result = await pool.query(
+      `SELECT * FROM product_variants WHERE product_id = ANY($1) ORDER BY product_id, id`,
+      [ids],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -2268,20 +2314,26 @@ app.get("/admin/products", async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT 
-  id,
-  name,
-  wholesale_package,
-  retail_package,
-  manufacturer,
-  purchase_price,
-  retail_purchase_price,
-  wholesale_price,
-  retail_price,
-  barcode,
-  discount_amount,
-  is_active
-FROM products
-ORDER BY name`,
+  p.id,
+  p.name,
+  p.wholesale_package,
+  p.retail_package,
+  p.manufacturer,
+  p.purchase_price,
+  p.retail_purchase_price,
+  p.wholesale_price,
+  p.retail_price,
+  p.barcode,
+  p.discount_amount,
+  p.is_active,
+  COALESCE(v.variant_count, 0) AS variant_count
+FROM products p
+LEFT JOIN (
+  SELECT product_id, COUNT(*) AS variant_count
+  FROM product_variants
+  GROUP BY product_id
+) v ON v.product_id = p.id
+ORDER BY p.name`,
     );
     res.json(result.rows);
   } catch (err) {
@@ -2563,11 +2615,59 @@ app.get("/products/by-barcode/:barcode", async (req, res) => {
       );
     }
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "الصنف غير موجود" });
+    // لو لقينا في المنتج الأساسي
+    if (result.rows.length > 0) {
+      return res.json(result.rows[0]);
     }
 
-    res.json(result.rows[0]);
+    // 🔍 بحث في الأكواد الفرعية (product_variants)
+    let variantQuery;
+    if (movement_type === "sale") {
+      variantQuery = await pool.query(
+        `SELECT pv.*, p.name, p.manufacturer, p.discount_amount, p.is_active,
+                s.quantity AS available_quantity
+         FROM product_variants pv
+         JOIN products p ON p.id = pv.product_id
+         JOIN stock s ON s.product_id = p.id AND s.warehouse_id = $1
+         WHERE pv.barcode = $2 AND p.is_active = true AND s.quantity > 0
+         LIMIT 1`,
+        [warehouseId, barcode],
+      );
+    } else {
+      variantQuery = await pool.query(
+        `SELECT pv.*, p.name, p.manufacturer, p.discount_amount, p.is_active,
+                COALESCE(s.quantity, 0) AS available_quantity
+         FROM product_variants pv
+         JOIN products p ON p.id = pv.product_id
+         LEFT JOIN stock s ON s.product_id = p.id AND s.warehouse_id = $1
+         WHERE pv.barcode = $2 AND p.is_active = true
+         LIMIT 1`,
+        [warehouseId, barcode],
+      );
+    }
+
+    if (variantQuery.rows.length > 0) {
+      const v = variantQuery.rows[0];
+      // نرجع البيانات بنفس الشكل بس بسعر وعبوة الكود الفرعي
+      return res.json({
+        id: v.product_id,
+        name: v.name,
+        wholesale_package: v.wholesale_package,
+        retail_package: v.retail_package,
+        manufacturer: v.manufacturer,
+        barcode: v.barcode,
+        price:
+          movement_type === "sale"
+            ? Number(v.retail_price)
+            : Number(v.retail_purchase_price),
+        discount_amount: v.discount_amount,
+        available_quantity: v.available_quantity,
+        variant_id: v.id,
+        is_variant: true,
+      });
+    }
+
+    return res.status(404).json({ error: "الصنف غير موجود" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -2599,9 +2699,178 @@ app.get("/admin/products/check-barcode/:barcode", async (req, res) => {
 
     const result = await pool.query(query, values);
 
+    // كمان نشيك في الأكواد الفرعية
+    const variantResult = await pool.query(
+      `SELECT id FROM product_variants WHERE barcode = $1`,
+      [barcode],
+    );
+
     res.json({
-      exists: result.rows.length > 0,
+      exists: result.rows.length > 0 || variantResult.rows.length > 0,
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ===== 📦 CRUD أكواد فرعية (عبوات بديلة) =====
+
+// عرض الأكواد الفرعية لصنف معين
+app.get("/admin/products/:id/variants", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id`,
+      [id],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// إضافة كود فرعي
+app.post("/admin/products/:id/variants", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      label,
+      barcode,
+      wholesale_package,
+      retail_package,
+      purchase_price = 0,
+      retail_purchase_price = 0,
+      wholesale_price = 0,
+      retail_price = 0,
+    } = req.body;
+
+    if (!wholesale_package && !retail_package) {
+      return res.status(400).json({ error: "العبوة مطلوبة" });
+    }
+
+    // تحقق من الباركود لو موجود
+    if (barcode) {
+      const existsInProducts = await pool.query(
+        `SELECT id FROM products WHERE barcode = $1`,
+        [barcode],
+      );
+      const existsInVariants = await pool.query(
+        `SELECT id FROM product_variants WHERE barcode = $1`,
+        [barcode],
+      );
+      if (
+        existsInProducts.rows.length > 0 ||
+        existsInVariants.rows.length > 0
+      ) {
+        return res.status(400).json({ error: "الباركود مستخدم بالفعل" });
+      }
+    }
+
+    const result = await pool.query(
+      `INSERT INTO product_variants 
+        (product_id, label, barcode, wholesale_package, retail_package,
+         purchase_price, retail_purchase_price, wholesale_price, retail_price)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [
+        id,
+        label || null,
+        barcode || null,
+        wholesale_package || null,
+        retail_package || null,
+        purchase_price,
+        retail_purchase_price,
+        wholesale_price,
+        retail_price,
+      ],
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// تعديل كود فرعي
+app.put("/admin/products/variants/:variantId", async (req, res) => {
+  try {
+    const { variantId } = req.params;
+    const {
+      label,
+      barcode,
+      wholesale_package,
+      retail_package,
+      purchase_price = 0,
+      retail_purchase_price = 0,
+      wholesale_price = 0,
+      retail_price = 0,
+    } = req.body;
+
+    // تحقق من الباركود لو موجود
+    if (barcode) {
+      const existsInProducts = await pool.query(
+        `SELECT id FROM products WHERE barcode = $1`,
+        [barcode],
+      );
+      const existsInVariants = await pool.query(
+        `SELECT id FROM product_variants WHERE barcode = $1 AND id <> $2`,
+        [barcode, variantId],
+      );
+      if (
+        existsInProducts.rows.length > 0 ||
+        existsInVariants.rows.length > 0
+      ) {
+        return res.status(400).json({ error: "الباركود مستخدم بالفعل" });
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE product_variants
+       SET label = $1, barcode = $2, wholesale_package = $3, retail_package = $4,
+           purchase_price = $5, retail_purchase_price = $6, wholesale_price = $7, retail_price = $8
+       WHERE id = $9
+       RETURNING *`,
+      [
+        label || null,
+        barcode || null,
+        wholesale_package || null,
+        retail_package || null,
+        purchase_price,
+        retail_purchase_price,
+        wholesale_price,
+        retail_price,
+        variantId,
+      ],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "الكود الفرعي غير موجود" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// حذف كود فرعي
+app.delete("/admin/products/variants/:variantId", async (req, res) => {
+  try {
+    const { variantId } = req.params;
+    const result = await pool.query(
+      `DELETE FROM product_variants WHERE id = $1 RETURNING id`,
+      [variantId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "الكود الفرعي غير موجود" });
+    }
+
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -4800,12 +5069,13 @@ app.post("/login", async (req, res) => {
     });
 
     // 📝 تسجيل دخول اليوزر (بدون انتظار)
-    pool.query(
-      `INSERT INTO user_activity (user_id, username, action, ip_address)
+    pool
+      .query(
+        `INSERT INTO user_activity (user_id, username, action, ip_address)
        VALUES ($1, $2, 'login', $3)`,
-      [user.id, user.username, req.headers["x-forwarded-for"] || req.ip]
-    ).catch((e) => console.error("LOG LOGIN ERR:", e.message));
-
+        [user.id, user.username, req.headers["x-forwarded-for"] || req.ip],
+      )
+      .catch((e) => console.error("LOG LOGIN ERR:", e.message));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Login error" });
@@ -4820,7 +5090,11 @@ app.post("/logout", authMiddleware, async (req, res) => {
     await pool.query(
       `INSERT INTO user_activity (user_id, username, action, ip_address)
        VALUES ($1, $2, 'logout', $3)`,
-      [req.user.id, req.user.username, req.headers["x-forwarded-for"] || req.ip]
+      [
+        req.user.id,
+        req.user.username,
+        req.headers["x-forwarded-for"] || req.ip,
+      ],
     );
     res.json({ success: true });
   } catch (err) {
@@ -4840,7 +5114,7 @@ app.get("/user-activity", authMiddleware, async (req, res) => {
        FROM user_activity
        ORDER BY created_at DESC
        LIMIT $1`,
-      [Number(limit)]
+      [Number(limit)],
     );
     res.json(result.rows);
   } catch (err) {
