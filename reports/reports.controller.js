@@ -40,11 +40,17 @@ exports.getInventorySummary = async (req, res) => {
 
       -- العبوات المستخدمة في الحركات
       (
-        SELECT string_agg(DISTINCT ii.package, '، ')
-        FROM stock_movements sm2
-        JOIN invoice_items ii ON ii.invoice_id = sm2.invoice_id AND ii.product_id = sm2.product_id
-        WHERE sm2.product_id = p.id AND sm2.warehouse_id = s.warehouse_id
-        AND ii.package IS NOT NULL AND ii.package != ''
+        SELECT string_agg(DISTINCT sub.pkg, ' | ')
+        FROM (
+          SELECT p.wholesale_package AS pkg
+          UNION
+          SELECT p.retail_package AS pkg
+          UNION
+          SELECT pv.wholesale_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
+          UNION
+          SELECT pv.retail_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
+        ) sub
+        WHERE sub.pkg IS NOT NULL AND sub.pkg != ''
       ) AS packages,
 
       (
@@ -219,11 +225,17 @@ exports.getLowStock = async (req, res) => {
         w.name AS warehouse_name,
         s.quantity AS current_stock,
         (
-          SELECT string_agg(DISTINCT ii.package, '\u060C ')
-          FROM stock_movements sm2
-          JOIN invoice_items ii ON ii.invoice_id = sm2.invoice_id AND ii.product_id = sm2.product_id
-          WHERE sm2.product_id = p.id AND sm2.warehouse_id = s.warehouse_id
-          AND ii.package IS NOT NULL AND ii.package != ''
+          SELECT string_agg(DISTINCT sub.pkg, ' | ')
+          FROM (
+            SELECT p.wholesale_package AS pkg
+            UNION
+            SELECT p.retail_package AS pkg
+            UNION
+            SELECT pv.wholesale_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
+            UNION
+            SELECT pv.retail_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
+          ) sub
+          WHERE sub.pkg IS NOT NULL AND sub.pkg != ''
         ) AS packages
       FROM stock s
       JOIN products p ON p.id = s.product_id
@@ -318,11 +330,17 @@ exports.getInventoryDetails = async (req, res) => {
         w.id AS warehouse_id,
         w.name AS warehouse_name,
         (
-          SELECT string_agg(DISTINCT ii.package, '\u060C ')
-          FROM stock_movements sm2
-          JOIN invoice_items ii ON ii.invoice_id = sm2.invoice_id AND ii.product_id = sm2.product_id
-          WHERE sm2.product_id = p.id AND sm2.warehouse_id = s.warehouse_id
-          AND ii.package IS NOT NULL AND ii.package != ''
+          SELECT string_agg(DISTINCT sub.pkg, ' | ')
+          FROM (
+            SELECT p.wholesale_package AS pkg
+            UNION
+            SELECT p.retail_package AS pkg
+            UNION
+            SELECT pv.wholesale_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
+            UNION
+            SELECT pv.retail_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
+          ) sub
+          WHERE sub.pkg IS NOT NULL AND sub.pkg != ''
         ) AS packages
       FROM stock s
       JOIN products p ON p.id = s.product_id
