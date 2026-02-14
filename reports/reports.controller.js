@@ -145,6 +145,9 @@ exports.getProductMovement = async (req, res) => {
         -- نوع الفاتورة (بيع / شراء)
         i.invoice_type,
 
+        -- نوع الحركة من الفاتورة (sale / purchase)
+        i.movement_type AS invoice_movement_type,
+
         -- العبوة المستخدمة من بنود الفاتورة
         ii.package AS package_name
 
@@ -152,7 +155,7 @@ exports.getProductMovement = async (req, res) => {
       JOIN products p ON p.id = sm.product_id
       JOIN warehouses w ON w.id = sm.warehouse_id
       LEFT JOIN invoices i ON i.id = sm.invoice_id
-      LEFT JOIN invoice_items ii ON ii.invoice_id = sm.invoice_id AND ii.product_id = sm.product_id
+      LEFT JOIN invoice_items ii ON ii.invoice_id = sm.invoice_id AND ii.product_id = sm.product_id AND ii.variant_id = sm.variant_id
 
       WHERE ${conditions.join(" AND ")}
       ORDER BY sm.created_at ASC
