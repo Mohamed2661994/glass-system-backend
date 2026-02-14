@@ -553,7 +553,11 @@ VALUES
     }
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع - فقط لفرع الجملة
-    if (movement_type === "sale" && paid_amount > 0 && Number(branch_id) === 2) {
+    if (
+      movement_type === "sale" &&
+      paid_amount > 0 &&
+      Number(branch_id) === 2
+    ) {
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
@@ -4546,7 +4550,69 @@ app.get("/users", authMiddleware, async (req, res) => {
 });
 
 /* =========================
-   📦 CREATE BACKUP
+   �️ DELETE USER
+========================= */
+app.delete("/users/:id", authMiddleware, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+
+    // لا يمكن حذف نفسك
+    if (userId === req.user.id) {
+      return res.status(400).json({ error: "لا يمكنك حذف حسابك الحالي" });
+    }
+
+    const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [userId]);
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE USER ERROR:", err);
+    res.status(500).json({ error: "فشل حذف المستخدم" });
+  }
+});
+
+/* =========================
+   🔑 CHANGE PASSWORD
+========================= */
+app.put("/users/:id/password", authMiddleware, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const { current_password, new_password } = req.body;
+
+    if (!current_password || !new_password) {
+      return res.status(400).json({ error: "بيانات ناقصة" });
+    }
+
+    // تأكد إن اليوزر بيغير باسورد نفسه
+    if (userId !== req.user.id) {
+      return res.status(403).json({ error: "غير مصرح" });
+    }
+
+    const userResult = await pool.query("SELECT password FROM users WHERE id = $1", [userId]);
+    if (!userResult.rows.length) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    const isMatch = await bcrypt.compare(current_password, userResult.rows[0].password);
+    if (!isMatch) {
+      return res.status(400).json({ error: "كلمة المرور الحالية غير صحيحة" });
+    }
+
+    const hashedPassword = await bcrypt.hash(new_password, 10);
+    await pool.query("UPDATE users SET password = $1 WHERE id = $2", [hashedPassword, userId]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("CHANGE PASSWORD ERROR:", err);
+    res.status(500).json({ error: "فشل تغيير كلمة المرور" });
+  }
+});
+
+/* =========================
+   �📦 CREATE BACKUP
 ========================= */
 app.post("/system/backup", authMiddleware, async (req, res) => {
   try {
