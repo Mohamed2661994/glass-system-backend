@@ -2937,16 +2937,14 @@ app.post("/admin/products/:id/variants", async (req, res) => {
     }
 
     // لو القطاعي فاضي أو 0 → ياخد من الصنف الأساسي
-    let finalRetailPackage = retail_package;
-    if (!retail_package || retail_package === "0") {
-      const parentProduct = await pool.query(
-        `SELECT retail_package FROM products WHERE id = $1`,
-        [id],
-      );
-      if (parentProduct.rows.length > 0) {
-        finalRetailPackage = parentProduct.rows[0].retail_package;
-      }
-    }
+    const parentProduct = await pool.query(
+      `SELECT retail_package, retail_price, retail_purchase_price FROM products WHERE id = $1`,
+      [id],
+    );
+    const parent = parentProduct.rows[0] || {};
+    const finalRetailPackage = (!retail_package || retail_package === "0") ? parent.retail_package : retail_package;
+    const finalRetailPrice = Number(retail_price) === 0 ? Number(parent.retail_price || 0) : retail_price;
+    const finalRetailPurchasePrice = Number(retail_purchase_price) === 0 ? Number(parent.retail_purchase_price || 0) : retail_purchase_price;
 
     // تحقق من الباركود لو موجود
     if (barcode) {
@@ -2979,9 +2977,9 @@ app.post("/admin/products/:id/variants", async (req, res) => {
         wholesale_package || null,
         finalRetailPackage || null,
         purchase_price,
-        retail_purchase_price,
+        finalRetailPurchasePrice,
         wholesale_price,
-        retail_price,
+        finalRetailPrice,
         discount_amount,
       ],
     );
@@ -3010,20 +3008,17 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
     } = req.body;
 
     // لو القطاعي فاضي أو 0 → ياخد من الصنف الأساسي
-    let finalRetailPackage = retail_package;
-    if (!retail_package || retail_package === "0") {
-      // جلب product_id من الـ variant نفسه
-      const variantRow = await pool.query(
-        `SELECT pv.product_id, p.retail_package
-         FROM product_variants pv
-         JOIN products p ON p.id = pv.product_id
-         WHERE pv.id = $1`,
-        [variantId],
-      );
-      if (variantRow.rows.length > 0) {
-        finalRetailPackage = variantRow.rows[0].retail_package;
-      }
-    }
+    const variantRow = await pool.query(
+      `SELECT pv.product_id, p.retail_package, p.retail_price, p.retail_purchase_price
+       FROM product_variants pv
+       JOIN products p ON p.id = pv.product_id
+       WHERE pv.id = $1`,
+      [variantId],
+    );
+    const parent = variantRow.rows[0] || {};
+    const finalRetailPackage = (!retail_package || retail_package === "0") ? parent.retail_package : retail_package;
+    const finalRetailPrice = Number(retail_price) === 0 ? Number(parent.retail_price || 0) : retail_price;
+    const finalRetailPurchasePrice = Number(retail_purchase_price) === 0 ? Number(parent.retail_purchase_price || 0) : retail_purchase_price;
 
     // تحقق من الباركود لو موجود
     if (barcode) {
@@ -3056,9 +3051,9 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
         wholesale_package || null,
         finalRetailPackage || null,
         purchase_price,
-        retail_purchase_price,
+        finalRetailPurchasePrice,
         wholesale_price,
-        retail_price,
+        finalRetailPrice,
         discount_amount,
         variantId,
       ],
