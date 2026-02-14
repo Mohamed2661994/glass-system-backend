@@ -217,7 +217,14 @@ exports.getLowStock = async (req, res) => {
         p.name AS product_name,
         p.manufacturer AS manufacturer_name,
         w.name AS warehouse_name,
-        s.quantity AS current_stock
+        s.quantity AS current_stock,
+        (
+          SELECT string_agg(DISTINCT ii.package, '\u060C ')
+          FROM stock_movements sm2
+          JOIN invoice_items ii ON ii.invoice_id = sm2.invoice_id AND ii.product_id = sm2.product_id
+          WHERE sm2.product_id = p.id AND sm2.warehouse_id = s.warehouse_id
+          AND ii.package IS NOT NULL AND ii.package != ''
+        ) AS packages
       FROM stock s
       JOIN products p ON p.id = s.product_id
       JOIN warehouses w ON w.id = s.warehouse_id
@@ -309,7 +316,14 @@ exports.getInventoryDetails = async (req, res) => {
         p.purchase_price,
         (s.quantity * p.purchase_price) AS total_value,
         w.id AS warehouse_id,
-        w.name AS warehouse_name
+        w.name AS warehouse_name,
+        (
+          SELECT string_agg(DISTINCT ii.package, '\u060C ')
+          FROM stock_movements sm2
+          JOIN invoice_items ii ON ii.invoice_id = sm2.invoice_id AND ii.product_id = sm2.product_id
+          WHERE sm2.product_id = p.id AND sm2.warehouse_id = s.warehouse_id
+          AND ii.package IS NOT NULL AND ii.package != ''
+        ) AS packages
       FROM stock s
       JOIN products p ON p.id = s.product_id
       JOIN warehouses w ON w.id = s.warehouse_id
