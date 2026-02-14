@@ -91,72 +91,112 @@ pool
   .then(() => console.log("✅ discount_amount column ready"))
   .catch((e) => console.error("❌ discount_amount column error:", e.message));
 
-// 📦 إضافة variant_id لجدول stock
-pool
-  .query(
-    `ALTER TABLE stock ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
-  )
-  .then(() => console.log("✅ stock.variant_id column ready"))
-  .catch((e) => console.error("❌ stock.variant_id error:", e.message));
+// 📦 migrations لـ variant_id (متسلسلة عشان الـ constraint يشتغل بعد الأعمدة)
+(async () => {
+  try {
+    await pool.query(`ALTER TABLE stock ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`);
+    console.log("✅ stock.variant_id column ready");
 
-// 📦 إضافة variant_id لجدول stock_movements
-pool
-  .query(
-    `ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
-  )
-  .then(() => console.log("✅ stock_movements.variant_id column ready"))
-  .catch((e) =>
-    console.error("❌ stock_movements.variant_id error:", e.message),
-  );
+    await pool.query(`ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`);
+    console.log("✅ stock_movements.variant_id column ready");
 
-// 📦 إضافة variant_id لجدول invoice_items
-pool
-  .query(
-    `ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
-  )
-  .then(() => console.log("✅ invoice_items.variant_id column ready"))
-  .catch((e) => console.error("❌ invoice_items.variant_id error:", e.message));
+    await pool.query(`ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`);
+    console.log("✅ invoice_items.variant_id column ready");
 
-// 📦 تحديث unique constraint على stock (warehouse_id, product_id, variant_id)
-pool
-  .query(
-    `
-    DO $$
-    BEGIN
-      -- حذف القيد القديم لو موجود (unique)
-      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_id_product_id_key') THEN
-        ALTER TABLE stock DROP CONSTRAINT stock_warehouse_id_product_id_key;
-      END IF;
+    // تحديث constraint بعد التأكد إن العمود موجود
+    await pool.query(`
+      DO $$
+      BEGIN
+        -- حذف القيد القديم لو موجود (unique)
+        IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_id_product_id_key') THEN
+          ALTER TABLE stock DROP CONSTRAINT stock_warehouse_id_product_id_key;
+        END IF;
 
-      -- حذف الـ primary key القديم لو مبني على (warehouse_id, product_id) بدون variant_id
-      IF EXISTS (
-        SELECT 1 FROM pg_constraint c
-        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
-        WHERE c.conrelid = 'stock'::regclass
-          AND c.contype = 'p'
-        GROUP BY c.oid
-        HAVING COUNT(*) = 2
-           AND BOOL_AND(a.attname IN ('warehouse_id','product_id'))
-      ) THEN
-        ALTER TABLE stock DROP CONSTRAINT stock_pkey;
-        -- إضافة primary key جديد يشمل variant_id
-        ALTER TABLE stock ADD PRIMARY KEY (warehouse_id, product_id, variant_id);
-      END IF;
+        -- حذف الـ primary key القديم لو مبني على (warehouse_id, product_id) بدون variant_id
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+          WHERE c.conrelid = 'stock'::regclass
+            AND c.contype = 'p'
+          GROUP BY c.oid
+          HAVING COUNT(*) = 2
+             AND BOOL_AND(a.attname IN ('warehouse_id','product_id'))
+        ) THEN
+          ALTER TABLE stock DROP CONSTRAINT stock_pkey;
+          ALTER TABLE stock ADD PRIMARY KEY (warehouse_id, product_id, variant_id);
+        END IF;
 
-      -- إنشاء القيد الجديد لو مش موجود (احتياطي)
-      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_product_variant_unique')
-         AND NOT EXISTS (
-           SELECT 1 FROM pg_constraint
-           WHERE conrelid = 'stock'::regclass AND contype = 'p'
-         )
-      THEN
-        ALTER TABLE stock ADD CONSTRAINT stock_warehouse_product_variant_unique UNIQUE (warehouse_id, product_id, variant_id);
-      END IF;
-    END $$;
-  `,
-  )
-  .then(() => console.log("✅ stock unique constraint updated"))
-  .catch((e) => console.error("❌ stock constraint error:", e.message));
+        -- إنشاء القيد الجديد لو مش موجود (احتياطي)
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_product_variant_unique')
+           AND NOT EXISTS (
+             SELECT 1 FROM pg_constraint
+             WHERE conrelid = 'stock'::regclass AND contype = 'p'
+           )
+        THEN
+          ALTER TABLE stock ADD CONSTRAINT stock_warehouse_product_variant_unique UNIQUE (warehouse_id, product_id, variant_id);
+        END IF;
+      END $$;
+    `);
+    console.log("✅ stock unique constraint updated");
+
+    // 🔧 تصليح البيانات القديمة: لو كل الرصيد في variant_id=0 والحركات فيها variant_ids مختلفة
+    // نعيد حساب الرصيد من الحركات
+    await pool.query(`
+      DO $$
+      DECLARE
+        r RECORD;
+      BEGIN
+        FOR r IN
+          SELECT warehouse_id, product_id, variant_id, SUM(
+            CASE
+              WHEN movement_type IN ('purchase','transfer_in','replace_in') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out') THEN -quantity
+              ELSE 0
+            END
+          ) AS calc_qty
+          FROM stock_movements
+          WHERE variant_id IS NOT NULL AND variant_id != 0
+          GROUP BY warehouse_id, product_id, variant_id
+          HAVING SUM(
+            CASE
+              WHEN movement_type IN ('purchase','transfer_in','replace_in') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out') THEN -quantity
+              ELSE 0
+            END
+          ) > 0
+        LOOP
+          INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+          VALUES (r.warehouse_id, r.product_id, r.variant_id, r.calc_qty)
+          ON CONFLICT (warehouse_id, product_id, variant_id)
+          DO UPDATE SET quantity = r.calc_qty;
+        END LOOP;
+
+        -- حساب رصيد variant_id=0 من الحركات
+        FOR r IN
+          SELECT warehouse_id, product_id, SUM(
+            CASE
+              WHEN movement_type IN ('purchase','transfer_in','replace_in') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out') THEN -quantity
+              ELSE 0
+            END
+          ) AS calc_qty
+          FROM stock_movements
+          WHERE COALESCE(variant_id, 0) = 0
+          GROUP BY warehouse_id, product_id
+        LOOP
+          INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+          VALUES (r.warehouse_id, r.product_id, 0, GREATEST(r.calc_qty, 0))
+          ON CONFLICT (warehouse_id, product_id, variant_id)
+          DO UPDATE SET quantity = GREATEST(r.calc_qty, 0);
+        END LOOP;
+      END $$;
+    `);
+    console.log("✅ stock data recalculated from movements");
+
+  } catch (e) {
+    console.error("❌ variant migrations error:", e.message);
+  }
+})();
 
 function getWarehouseIdByInvoiceType(invoice_type) {
   if (invoice_type === "retail") {
