@@ -4429,6 +4429,15 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
   try {
     await client.query("BEGIN");
 
+    // 🧹 الخزنة أولاً (قد تشير لفواتير)
+    if (safeTables.includes("cash_in")) {
+      await client.query("DELETE FROM cash_in");
+    }
+
+    if (safeTables.includes("cash_out")) {
+      await client.query("DELETE FROM cash_out");
+    }
+
     // 🧹 الفواتير
     if (safeTables.includes("invoice_items")) {
       await client.query("DELETE FROM invoice_items");
@@ -4455,15 +4464,6 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
     if (safeTables.includes("stock")) {
       // نصفر الكميات بدل ما نحذف السجلات
       await client.query("UPDATE stock SET quantity = 0");
-    }
-
-    // 🧹 الخزنة
-    if (safeTables.includes("cash_in")) {
-      await client.query("DELETE FROM cash_in");
-    }
-
-    if (safeTables.includes("cash_out")) {
-      await client.query("DELETE FROM cash_out");
     }
 
     await client.query("COMMIT");
@@ -4561,7 +4561,10 @@ app.delete("/users/:id", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "لا يمكنك حذف حسابك الحالي" });
     }
 
-    const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [userId]);
+    const result = await pool.query(
+      "DELETE FROM users WHERE id = $1 RETURNING id",
+      [userId],
+    );
 
     if (!result.rows.length) {
       return res.status(404).json({ error: "المستخدم غير موجود" });
@@ -4591,18 +4594,27 @@ app.put("/users/:id/password", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "غير مصرح" });
     }
 
-    const userResult = await pool.query("SELECT password FROM users WHERE id = $1", [userId]);
+    const userResult = await pool.query(
+      "SELECT password FROM users WHERE id = $1",
+      [userId],
+    );
     if (!userResult.rows.length) {
       return res.status(404).json({ error: "المستخدم غير موجود" });
     }
 
-    const isMatch = await bcrypt.compare(current_password, userResult.rows[0].password);
+    const isMatch = await bcrypt.compare(
+      current_password,
+      userResult.rows[0].password,
+    );
     if (!isMatch) {
       return res.status(400).json({ error: "كلمة المرور الحالية غير صحيحة" });
     }
 
     const hashedPassword = await bcrypt.hash(new_password, 10);
-    await pool.query("UPDATE users SET password = $1 WHERE id = $2", [hashedPassword, userId]);
+    await pool.query("UPDATE users SET password = $1 WHERE id = $2", [
+      hashedPassword,
+      userId,
+    ]);
 
     res.json({ success: true });
   } catch (err) {
