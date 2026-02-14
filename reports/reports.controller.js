@@ -17,6 +17,7 @@ exports.getInventorySummary = async (req, res) => {
       w.name AS warehouse_name,
       p.wholesale_package,
       p.retail_package,
+      s.variant_id,
 
       COALESCE(SUM(
         CASE 
@@ -38,10 +39,11 @@ exports.getInventorySummary = async (req, res) => {
     LEFT JOIN stock_movements sm
       ON sm.product_id = p.id
       AND sm.warehouse_id = s.warehouse_id
+      AND COALESCE(sm.variant_id, 0) = COALESCE(s.variant_id, 0)
 
     ${warehouse_id ? "WHERE s.warehouse_id = $1" : ""}
 
-    GROUP BY p.id, p.name, p.manufacturer, w.name, p.wholesale_package, p.retail_package, s.quantity
+    GROUP BY p.id, p.name, p.manufacturer, w.name, p.wholesale_package, p.retail_package, s.quantity, s.variant_id
 
     HAVING 
       COALESCE(SUM(CASE WHEN sm.movement_type IN ('purchase','transfer_in','replace_in') THEN sm.quantity ELSE 0 END),0) > 0
@@ -53,37 +55,29 @@ exports.getInventorySummary = async (req, res) => {
       warehouse_id ? [warehouse_id] : [],
     );
 
-    // Get all variants
+    // Get all variants to map variant_id → package names
     const variantsRes = await pool.query(
-      `SELECT product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`
+      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`,
     );
-    const variantsByProduct = {};
+    const variantsById = {};
     for (const v of variantsRes.rows) {
-      if (!variantsByProduct[v.product_id]) variantsByProduct[v.product_id] = [];
-      variantsByProduct[v.product_id].push(v);
+      variantsById[v.id] = v;
     }
 
-    // Expand: one row per package (main + variants)
-    const expanded = [];
-    for (const row of result.rows) {
-      const variants = variantsByProduct[row.product_id] || [];
-      const pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(' / ') || '-';
-      
-      expanded.push({
-        ...row,
-        package_name: pkgLabel,
-      });
-
-      for (const v of variants) {
-        const vPkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(' / ') || '-';
-        expanded.push({
-          ...row,
-          package_name: vPkgLabel,
-        });
+    // Build rows with package_name based on variant_id
+    const rows = result.rows.map((row) => {
+      const vid = Number(row.variant_id) || 0;
+      let pkgLabel;
+      if (vid === 0) {
+        pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(" / ") || "-";
+      } else {
+        const v = variantsById[vid];
+        pkgLabel = v ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ") : "-";
       }
-    }
+      return { ...row, package_name: pkgLabel };
+    });
 
-    res.json(expanded);
+    res.json(rows);
   } catch (err) {
     console.error("INVENTORY SUMMARY ERROR:", err);
     res.status(500).json({ error: "Server error" });
@@ -192,6 +186,7 @@ exports.getLowStock = async (req, res) => {
         p.manufacturer AS manufacturer_name,
         w.name AS warehouse_name,
         s.quantity AS current_stock,
+        s.variant_id,
         p.wholesale_package,
         p.retail_package
       FROM stock s
@@ -203,37 +198,28 @@ exports.getLowStock = async (req, res) => {
       values,
     );
 
-    // Get all variants
+    // Get all variants to map variant_id → package names
     const variantsRes = await pool.query(
-      `SELECT product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`
+      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`,
     );
-    const variantsByProduct = {};
+    const variantsById = {};
     for (const v of variantsRes.rows) {
-      if (!variantsByProduct[v.product_id]) variantsByProduct[v.product_id] = [];
-      variantsByProduct[v.product_id].push(v);
+      variantsById[v.id] = v;
     }
 
-    // Expand: one row per package (main + variants)
-    const expanded = [];
-    for (const row of result.rows) {
-      const variants = variantsByProduct[row.product_id] || [];
-      const pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(' / ') || '-';
-      
-      expanded.push({
-        ...row,
-        package_name: pkgLabel,
-      });
-
-      for (const v of variants) {
-        const vPkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(' / ') || '-';
-        expanded.push({
-          ...row,
-          package_name: vPkgLabel,
-        });
+    const rows = result.rows.map((row) => {
+      const vid = Number(row.variant_id) || 0;
+      let pkgLabel;
+      if (vid === 0) {
+        pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(" / ") || "-";
+      } else {
+        const v = variantsById[vid];
+        pkgLabel = v ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ") : "-";
       }
-    }
+      return { ...row, package_name: pkgLabel };
+    });
 
-    res.json(expanded);
+    res.json(rows);
   } catch (err) {
     console.error("LOW STOCK ERROR:", err);
     res.status(500).json({ error: "Server error" });
@@ -312,6 +298,7 @@ exports.getInventoryDetails = async (req, res) => {
         p.name AS product_name,
         p.manufacturer,
         s.quantity,
+        s.variant_id,
         p.purchase_price,
         p.wholesale_package,
         p.retail_package,
@@ -327,39 +314,39 @@ exports.getInventoryDetails = async (req, res) => {
       values,
     );
 
-    // Get all variants
+    // Get all variants to map variant_id → package + purchase_price
     const variantsRes = await pool.query(
-      `SELECT product_id, wholesale_package, retail_package, purchase_price, retail_purchase_price FROM product_variants ORDER BY id`
+      `SELECT id, product_id, wholesale_package, retail_package, purchase_price, retail_purchase_price FROM product_variants ORDER BY id`,
     );
-    const variantsByProduct = {};
+    const variantsById = {};
     for (const v of variantsRes.rows) {
-      if (!variantsByProduct[v.product_id]) variantsByProduct[v.product_id] = [];
-      variantsByProduct[v.product_id].push(v);
+      variantsById[v.id] = v;
     }
 
-    // Expand: one row per package (main + variants)
-    const expanded = [];
-    for (const row of result.rows) {
-      const variants = variantsByProduct[row.product_id] || [];
-      const pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(' / ') || '-';
-      
-      expanded.push({
+    const rows = result.rows.map((row) => {
+      const vid = Number(row.variant_id) || 0;
+      let pkgLabel;
+      let purchasePrice = row.purchase_price;
+      if (vid === 0) {
+        pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(" / ") || "-";
+      } else {
+        const v = variantsById[vid];
+        if (v) {
+          pkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ") || "-";
+          purchasePrice = v.purchase_price;
+        } else {
+          pkgLabel = "-";
+        }
+      }
+      return {
         ...row,
         package_name: pkgLabel,
-      });
+        purchase_price: purchasePrice,
+        total_value: row.quantity * Number(purchasePrice),
+      };
+    });
 
-      for (const v of variants) {
-        const vPkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(' / ') || '-';
-        expanded.push({
-          ...row,
-          package_name: vPkgLabel,
-          purchase_price: v.purchase_price,
-          total_value: row.quantity * Number(v.purchase_price),
-        });
-      }
-    }
-
-    res.json(expanded);
+    res.json(rows);
   } catch (err) {
     console.error("INVENTORY DETAILS ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });

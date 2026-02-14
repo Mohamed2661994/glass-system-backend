@@ -91,6 +91,42 @@ pool
   .then(() => console.log("✅ discount_amount column ready"))
   .catch((e) => console.error("❌ discount_amount column error:", e.message));
 
+// 📦 إضافة variant_id لجدول stock
+pool
+  .query(`ALTER TABLE stock ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`)
+  .then(() => console.log("✅ stock.variant_id column ready"))
+  .catch((e) => console.error("❌ stock.variant_id error:", e.message));
+
+// 📦 إضافة variant_id لجدول stock_movements
+pool
+  .query(`ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`)
+  .then(() => console.log("✅ stock_movements.variant_id column ready"))
+  .catch((e) => console.error("❌ stock_movements.variant_id error:", e.message));
+
+// 📦 إضافة variant_id لجدول invoice_items
+pool
+  .query(`ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`)
+  .then(() => console.log("✅ invoice_items.variant_id column ready"))
+  .catch((e) => console.error("❌ invoice_items.variant_id error:", e.message));
+
+// 📦 تحديث unique constraint على stock (warehouse_id, product_id, variant_id)
+pool
+  .query(`
+    DO $$
+    BEGIN
+      -- حذف القيد القديم لو موجود
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_id_product_id_key') THEN
+        ALTER TABLE stock DROP CONSTRAINT stock_warehouse_id_product_id_key;
+      END IF;
+      -- إنشاء القيد الجديد لو مش موجود
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stock_warehouse_product_variant_unique') THEN
+        ALTER TABLE stock ADD CONSTRAINT stock_warehouse_product_variant_unique UNIQUE (warehouse_id, product_id, variant_id);
+      END IF;
+    END $$;
+  `)
+  .then(() => console.log("✅ stock unique constraint updated"))
+  .catch((e) => console.error("❌ stock constraint error:", e.message));
+
 function getWarehouseIdByInvoiceType(invoice_type) {
   if (invoice_type === "retail") {
     return 1; // مخزن المعرض
@@ -513,6 +549,8 @@ VALUES
         item.price * item.quantity - (item.discount || 0) * item.quantity;
       const packageText = item.package || "";
 
+      const variantId = item.variant_id || 0;
+
       // إضافة item للفاتورة
       await client.query(
         `
@@ -525,9 +563,10 @@ VALUES
           price,
           quantity,
           discount,
-          total
+          total,
+          variant_id
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         `,
         [
           invoiceId,
@@ -538,6 +577,7 @@ VALUES
           item.quantity,
           item.discount || 0,
           itemTotal,
+          variantId,
         ],
       );
 
@@ -546,21 +586,21 @@ VALUES
         // 🟢 شراء → زيادة المخزون
         await client.query(
           `
-          INSERT INTO stock (warehouse_id, product_id, quantity)
-          VALUES ($1,$2,$3)
-          ON CONFLICT (warehouse_id, product_id)
-          DO UPDATE SET quantity = stock.quantity + $3
+          INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+          VALUES ($1,$2,$3,$4)
+          ON CONFLICT (warehouse_id, product_id, variant_id)
+          DO UPDATE SET quantity = stock.quantity + $4
           `,
-          [warehouseId, item.product_id, item.quantity],
+          [warehouseId, item.product_id, variantId, item.quantity],
         );
 
         await client.query(
           `
        INSERT INTO stock_movements
-       (invoice_id, warehouse_id, product_id, quantity, movement_type)
-       VALUES ($1,$2,$3,$4,'purchase')
+       (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+       VALUES ($1,$2,$3,$4,$5,'purchase')
        `,
-          [invoiceId, warehouseId, item.product_id, item.quantity],
+          [invoiceId, warehouseId, item.product_id, variantId, item.quantity],
         );
       }
 
@@ -570,18 +610,18 @@ VALUES
           `
           UPDATE stock
           SET quantity = quantity - $1
-          WHERE warehouse_id = $2 AND product_id = $3
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
           `,
-          [item.quantity, warehouseId, item.product_id],
+          [item.quantity, warehouseId, item.product_id, variantId],
         );
 
         await client.query(
           `
         INSERT INTO stock_movements
-        (invoice_id, warehouse_id, product_id, quantity, movement_type)
-        VALUES ($1,$2,$3,$4,'sale')
+        (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+        VALUES ($1,$2,$3,$4,$5,'sale')
          `,
-          [invoiceId, warehouseId, item.product_id, item.quantity],
+          [invoiceId, warehouseId, item.product_id, variantId, item.quantity],
         );
       }
     }
@@ -792,6 +832,7 @@ app.post("/invoices/retail", async (req, res) => {
     for (const item of items) {
       const itemTotal =
         item.price * item.quantity - (item.discount || 0) * item.quantity;
+      const variantId = item.variant_id || 0;
 
       await client.query(
         `
@@ -804,9 +845,10 @@ app.post("/invoices/retail", async (req, res) => {
           price,
           quantity,
           discount,
-          total
+          total,
+          variant_id
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         `,
         [
           invoiceId,
@@ -817,6 +859,7 @@ app.post("/invoices/retail", async (req, res) => {
           item.quantity,
           item.discount || 0,
           itemTotal,
+          variantId,
         ],
       );
 
@@ -825,29 +868,29 @@ app.post("/invoices/retail", async (req, res) => {
           `
           UPDATE stock
           SET quantity = quantity - $1
-          WHERE warehouse_id = $2 AND product_id = $3
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
           `,
-          [item.quantity, warehouseId, item.product_id],
+          [item.quantity, warehouseId, item.product_id, variantId],
         );
       } else {
         await client.query(
           `
-          INSERT INTO stock (warehouse_id, product_id, quantity)
-          VALUES ($1,$2,$3)
-          ON CONFLICT (warehouse_id, product_id)
-          DO UPDATE SET quantity = stock.quantity + $3
+          INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+          VALUES ($1,$2,$3,$4)
+          ON CONFLICT (warehouse_id, product_id, variant_id)
+          DO UPDATE SET quantity = stock.quantity + $4
           `,
-          [warehouseId, item.product_id, item.quantity],
+          [warehouseId, item.product_id, variantId, item.quantity],
         );
       }
 
       await client.query(
         `
         INSERT INTO stock_movements
-        (invoice_id, warehouse_id, product_id, quantity, movement_type)
-        VALUES ($1,$2,$3,$4,$5)
+        (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+        VALUES ($1,$2,$3,$4,$5,$6)
         `,
-        [invoiceId, warehouseId, item.product_id, item.quantity, movement_type],
+        [invoiceId, warehouseId, item.product_id, variantId, item.quantity, movement_type],
       );
     }
 
@@ -919,7 +962,7 @@ app.put("/invoices/retail/:id", async (req, res) => {
     ================================= */
     const oldItemsRes = await client.query(
       `
-      SELECT product_id, quantity
+      SELECT product_id, quantity, COALESCE(variant_id, 0) AS variant_id
       FROM invoice_items
       WHERE invoice_id = $1
       `,
@@ -932,18 +975,18 @@ app.put("/invoices/retail/:id", async (req, res) => {
           `
           UPDATE stock
           SET quantity = quantity + $1
-          WHERE warehouse_id = $2 AND product_id = $3
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
           `,
-          [oldItem.quantity, warehouseId, oldItem.product_id],
+          [oldItem.quantity, warehouseId, oldItem.product_id, oldItem.variant_id],
         );
       } else {
         await client.query(
           `
           UPDATE stock
           SET quantity = quantity - $1
-          WHERE warehouse_id = $2 AND product_id = $3
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
           `,
-          [oldItem.quantity, warehouseId, oldItem.product_id],
+          [oldItem.quantity, warehouseId, oldItem.product_id, oldItem.variant_id],
         );
       }
     }
@@ -991,6 +1034,7 @@ app.put("/invoices/retail/:id", async (req, res) => {
     for (const item of items) {
       const itemTotal =
         item.price * item.quantity - (item.discount || 0) * item.quantity;
+      const variantId = item.variant_id || 0;
 
       await client.query(
         `
@@ -1003,9 +1047,10 @@ app.put("/invoices/retail/:id", async (req, res) => {
           price,
           quantity,
           discount,
-          total
+          total,
+          variant_id
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         `,
         [
           invoiceId,
@@ -1016,6 +1061,7 @@ app.put("/invoices/retail/:id", async (req, res) => {
           item.quantity,
           item.discount || 0,
           itemTotal,
+          variantId,
         ],
       );
 
@@ -1024,29 +1070,29 @@ app.put("/invoices/retail/:id", async (req, res) => {
           `
           UPDATE stock
           SET quantity = quantity - $1
-          WHERE warehouse_id = $2 AND product_id = $3
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
           `,
-          [item.quantity, warehouseId, item.product_id],
+          [item.quantity, warehouseId, item.product_id, variantId],
         );
       } else {
         await client.query(
           `
-          INSERT INTO stock (warehouse_id, product_id, quantity)
-          VALUES ($1,$2,$3)
-          ON CONFLICT (warehouse_id, product_id)
-          DO UPDATE SET quantity = stock.quantity + $3
+          INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+          VALUES ($1,$2,$3,$4)
+          ON CONFLICT (warehouse_id, product_id, variant_id)
+          DO UPDATE SET quantity = stock.quantity + $4
           `,
-          [warehouseId, item.product_id, item.quantity],
+          [warehouseId, item.product_id, variantId, item.quantity],
         );
       }
 
       await client.query(
         `
         INSERT INTO stock_movements
-        (invoice_id, warehouse_id, product_id, quantity, movement_type)
-        VALUES ($1,$2,$3,$4,$5)
+        (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+        VALUES ($1,$2,$3,$4,$5,$6)
         `,
-        [invoiceId, warehouseId, item.product_id, item.quantity, movement_type],
+        [invoiceId, warehouseId, item.product_id, variantId, item.quantity, movement_type],
       );
     }
 
@@ -1403,7 +1449,7 @@ app.put("/invoices/:id", async (req, res) => {
     ========================================= */
     const movementsRes = await client.query(
       `
-  SELECT product_id, quantity, movement_type
+  SELECT product_id, quantity, movement_type, COALESCE(variant_id, 0) AS variant_id
   FROM stock_movements
   WHERE invoice_id = $1
   FOR UPDATE
@@ -1418,9 +1464,9 @@ app.put("/invoices/:id", async (req, res) => {
           `
       UPDATE stock
       SET quantity = quantity - $1
-      WHERE warehouse_id = $2 AND product_id = $3
+      WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
     `,
-          [m.quantity, warehouseId, m.product_id],
+          [m.quantity, warehouseId, m.product_id, m.variant_id],
         );
       }
 
@@ -1430,9 +1476,9 @@ app.put("/invoices/:id", async (req, res) => {
           `
       UPDATE stock
       SET quantity = quantity + $1
-      WHERE warehouse_id = $2 AND product_id = $3
+      WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
     `,
-          [m.quantity, warehouseId, m.product_id],
+          [m.quantity, warehouseId, m.product_id, m.variant_id],
         );
       }
     }
@@ -1457,6 +1503,7 @@ app.put("/invoices/:id", async (req, res) => {
     for (const item of items) {
       const itemTotal =
         item.price * item.quantity - (item.discount || 0) * item.quantity;
+      const variantId = item.variant_id || 0;
 
       // ➕ invoice_items
       await client.query(
@@ -1470,9 +1517,10 @@ app.put("/invoices/:id", async (req, res) => {
           price,
           quantity,
           discount,
-          total
+          total,
+          variant_id
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         `,
         [
           invoiceId,
@@ -1483,6 +1531,7 @@ app.put("/invoices/:id", async (req, res) => {
           item.quantity,
           item.discount || 0,
           itemTotal,
+          variantId,
         ],
       );
 
@@ -1494,18 +1543,19 @@ app.put("/invoices/:id", async (req, res) => {
           SET quantity = quantity - $1
           WHERE warehouse_id = $2
             AND product_id = $3
+            AND variant_id = $4
           `,
-          [item.quantity, warehouseId, item.product_id],
+          [item.quantity, warehouseId, item.product_id, variantId],
         );
       } else {
         await client.query(
           `
-          INSERT INTO stock (warehouse_id, product_id, quantity)
-          VALUES ($1,$2,$3)
-          ON CONFLICT (warehouse_id, product_id)
-          DO UPDATE SET quantity = stock.quantity + $3
+          INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+          VALUES ($1,$2,$3,$4)
+          ON CONFLICT (warehouse_id, product_id, variant_id)
+          DO UPDATE SET quantity = stock.quantity + $4
           `,
-          [warehouseId, item.product_id, item.quantity],
+          [warehouseId, item.product_id, variantId, item.quantity],
         );
       }
 
@@ -1513,10 +1563,10 @@ app.put("/invoices/:id", async (req, res) => {
       await client.query(
         `
         INSERT INTO stock_movements
-        (invoice_id, warehouse_id, product_id, quantity, movement_type)
-        VALUES ($1,$2,$3,$4,$5)
+        (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+        VALUES ($1,$2,$3,$4,$5,$6)
         `,
-        [invoiceId, warehouseId, item.product_id, item.quantity, movement_type],
+        [invoiceId, warehouseId, item.product_id, variantId, item.quantity, movement_type],
       );
     }
 
@@ -2262,7 +2312,7 @@ app.delete("/invoices/:id", async (req, res) => {
     // 1️⃣ هات الحركات
     const movementsRes = await client.query(
       `
-      SELECT warehouse_id, product_id, quantity, movement_type
+      SELECT warehouse_id, product_id, quantity, movement_type, COALESCE(variant_id, 0) AS variant_id
       FROM stock_movements
       WHERE invoice_id = $1
       FOR UPDATE
@@ -2277,18 +2327,18 @@ app.delete("/invoices/:id", async (req, res) => {
           `
           UPDATE stock
           SET quantity = quantity - $1
-          WHERE warehouse_id = $2 AND product_id = $3
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
         `,
-          [m.quantity, m.warehouse_id, m.product_id],
+          [m.quantity, m.warehouse_id, m.product_id, m.variant_id],
         );
       } else if (m.movement_type === "sale") {
         await client.query(
           `
           UPDATE stock
           SET quantity = quantity + $1
-          WHERE warehouse_id = $2 AND product_id = $3
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
         `,
-          [m.quantity, m.warehouse_id, m.product_id],
+          [m.quantity, m.warehouse_id, m.product_id, m.variant_id],
         );
       }
     }
@@ -2918,11 +2968,12 @@ app.post("/stock/transfer", async (req, res) => {
 
     for (const item of items) {
       const { product_id, quantity } = item;
+      const variantId = item.variant_id || 0;
 
       // تحقق من رصيد المصدر
       const stockRes = await client.query(
-        "SELECT quantity FROM stock WHERE warehouse_id = $1 AND product_id = $2",
-        [fromWarehouseId, product_id],
+        "SELECT quantity FROM stock WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = $3",
+        [fromWarehouseId, product_id, variantId],
       );
 
       const available = stockRes.rows.length ? stockRes.rows[0].quantity : 0;
@@ -2935,40 +2986,40 @@ app.post("/stock/transfer", async (req, res) => {
         `
         UPDATE stock
         SET quantity = quantity - $1
-        WHERE warehouse_id = $2 AND product_id = $3
+        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
         `,
-        [quantity, fromWarehouseId, product_id],
+        [quantity, fromWarehouseId, product_id, variantId],
       );
 
       // إضافة للوجهة (لو مش موجود ينشئه)
       await client.query(
         `
-        INSERT INTO stock (warehouse_id, product_id, quantity)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (warehouse_id, product_id)
-        DO UPDATE SET quantity = stock.quantity + $3
+        INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (warehouse_id, product_id, variant_id)
+        DO UPDATE SET quantity = stock.quantity + $4
         `,
-        [toWarehouseId, product_id, quantity],
+        [toWarehouseId, product_id, variantId, quantity],
       );
 
       // حركة خروج
       await client.query(
         `
         INSERT INTO stock_movements
-        (warehouse_id, product_id, quantity, movement_type)
-        VALUES ($1, $2, $3, 'transfer_out')
+        (warehouse_id, product_id, variant_id, quantity, movement_type)
+        VALUES ($1, $2, $3, $4, 'transfer_out')
         `,
-        [fromWarehouseId, product_id, quantity],
+        [fromWarehouseId, product_id, variantId, quantity],
       );
 
       // حركة دخول
       await client.query(
         `
         INSERT INTO stock_movements
-        (warehouse_id, product_id, quantity, movement_type)
-        VALUES ($1, $2, $3, 'transfer_in')
+        (warehouse_id, product_id, variant_id, quantity, movement_type)
+        VALUES ($1, $2, $3, $4, 'transfer_in')
         `,
-        [toWarehouseId, product_id, quantity],
+        [toWarehouseId, product_id, variantId, quantity],
       );
     }
 
@@ -2985,6 +3036,36 @@ app.post("/stock/transfer", async (req, res) => {
 });
 
 app.get("/stock/quantity", async (req, res) => {
+  const { product_id, branch_id, variant_id } = req.query;
+
+  if (!product_id || !branch_id) {
+    return res.status(400).json({ error: "بيانات ناقصة" });
+  }
+
+  try {
+    const warehouse_id = await getWholesaleWarehouseByBranch(branch_id);
+    const vid = variant_id !== undefined ? Number(variant_id) : 0;
+
+    const result = await pool.query(
+      `
+      SELECT quantity
+      FROM stock
+      WHERE product_id = $1 AND warehouse_id = $2 AND variant_id = $3
+      `,
+      [product_id, warehouse_id, vid],
+    );
+
+    const quantity = result.rows.length ? result.rows[0].quantity : 0;
+
+    res.json({ quantity });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 📦 رصيد كل العبوات لمنتج معين
+app.get("/stock/quantity-all", async (req, res) => {
   const { product_id, branch_id } = req.query;
 
   if (!product_id || !branch_id) {
@@ -2996,16 +3077,21 @@ app.get("/stock/quantity", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT quantity
+      SELECT variant_id, quantity
       FROM stock
       WHERE product_id = $1 AND warehouse_id = $2
+      ORDER BY variant_id
       `,
       [product_id, warehouse_id],
     );
 
-    const quantity = result.rows.length ? result.rows[0].quantity : 0;
+    // Return as map: { 0: 50, 3: 20, 5: 10 }
+    const stockMap = {};
+    for (const row of result.rows) {
+      stockMap[row.variant_id] = Number(row.quantity);
+    }
 
-    res.json({ quantity });
+    res.json(stockMap);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -3031,12 +3117,13 @@ app.get("/products/for-replace", async (req, res) => {
         p.wholesale_package,
         p.retail_package,
         p.manufacturer,
-        p.purchase_price AS wholesale_price,   -- ✅ سعر الشراء
+        p.purchase_price AS wholesale_price,
         COALESCE(s.quantity, 0) AS available_quantity
       FROM products p
       LEFT JOIN stock s
         ON s.product_id = p.id
         AND s.warehouse_id = $1
+        AND s.variant_id = 0
       WHERE p.is_active = true
       ORDER BY p.name
       `,
@@ -3079,7 +3166,7 @@ app.post("/stock/replace", async (req, res) => {
     const result = await client.query(
       `SELECT quantity
      FROM stock
-     WHERE product_id = $1 AND warehouse_id = $2
+     WHERE product_id = $1 AND warehouse_id = $2 AND variant_id = 0
      FOR UPDATE`,
       [out_product_id, warehouse_id],
     );
@@ -3099,7 +3186,7 @@ app.post("/stock/replace", async (req, res) => {
       `
   UPDATE stock
   SET quantity = quantity - $1
-  WHERE product_id = $2 AND warehouse_id = $3
+  WHERE product_id = $2 AND warehouse_id = $3 AND variant_id = 0
   `,
       [out_quantity, out_product_id, warehouse_id],
     );
@@ -3117,9 +3204,9 @@ app.post("/stock/replace", async (req, res) => {
     // 3️⃣ إضافة الصنف البديل
     await client.query(
       `
-  INSERT INTO stock (warehouse_id, product_id, quantity)
-  VALUES ($1, $2, $3)
-  ON CONFLICT (warehouse_id, product_id)
+  INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+  VALUES ($1, $2, 0, $3)
+  ON CONFLICT (warehouse_id, product_id, variant_id)
   DO UPDATE SET quantity = stock.quantity + $3
   `,
       [warehouse_id, in_product_id, in_quantity],
@@ -3902,7 +3989,7 @@ FROM products
         `
         SELECT quantity
         FROM stock
-        WHERE product_id = $1 AND warehouse_id = $2
+        WHERE product_id = $1 AND warehouse_id = $2 AND variant_id = 0
         `,
         [product_id, wholesaleWarehouseId],
       );
@@ -4027,7 +4114,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         `
         SELECT quantity
         FROM stock
-        WHERE warehouse_id = $1 AND product_id = $2
+        WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = 0
         FOR UPDATE
         `,
         [wholesaleWarehouseId, product_id],
@@ -4053,7 +4140,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         `
         UPDATE stock
         SET quantity = quantity - $1
-        WHERE warehouse_id = $2 AND product_id = $3
+        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
         `,
         [quantity, wholesaleWarehouseId, product_id],
       );
@@ -4061,9 +4148,9 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
       // 4️⃣ إضافة للقطاعي
       await client.query(
         `
-        INSERT INTO stock (warehouse_id, product_id, quantity)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (warehouse_id, product_id)
+        INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+        VALUES ($1, $2, 0, $3)
+        ON CONFLICT (warehouse_id, product_id, variant_id)
         DO UPDATE SET quantity = stock.quantity + $3
         `,
         [retailWarehouseId, product_id, conversion.retail_quantity],
@@ -4406,7 +4493,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         `
         UPDATE stock
         SET quantity = quantity + $1
-        WHERE warehouse_id = $2 AND product_id = $3
+        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
         `,
         [item.from_quantity, item.from_warehouse_id, item.product_id],
       );
@@ -4416,7 +4503,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         `
         SELECT quantity
         FROM stock
-        WHERE warehouse_id = $1 AND product_id = $2
+        WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = 0
         FOR UPDATE
         `,
         [item.to_warehouse_id, item.product_id],
@@ -4436,7 +4523,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         `
         UPDATE stock
         SET quantity = quantity - $1
-        WHERE warehouse_id = $2 AND product_id = $3
+        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
         `,
         [item.to_quantity, item.to_warehouse_id, item.product_id],
       );
@@ -4564,10 +4651,9 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
     // 2️⃣ تأكد إن رصيد المخزن الهدف يسمح بالعكس
     const targetStockRes = await client.query(
       `
-      SELECT quantity
+      SELECT SUM(quantity) AS quantity
       FROM stock
       WHERE warehouse_id = $1 AND product_id = $2
-      FOR UPDATE
       `,
       [item.to_warehouse_id, item.product_id],
     );
@@ -4587,7 +4673,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       `
       UPDATE stock
       SET quantity = quantity + $1
-      WHERE warehouse_id = $2 AND product_id = $3
+      WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
       `,
       [item.from_quantity, item.from_warehouse_id, item.product_id],
     );
@@ -4597,7 +4683,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       `
       UPDATE stock
       SET quantity = quantity - $1
-      WHERE warehouse_id = $2 AND product_id = $3
+      WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
       `,
       [item.to_quantity, item.to_warehouse_id, item.product_id],
     );
