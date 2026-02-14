@@ -206,7 +206,7 @@ app.get("/products", async (req, res) => {
     let productsResult;
 
     if (movement_type === "sale") {
-      // 🔹 بيع → لازم رصيد
+      // 🔹 بيع → لازم رصيد (نجمع كل الـ variants في سطر واحد)
       productsResult = await pool.query(
         `
      SELECT
@@ -220,19 +220,21 @@ app.get("/products", async (req, res) => {
         ELSE p.retail_price
       END AS price,
       p.discount_amount,
-      s.quantity AS available_quantity
+      COALESCE(SUM(s.quantity), 0) AS available_quantity
     FROM products p
     JOIN stock s
       ON s.product_id = p.id
       AND s.warehouse_id = $2
     WHERE p.is_active = true
-      AND s.quantity > 0
+    GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
+             p.manufacturer, p.wholesale_price, p.retail_price, p.discount_amount
+    HAVING SUM(s.quantity) > 0
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
       );
     } else {
-      // 🔹 شراء → كل الأصناف حتى لو الرصيد صفر
+      // 🔹 شراء → كل الأصناف حتى لو الرصيد صفر (نجمع كل الـ variants في سطر واحد)
       productsResult = await pool.query(
         `
    SELECT
@@ -246,12 +248,14 @@ app.get("/products", async (req, res) => {
         ELSE p.retail_purchase_price
       END AS price,
       p.discount_amount,
-     COALESCE(s.quantity, 0) AS available_quantity
+     COALESCE(SUM(s.quantity), 0) AS available_quantity
     FROM products p
     LEFT JOIN stock s
       ON s.product_id = p.id
       AND s.warehouse_id = $2
     WHERE p.is_active = true
+    GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
+             p.manufacturer, p.purchase_price, p.retail_purchase_price, p.discount_amount
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
@@ -2698,14 +2702,16 @@ app.get("/products/by-barcode/:barcode", async (req, res) => {
             ELSE p.retail_price
           END AS price,
           p.discount_amount,
-          s.quantity AS available_quantity
+          COALESCE(SUM(s.quantity), 0) AS available_quantity
         FROM products p
         JOIN stock s
           ON s.product_id = p.id
           AND s.warehouse_id = $2
         WHERE p.barcode = $3
           AND p.is_active = true
-          AND s.quantity > 0
+        GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
+                 p.manufacturer, p.barcode, p.wholesale_price, p.retail_price, p.discount_amount
+        HAVING SUM(s.quantity) > 0
         LIMIT 1
         `,
         [invoice_type, warehouseId, barcode],
@@ -2723,13 +2729,15 @@ app.get("/products/by-barcode/:barcode", async (req, res) => {
     p.barcode,
     p.retail_purchase_price AS price,
     p.discount_amount,
-    COALESCE(s.quantity, 0) AS available_quantity
+    COALESCE(SUM(s.quantity), 0) AS available_quantity
   FROM products p
   LEFT JOIN stock s
     ON s.product_id = p.id
     AND s.warehouse_id = $1
   WHERE p.barcode = $2
     AND p.is_active = true
+  GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
+           p.manufacturer, p.barcode, p.retail_purchase_price, p.discount_amount
   LIMIT 1
   `,
         [warehouseId, barcode],
@@ -2746,22 +2754,25 @@ app.get("/products/by-barcode/:barcode", async (req, res) => {
     if (movement_type === "sale") {
       variantQuery = await pool.query(
         `SELECT pv.*, p.name, p.manufacturer, p.discount_amount, p.is_active,
-                s.quantity AS available_quantity
+                COALESCE(SUM(s.quantity), 0) AS available_quantity
          FROM product_variants pv
          JOIN products p ON p.id = pv.product_id
          JOIN stock s ON s.product_id = p.id AND s.warehouse_id = $1
-         WHERE pv.barcode = $2 AND p.is_active = true AND s.quantity > 0
+         WHERE pv.barcode = $2 AND p.is_active = true
+         GROUP BY pv.id, p.name, p.manufacturer, p.discount_amount, p.is_active
+         HAVING SUM(s.quantity) > 0
          LIMIT 1`,
         [warehouseId, barcode],
       );
     } else {
       variantQuery = await pool.query(
         `SELECT pv.*, p.name, p.manufacturer, p.discount_amount, p.is_active,
-                COALESCE(s.quantity, 0) AS available_quantity
+                COALESCE(SUM(s.quantity), 0) AS available_quantity
          FROM product_variants pv
          JOIN products p ON p.id = pv.product_id
          LEFT JOIN stock s ON s.product_id = p.id AND s.warehouse_id = $1
          WHERE pv.barcode = $2 AND p.is_active = true
+         GROUP BY pv.id, p.name, p.manufacturer, p.discount_amount, p.is_active
          LIMIT 1`,
         [warehouseId, barcode],
       );
