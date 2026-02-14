@@ -43,6 +43,19 @@ app.get("/", (req, res) => {
   res.send("Glass System Backend Running 🚀");
 });
 
+// 📋 إنشاء جدول سجل النشاط لو مش موجود
+pool.query(`
+  CREATE TABLE IF NOT EXISTS user_activity (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    username VARCHAR(100) NOT NULL,
+    action VARCHAR(20) NOT NULL,
+    ip_address VARCHAR(100),
+    created_at TIMESTAMP DEFAULT NOW()
+  )
+`).then(() => console.log("✅ user_activity table ready"))
+  .catch((e) => console.error("❌ user_activity table error:", e.message));
+
 function getWarehouseIdByInvoiceType(invoice_type) {
   if (invoice_type === "retail") {
     return 1; // مخزن المعرض
@@ -4785,9 +4798,54 @@ app.post("/login", async (req, res) => {
         theme: user.theme,
       },
     });
+
+    // 📝 تسجيل دخول اليوزر (بدون انتظار)
+    pool.query(
+      `INSERT INTO user_activity (user_id, username, action, ip_address)
+       VALUES ($1, $2, 'login', $3)`,
+      [user.id, user.username, req.headers["x-forwarded-for"] || req.ip]
+    ).catch((e) => console.error("LOG LOGIN ERR:", e.message));
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Login error" });
+  }
+});
+
+/* =========================
+   📝 LOG LOGOUT
+========================= */
+app.post("/logout", authMiddleware, async (req, res) => {
+  try {
+    await pool.query(
+      `INSERT INTO user_activity (user_id, username, action, ip_address)
+       VALUES ($1, $2, 'logout', $3)`,
+      [req.user.id, req.user.username, req.headers["x-forwarded-for"] || req.ip]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("LOG LOGOUT ERR:", err);
+    res.json({ success: true }); // مش نوقف اللوجاوت بسبب خطأ في التسجيل
+  }
+});
+
+/* =========================
+   📋 GET USER ACTIVITY LOG
+========================= */
+app.get("/user-activity", authMiddleware, async (req, res) => {
+  try {
+    const { limit = 50 } = req.query;
+    const result = await pool.query(
+      `SELECT id, user_id, username, action, ip_address, created_at
+       FROM user_activity
+       ORDER BY created_at DESC
+       LIMIT $1`,
+      [Number(limit)]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET ACTIVITY ERR:", err);
+    res.status(500).json({ error: "فشل تحميل سجل النشاط" });
   }
 });
 
