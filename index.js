@@ -94,13 +94,19 @@ pool
 // 📦 migrations لـ variant_id (متسلسلة عشان الـ constraint يشتغل بعد الأعمدة)
 (async () => {
   try {
-    await pool.query(`ALTER TABLE stock ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`);
+    await pool.query(
+      `ALTER TABLE stock ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
+    );
     console.log("✅ stock.variant_id column ready");
 
-    await pool.query(`ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`);
+    await pool.query(
+      `ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
+    );
     console.log("✅ stock_movements.variant_id column ready");
 
-    await pool.query(`ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`);
+    await pool.query(
+      `ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS variant_id INTEGER DEFAULT 0`,
+    );
     console.log("✅ invoice_items.variant_id column ready");
 
     // تحديث constraint بعد التأكد إن العمود موجود
@@ -192,7 +198,6 @@ pool
       END $$;
     `);
     console.log("✅ stock data recalculated from movements");
-
   } catch (e) {
     console.error("❌ variant migrations error:", e.message);
   }
@@ -4059,11 +4064,13 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
     const previewResults = [];
 
     for (const item of items) {
-      const { product_id, quantity } = item;
+      const { product_id, quantity, variant_id: rawVariantId } = item;
+      const variantId = rawVariantId || 0;
 
       if (!product_id || !quantity || quantity <= 0) {
         previewResults.push({
           product_id,
+          variant_id: variantId,
           status: "rejected",
           reason: "INVALID_ITEM_DATA",
         });
@@ -4089,6 +4096,7 @@ FROM products
       if (!productRes.rows.length) {
         previewResults.push({
           product_id,
+          variant_id: variantId,
           status: "rejected",
           reason: "PRODUCT_NOT_FOUND",
         });
@@ -4097,14 +4105,31 @@ FROM products
 
       const product = productRes.rows[0];
 
-      // 2️⃣ رصيد مخزن الجملة فقط
+      // بيانات العبوة (من الأصناف الفرعية لو variant_id مش 0)
+      let wholesalePkg = product.wholesale_package;
+      let retailPkg = product.retail_package;
+      let packageName = wholesalePkg;
+
+      if (variantId !== 0) {
+        const vRes = await pool.query(
+          `SELECT wholesale_package, retail_package FROM product_variants WHERE id = $1`,
+          [variantId],
+        );
+        if (vRes.rows.length) {
+          wholesalePkg = vRes.rows[0].wholesale_package || wholesalePkg;
+          retailPkg = vRes.rows[0].retail_package || retailPkg;
+          packageName = wholesalePkg;
+        }
+      }
+
+      // 2️⃣ رصيد مخزن الجملة للعبوة المحددة
       const stockRes = await pool.query(
         `
         SELECT quantity
         FROM stock
-        WHERE product_id = $1 AND warehouse_id = $2 AND variant_id = 0
+        WHERE product_id = $1 AND warehouse_id = $2 AND variant_id = $3
         `,
-        [product_id, wholesaleWarehouseId],
+        [product_id, wholesaleWarehouseId, variantId],
       );
 
       const availableQuantity = stockRes.rows.length
@@ -4114,7 +4139,9 @@ FROM products
       if (availableQuantity < quantity) {
         previewResults.push({
           product_id,
+          variant_id: variantId,
           product_name: product.name,
+          package_name: packageName,
           status: "rejected",
           reason: "INSUFFICIENT_STOCK",
         });
@@ -4124,15 +4151,17 @@ FROM products
       // 3️⃣ التحويل
       try {
         const result = convertWholesaleToRetail({
-          wholesale_package: product.wholesale_package,
-          retail_package: product.retail_package,
+          wholesale_package: wholesalePkg,
+          retail_package: retailPkg,
           wholesale_quantity: quantity,
         });
 
         previewResults.push({
           product_id,
+          variant_id: variantId,
           product_name: product.name,
-          manufacturer: product.manufacturer, // ✅ هنا الحل
+          manufacturer: product.manufacturer,
+          package_name: packageName,
           from_quantity: quantity,
           to_quantity: result.retail_quantity,
           status: "ok",
@@ -4140,7 +4169,9 @@ FROM products
       } catch (err) {
         previewResults.push({
           product_id,
+          variant_id: variantId,
           product_name: product.name,
+          package_name: packageName,
           status: "rejected",
           reason: err.message || "INVALID_PACKAGE",
         });
@@ -4201,6 +4232,7 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
     for (const item of items) {
       const product_id = Number(item.product_id);
       const quantity = Number(item.quantity);
+      const variantId = Number(item.variant_id) || 0;
 
       if (!product_id || quantity <= 0) {
         throw new Error("INVALID_ITEM_DATA");
@@ -4222,15 +4254,30 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
 
       const product = productRes.rows[0];
 
+      // بيانات العبوة (من الأصناف الفرعية لو variant_id مش 0)
+      let wholesalePkg = product.wholesale_package;
+      let retailPkg = product.retail_package;
+
+      if (variantId !== 0) {
+        const vRes = await client.query(
+          `SELECT wholesale_package, retail_package FROM product_variants WHERE id = $1`,
+          [variantId],
+        );
+        if (vRes.rows.length) {
+          wholesalePkg = vRes.rows[0].wholesale_package || wholesalePkg;
+          retailPkg = vRes.rows[0].retail_package || retailPkg;
+        }
+      }
+
       // 🔹 رصيد الجملة (قفل الصف)
       const stockRes = await client.query(
         `
         SELECT quantity
         FROM stock
-        WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = 0
+        WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = $3
         FOR UPDATE
         `,
-        [wholesaleWarehouseId, product_id],
+        [wholesaleWarehouseId, product_id, variantId],
       );
 
       const available = stockRes.rows.length
@@ -4243,8 +4290,8 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
 
       // 🔹 التحويل
       const conversion = convertWholesaleToRetail({
-        wholesale_package: product.wholesale_package,
-        retail_package: product.retail_package,
+        wholesale_package: wholesalePkg,
+        retail_package: retailPkg,
         wholesale_quantity: quantity,
       });
 
@@ -4253,20 +4300,20 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         `
         UPDATE stock
         SET quantity = quantity - $1
-        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
+        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
         `,
-        [quantity, wholesaleWarehouseId, product_id],
+        [quantity, wholesaleWarehouseId, product_id, variantId],
       );
 
       // 4️⃣ إضافة للقطاعي
       await client.query(
         `
         INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-        VALUES ($1, $2, 0, $3)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (warehouse_id, product_id, variant_id)
-        DO UPDATE SET quantity = stock.quantity + $3
+        DO UPDATE SET quantity = stock.quantity + $4
         `,
-        [retailWarehouseId, product_id, conversion.retail_quantity],
+        [retailWarehouseId, product_id, variantId, conversion.retail_quantity],
       );
 
       // 5️⃣ تفاصيل التحويل
@@ -4302,17 +4349,19 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         (
           warehouse_id,
           product_id,
+          variant_id,
           quantity,
           movement_type,
           reference_type,
           reference_id,
           note
         )
-        VALUES ($1,$2,$3,'transfer_out','transfer',$4,$5)
+        VALUES ($1,$2,$3,$4,'transfer_out','transfer',$5,$6)
         `,
         [
           wholesaleWarehouseId,
           product_id,
+          variantId,
           quantity,
           transferId,
           "تحويل من الجملة إلى القطاعي",
@@ -4326,17 +4375,19 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
         (
           warehouse_id,
           product_id,
+          variant_id,
           quantity,
           movement_type,
           reference_type,
           reference_id,
           note
         )
-        VALUES ($1,$2,$3,'transfer_in','transfer',$4,$5)
+        VALUES ($1,$2,$3,$4,'transfer_in','transfer',$5,$6)
         `,
         [
           retailWarehouseId,
           product_id,
+          variantId,
           conversion.retail_quantity,
           transferId,
           "تحويل من الجملة إلى القطاعي",
