@@ -75,12 +75,21 @@ pool
     retail_purchase_price NUMERIC DEFAULT 0,
     wholesale_price NUMERIC DEFAULT 0,
     retail_price NUMERIC DEFAULT 0,
+    discount_amount NUMERIC DEFAULT 0,
     created_at TIMESTAMP DEFAULT NOW()
   )
 `,
   )
   .then(() => console.log("✅ product_variants table ready"))
   .catch((e) => console.error("❌ product_variants table error:", e.message));
+
+// إضافة عمود الخصم لو مش موجود
+pool
+  .query(
+    `ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS discount_amount NUMERIC DEFAULT 0`,
+  )
+  .then(() => console.log("✅ discount_amount column ready"))
+  .catch((e) => console.error("❌ discount_amount column error:", e.message));
 
 function getWarehouseIdByInvoiceType(invoice_type) {
   if (invoice_type === "retail") {
@@ -2744,6 +2753,7 @@ app.post("/admin/products/:id/variants", async (req, res) => {
       retail_purchase_price = 0,
       wholesale_price = 0,
       retail_price = 0,
+      discount_amount = 0,
     } = req.body;
 
     if (!wholesale_package && !retail_package) {
@@ -2771,8 +2781,8 @@ app.post("/admin/products/:id/variants", async (req, res) => {
     const result = await pool.query(
       `INSERT INTO product_variants 
         (product_id, label, barcode, wholesale_package, retail_package,
-         purchase_price, retail_purchase_price, wholesale_price, retail_price)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         purchase_price, retail_purchase_price, wholesale_price, retail_price, discount_amount)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        RETURNING *`,
       [
         id,
@@ -2784,6 +2794,7 @@ app.post("/admin/products/:id/variants", async (req, res) => {
         retail_purchase_price,
         wholesale_price,
         retail_price,
+        discount_amount,
       ],
     );
 
@@ -2807,6 +2818,7 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
       retail_purchase_price = 0,
       wholesale_price = 0,
       retail_price = 0,
+      discount_amount = 0,
     } = req.body;
 
     // تحقق من الباركود لو موجود
@@ -2830,8 +2842,9 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
     const result = await pool.query(
       `UPDATE product_variants
        SET label = $1, barcode = $2, wholesale_package = $3, retail_package = $4,
-           purchase_price = $5, retail_purchase_price = $6, wholesale_price = $7, retail_price = $8
-       WHERE id = $9
+           purchase_price = $5, retail_purchase_price = $6, wholesale_price = $7, retail_price = $8,
+           discount_amount = $9
+       WHERE id = $10
        RETURNING *`,
       [
         label || null,
@@ -2842,6 +2855,7 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
         retail_purchase_price,
         wholesale_price,
         retail_price,
+        discount_amount,
         variantId,
       ],
     );
