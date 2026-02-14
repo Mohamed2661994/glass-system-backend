@@ -3236,13 +3236,13 @@ app.get("/products/for-replace", async (req, res) => {
         p.retail_package,
         p.manufacturer,
         p.purchase_price AS wholesale_price,
-        COALESCE(s.quantity, 0) AS available_quantity
+        COALESCE(SUM(s.quantity), 0) AS available_quantity
       FROM products p
       LEFT JOIN stock s
         ON s.product_id = p.id
         AND s.warehouse_id = $1
-        AND s.variant_id = 0
       WHERE p.is_active = true
+      GROUP BY p.id, p.name, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price
       ORDER BY p.name
       `,
       [warehouse_id],
