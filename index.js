@@ -552,6 +552,25 @@ VALUES
       });
     }
 
+    // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع
+    if (movement_type === "sale" && paid_amount > 0) {
+      await client.query(
+        `INSERT INTO cash_in 
+         (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'invoice', $8)`,
+        [
+          branch_id,
+          invoiceId,
+          customer_name || "عميل نقدي",
+          total,
+          paid_amount,
+          remaining_amount,
+          `فاتورة جملة رقم #${invoiceId}`,
+          invoice_date || new Date(),
+        ],
+      );
+    }
+
     await client.query("COMMIT");
 
     res.json({
@@ -757,6 +776,25 @@ app.post("/invoices/retail", async (req, res) => {
         VALUES ($1,$2,$3,$4,$5)
         `,
         [invoiceId, warehouseId, item.product_id, item.quantity, movement_type],
+      );
+    }
+
+    // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع القطاعي
+    if (movement_type === "sale" && Number(paid_amount) > 0) {
+      await client.query(
+        `INSERT INTO cash_in 
+         (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'invoice', $8)`,
+        [
+          branch_id,
+          invoiceId,
+          customer_name || "عميل نقدي",
+          Number(final_total),
+          Number(paid_amount),
+          remaining_amount,
+          `فاتورة قطاعي رقم #${invoiceId}`,
+          invoice_date || new Date(),
+        ],
       );
     }
 
