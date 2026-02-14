@@ -161,12 +161,16 @@ exports.getProductMovement = async (req, res) => {
         i.customer_name AS party_name,
 
         -- نوع الفاتورة (بيع / شراء)
-        i.invoice_type
+        i.invoice_type,
+
+        -- العبوة المستخدمة من بنود الفاتورة
+        ii.package AS package_name
 
       FROM stock_movements sm
       JOIN products p ON p.id = sm.product_id
       JOIN warehouses w ON w.id = sm.warehouse_id
       LEFT JOIN invoices i ON i.id = sm.invoice_id
+      LEFT JOIN invoice_items ii ON ii.invoice_id = sm.invoice_id AND ii.product_id = sm.product_id
 
       WHERE ${conditions.join(" AND ")}
       ORDER BY sm.created_at ASC
