@@ -552,8 +552,8 @@ VALUES
       });
     }
 
-    // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع
-    if (movement_type === "sale" && paid_amount > 0) {
+    // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع - فقط لفرع الجملة
+    if (movement_type === "sale" && paid_amount > 0 && Number(branch_id) === 2) {
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
