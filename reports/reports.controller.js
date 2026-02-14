@@ -8,21 +8,15 @@ exports.getInventorySummary = async (req, res) => {
   try {
     const { warehouse_id } = req.query;
 
-    let filter = "";
-    let values = [];
-
-    if (warehouse_id) {
-      filter = "WHERE s.warehouse_id = $1";
-      values.push(warehouse_id);
-    }
-
     const result = await pool.query(
       `
     SELECT
       p.id AS product_id,
       p.name AS product_name,
-      p.manufacturer AS manufacturer_name, -- ✅ المصنع من جدول المنتجات
+      p.manufacturer AS manufacturer_name,
       w.name AS warehouse_name,
+      p.wholesale_package,
+      p.retail_package,
 
       COALESCE(SUM(
         CASE 
@@ -36,57 +30,9 @@ exports.getInventorySummary = async (req, res) => {
           THEN sm.quantity ELSE 0 END
       ), 0) AS total_out,
 
-      COALESCE(s.quantity, 0) AS current_stock,
-
-      -- العبوات المستخدمة في الحركات
-      (
-        SELECT string_agg(DISTINCT sub.pkg, ' | ')
-        FROM (
-          SELECT p.wholesale_package AS pkg
-          UNION
-          SELECT p.retail_package AS pkg
-          UNION
-          SELECT pv.wholesale_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
-          UNION
-          SELECT pv.retail_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
-        ) sub
-        WHERE sub.pkg IS NOT NULL AND sub.pkg != ''
-      ) AS packages,
-
-      (
-        COALESCE(SUM(
-          CASE 
-            WHEN sm.movement_type IN ('purchase','transfer_in','replace_in')
-            THEN sm.quantity ELSE 0 END
-        ), 0)
-        -
-        COALESCE(SUM(
-          CASE 
-            WHEN sm.movement_type IN ('sale','transfer_out','replace_out')
-            THEN sm.quantity ELSE 0 END
-        ), 0)
-      ) AS expected_stock,
-
-      (
-        COALESCE(s.quantity, 0)
-        -
-        (
-          COALESCE(SUM(
-            CASE 
-              WHEN sm.movement_type IN ('purchase','transfer_in','replace_in')
-              THEN sm.quantity ELSE 0 END
-          ), 0)
-          -
-          COALESCE(SUM(
-            CASE 
-              WHEN sm.movement_type IN ('sale','transfer_out','replace_out')
-              THEN sm.quantity ELSE 0 END
-          ), 0)
-        )
-      ) AS stock_difference
+      COALESCE(s.quantity, 0) AS current_stock
 
     FROM products p
-    -- ❌ شلنا JOIN manufacturers لأنه مش موجود
     LEFT JOIN stock s ON s.product_id = p.id
     LEFT JOIN warehouses w ON w.id = s.warehouse_id
     LEFT JOIN stock_movements sm
@@ -95,27 +41,49 @@ exports.getInventorySummary = async (req, res) => {
 
     ${warehouse_id ? "WHERE s.warehouse_id = $1" : ""}
 
-    GROUP BY p.id, p.name, p.manufacturer, w.name, s.quantity
+    GROUP BY p.id, p.name, p.manufacturer, w.name, p.wholesale_package, p.retail_package, s.quantity
 
     HAVING 
       COALESCE(SUM(CASE WHEN sm.movement_type IN ('purchase','transfer_in','replace_in') THEN sm.quantity ELSE 0 END),0) > 0
       OR COALESCE(SUM(CASE WHEN sm.movement_type IN ('sale','transfer_out','replace_out') THEN sm.quantity ELSE 0 END),0) > 0
       OR COALESCE(s.quantity,0) > 0
 
-    ORDER BY ABS(
-      COALESCE(s.quantity, 0)
-      -
-      (
-        COALESCE(SUM(CASE WHEN sm.movement_type IN ('purchase','transfer_in','replace_in') THEN sm.quantity ELSE 0 END),0)
-        -
-        COALESCE(SUM(CASE WHEN sm.movement_type IN ('sale','transfer_out','replace_out') THEN sm.quantity ELSE 0 END),0)
-      )
-    ) DESC;
+    ORDER BY p.name
       `,
       warehouse_id ? [warehouse_id] : [],
     );
 
-    res.json(result.rows);
+    // Get all variants
+    const variantsRes = await pool.query(
+      `SELECT product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`
+    );
+    const variantsByProduct = {};
+    for (const v of variantsRes.rows) {
+      if (!variantsByProduct[v.product_id]) variantsByProduct[v.product_id] = [];
+      variantsByProduct[v.product_id].push(v);
+    }
+
+    // Expand: one row per package (main + variants)
+    const expanded = [];
+    for (const row of result.rows) {
+      const variants = variantsByProduct[row.product_id] || [];
+      const pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(' / ') || '-';
+      
+      expanded.push({
+        ...row,
+        package_name: pkgLabel,
+      });
+
+      for (const v of variants) {
+        const vPkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(' / ') || '-';
+        expanded.push({
+          ...row,
+          package_name: vPkgLabel,
+        });
+      }
+    }
+
+    res.json(expanded);
   } catch (err) {
     console.error("INVENTORY SUMMARY ERROR:", err);
     res.status(500).json({ error: "Server error" });
@@ -224,19 +192,8 @@ exports.getLowStock = async (req, res) => {
         p.manufacturer AS manufacturer_name,
         w.name AS warehouse_name,
         s.quantity AS current_stock,
-        (
-          SELECT string_agg(DISTINCT sub.pkg, ' | ')
-          FROM (
-            SELECT p.wholesale_package AS pkg
-            UNION
-            SELECT p.retail_package AS pkg
-            UNION
-            SELECT pv.wholesale_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
-            UNION
-            SELECT pv.retail_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
-          ) sub
-          WHERE sub.pkg IS NOT NULL AND sub.pkg != ''
-        ) AS packages
+        p.wholesale_package,
+        p.retail_package
       FROM stock s
       JOIN products p ON p.id = s.product_id
       JOIN warehouses w ON w.id = s.warehouse_id
@@ -246,7 +203,37 @@ exports.getLowStock = async (req, res) => {
       values,
     );
 
-    res.json(result.rows);
+    // Get all variants
+    const variantsRes = await pool.query(
+      `SELECT product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`
+    );
+    const variantsByProduct = {};
+    for (const v of variantsRes.rows) {
+      if (!variantsByProduct[v.product_id]) variantsByProduct[v.product_id] = [];
+      variantsByProduct[v.product_id].push(v);
+    }
+
+    // Expand: one row per package (main + variants)
+    const expanded = [];
+    for (const row of result.rows) {
+      const variants = variantsByProduct[row.product_id] || [];
+      const pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(' / ') || '-';
+      
+      expanded.push({
+        ...row,
+        package_name: pkgLabel,
+      });
+
+      for (const v of variants) {
+        const vPkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(' / ') || '-';
+        expanded.push({
+          ...row,
+          package_name: vPkgLabel,
+        });
+      }
+    }
+
+    res.json(expanded);
   } catch (err) {
     console.error("LOW STOCK ERROR:", err);
     res.status(500).json({ error: "Server error" });
@@ -326,22 +313,11 @@ exports.getInventoryDetails = async (req, res) => {
         p.manufacturer,
         s.quantity,
         p.purchase_price,
+        p.wholesale_package,
+        p.retail_package,
         (s.quantity * p.purchase_price) AS total_value,
         w.id AS warehouse_id,
-        w.name AS warehouse_name,
-        (
-          SELECT string_agg(DISTINCT sub.pkg, ' | ')
-          FROM (
-            SELECT p.wholesale_package AS pkg
-            UNION
-            SELECT p.retail_package AS pkg
-            UNION
-            SELECT pv.wholesale_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
-            UNION
-            SELECT pv.retail_package AS pkg FROM product_variants pv WHERE pv.product_id = p.id
-          ) sub
-          WHERE sub.pkg IS NOT NULL AND sub.pkg != ''
-        ) AS packages
+        w.name AS warehouse_name
       FROM stock s
       JOIN products p ON p.id = s.product_id
       JOIN warehouses w ON w.id = s.warehouse_id
@@ -351,7 +327,39 @@ exports.getInventoryDetails = async (req, res) => {
       values,
     );
 
-    res.json(result.rows);
+    // Get all variants
+    const variantsRes = await pool.query(
+      `SELECT product_id, wholesale_package, retail_package, purchase_price, retail_purchase_price FROM product_variants ORDER BY id`
+    );
+    const variantsByProduct = {};
+    for (const v of variantsRes.rows) {
+      if (!variantsByProduct[v.product_id]) variantsByProduct[v.product_id] = [];
+      variantsByProduct[v.product_id].push(v);
+    }
+
+    // Expand: one row per package (main + variants)
+    const expanded = [];
+    for (const row of result.rows) {
+      const variants = variantsByProduct[row.product_id] || [];
+      const pkgLabel = [row.wholesale_package, row.retail_package].filter(Boolean).join(' / ') || '-';
+      
+      expanded.push({
+        ...row,
+        package_name: pkgLabel,
+      });
+
+      for (const v of variants) {
+        const vPkgLabel = [v.wholesale_package, v.retail_package].filter(Boolean).join(' / ') || '-';
+        expanded.push({
+          ...row,
+          package_name: vPkgLabel,
+          purchase_price: v.purchase_price,
+          total_value: row.quantity * Number(v.purchase_price),
+        });
+      }
+    }
+
+    res.json(expanded);
   } catch (err) {
     console.error("INVENTORY DETAILS ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });
