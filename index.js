@@ -324,7 +324,11 @@ app.get("/products/variants", async (req, res) => {
     if (ids.length === 0) return res.json([]);
 
     const result = await pool.query(
-      `SELECT * FROM product_variants WHERE product_id = ANY($1) ORDER BY product_id, id`,
+      `SELECT pv.*, 
+              COALESCE(NULLIF(pv.retail_package, ''), p.retail_package) AS retail_package
+       FROM product_variants pv
+       JOIN products p ON p.id = pv.product_id
+       WHERE pv.product_id = ANY($1) ORDER BY pv.product_id, pv.id`,
       [ids],
     );
     res.json(result.rows);
@@ -2898,7 +2902,11 @@ app.get("/admin/products/:id/variants", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
-      `SELECT * FROM product_variants WHERE product_id = $1 ORDER BY id`,
+      `SELECT pv.*, 
+              COALESCE(NULLIF(pv.retail_package, ''), p.retail_package) AS retail_package
+       FROM product_variants pv
+       JOIN products p ON p.id = pv.product_id
+       WHERE pv.product_id = $1 ORDER BY pv.id`,
       [id],
     );
     res.json(result.rows);
@@ -2926,6 +2934,18 @@ app.post("/admin/products/:id/variants", async (req, res) => {
 
     if (!wholesale_package && !retail_package) {
       return res.status(400).json({ error: "العبوة مطلوبة" });
+    }
+
+    // لو القطاعي فاضي أو 0 → ياخد من الصنف الأساسي
+    let finalRetailPackage = retail_package;
+    if (!retail_package || retail_package === "0") {
+      const parentProduct = await pool.query(
+        `SELECT retail_package FROM products WHERE id = $1`,
+        [id],
+      );
+      if (parentProduct.rows.length > 0) {
+        finalRetailPackage = parentProduct.rows[0].retail_package;
+      }
     }
 
     // تحقق من الباركود لو موجود
@@ -2957,7 +2977,7 @@ app.post("/admin/products/:id/variants", async (req, res) => {
         label || null,
         barcode || null,
         wholesale_package || null,
-        retail_package || null,
+        finalRetailPackage || null,
         purchase_price,
         retail_purchase_price,
         wholesale_price,
@@ -2989,6 +3009,22 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
       discount_amount = 0,
     } = req.body;
 
+    // لو القطاعي فاضي أو 0 → ياخد من الصنف الأساسي
+    let finalRetailPackage = retail_package;
+    if (!retail_package || retail_package === "0") {
+      // جلب product_id من الـ variant نفسه
+      const variantRow = await pool.query(
+        `SELECT pv.product_id, p.retail_package
+         FROM product_variants pv
+         JOIN products p ON p.id = pv.product_id
+         WHERE pv.id = $1`,
+        [variantId],
+      );
+      if (variantRow.rows.length > 0) {
+        finalRetailPackage = variantRow.rows[0].retail_package;
+      }
+    }
+
     // تحقق من الباركود لو موجود
     if (barcode) {
       const existsInProducts = await pool.query(
@@ -3018,7 +3054,7 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
         label || null,
         barcode || null,
         wholesale_package || null,
-        retail_package || null,
+        finalRetailPackage || null,
         purchase_price,
         retail_purchase_price,
         wholesale_price,
