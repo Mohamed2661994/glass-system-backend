@@ -2895,6 +2895,92 @@ app.get("/admin/products/check-barcode/:barcode", async (req, res) => {
   }
 });
 
+// 📥 استيراد أصناف من Excel (bulk import)
+app.post("/admin/products/import", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { products } = req.body;
+
+    if (!Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({ error: "لا توجد بيانات للاستيراد" });
+    }
+
+    await client.query("BEGIN");
+
+    let imported = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i];
+      try {
+        // التحقق من البيانات المطلوبة
+        if (!p.name || !p.wholesale_package || !p.retail_package) {
+          errors.push({ row: i + 1, error: "اسم الصنف أو العبوة ناقصة" });
+          skipped++;
+          continue;
+        }
+
+        // التحقق من الباركود المكرر
+        if (p.barcode) {
+          const existing = await client.query(
+            "SELECT id FROM products WHERE barcode = $1",
+            [String(p.barcode)]
+          );
+          if (existing.rows.length > 0) {
+            errors.push({ row: i + 1, error: `باركود مكرر: ${p.barcode}` });
+            skipped++;
+            continue;
+          }
+        }
+
+        const insertRes = await client.query(
+          `INSERT INTO products
+           (name, wholesale_package, retail_package, manufacturer, purchase_price, retail_purchase_price, wholesale_price, retail_price, barcode, discount_amount)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           RETURNING id, barcode`,
+          [
+            p.name,
+            p.wholesale_package,
+            p.retail_package,
+            p.manufacturer || null,
+            Number(p.purchase_price) || 0,
+            Number(p.retail_purchase_price) || 0,
+            Number(p.wholesale_price) || 0,
+            Number(p.retail_price) || 0,
+            p.barcode || null,
+            Number(p.discount_amount) || 0,
+          ]
+        );
+
+        // لو مفيش باركود → ولّد تلقائي
+        const product = insertRes.rows[0];
+        if (!product.barcode) {
+          await client.query(
+            "UPDATE products SET barcode = $1 WHERE id = $2",
+            [`900000${product.id}`, product.id]
+          );
+        }
+
+        imported++;
+      } catch (rowErr) {
+        errors.push({ row: i + 1, error: rowErr.message });
+        skipped++;
+      }
+    }
+
+    await client.query("COMMIT");
+
+    res.json({ imported, skipped, errors });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("IMPORT ERROR:", err);
+    res.status(500).json({ error: "حدث خطأ أثناء الاستيراد" });
+  } finally {
+    client.release();
+  }
+});
+
 // ===== 📦 CRUD أكواد فرعية (عبوات بديلة) =====
 
 // عرض الأكواد الفرعية لصنف معين
@@ -2942,9 +3028,18 @@ app.post("/admin/products/:id/variants", async (req, res) => {
       [id],
     );
     const parent = parentProduct.rows[0] || {};
-    const finalRetailPackage = (!retail_package || retail_package === "0") ? parent.retail_package : retail_package;
-    const finalRetailPrice = Number(retail_price) === 0 ? Number(parent.retail_price || 0) : retail_price;
-    const finalRetailPurchasePrice = Number(retail_purchase_price) === 0 ? Number(parent.retail_purchase_price || 0) : retail_purchase_price;
+    const finalRetailPackage =
+      !retail_package || retail_package === "0"
+        ? parent.retail_package
+        : retail_package;
+    const finalRetailPrice =
+      Number(retail_price) === 0
+        ? Number(parent.retail_price || 0)
+        : retail_price;
+    const finalRetailPurchasePrice =
+      Number(retail_purchase_price) === 0
+        ? Number(parent.retail_purchase_price || 0)
+        : retail_purchase_price;
 
     // تحقق من الباركود لو موجود
     if (barcode) {
@@ -3016,9 +3111,18 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
       [variantId],
     );
     const parent = variantRow.rows[0] || {};
-    const finalRetailPackage = (!retail_package || retail_package === "0") ? parent.retail_package : retail_package;
-    const finalRetailPrice = Number(retail_price) === 0 ? Number(parent.retail_price || 0) : retail_price;
-    const finalRetailPurchasePrice = Number(retail_purchase_price) === 0 ? Number(parent.retail_purchase_price || 0) : retail_purchase_price;
+    const finalRetailPackage =
+      !retail_package || retail_package === "0"
+        ? parent.retail_package
+        : retail_package;
+    const finalRetailPrice =
+      Number(retail_price) === 0
+        ? Number(parent.retail_price || 0)
+        : retail_price;
+    const finalRetailPurchasePrice =
+      Number(retail_purchase_price) === 0
+        ? Number(parent.retail_purchase_price || 0)
+        : retail_purchase_price;
 
     // تحقق من الباركود لو موجود
     if (barcode) {
