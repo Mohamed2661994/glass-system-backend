@@ -91,6 +91,16 @@ pool
   .then(() => console.log("✅ discount_amount column ready"))
   .catch((e) => console.error("❌ discount_amount column error:", e.message));
 
+// إضافة عمود الوصف/كلمات مفتاحية للأصناف
+pool
+  .query(
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`,
+  )
+  .then(() => console.log("✅ products.description column ready"))
+  .catch((e) =>
+    console.error("❌ products.description column error:", e.message),
+  );
+
 // 📦 migrations لـ variant_id (متسلسلة عشان الـ constraint يشتغل بعد الأعمدة)
 (async () => {
   try {
@@ -2532,6 +2542,7 @@ app.post("/admin/products", async (req, res) => {
       retail_price,
       barcode,
       discount_amount = 0,
+      description = "",
     } = req.body;
     const nameNormalized = normalizeNumbers(name);
     const wholesalePackageNormalized = normalizeNumbers(wholesale_package);
@@ -2562,9 +2573,10 @@ app.post("/admin/products", async (req, res) => {
   purchase_price,
   wholesale_price,
   retail_price,
-  discount_amount
+  discount_amount,
+  description
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 RETURNING *
 
       `,
@@ -2579,6 +2591,7 @@ RETURNING *
         wholesale_price,
         retail_price,
         discount_amount,
+        description || "",
       ],
     );
 
@@ -2623,6 +2636,7 @@ app.put("/admin/products/:id", async (req, res) => {
       wholesale_price,
       retail_price,
       discount_amount = 0,
+      description = "",
     } = req.body;
     const nameNormalized = normalizeNumbers(name);
     const wholesalePackageNormalized = normalizeNumbers(wholesale_package);
@@ -2653,8 +2667,9 @@ SET
   retail_purchase_price = $7,
   wholesale_price = $8,
   retail_price = $9,
-  discount_amount = $10
-WHERE id = $11
+  discount_amount = $10,
+  description = $11
+WHERE id = $12
 RETURNING *
       `,
       [
@@ -2668,6 +2683,7 @@ RETURNING *
         wholesale_price,
         retail_price,
         discount_amount,
+        description || "",
         id,
       ],
     );
@@ -5337,6 +5353,42 @@ app.put("/users/:id/reset-password", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("RESET PASSWORD ERROR:", err);
     res.status(500).json({ error: "فشل إعادة تعيين كلمة المرور" });
+  }
+});
+
+/* ========================= update username ========================= */
+app.put("/users/:id/username", authMiddleware, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const { new_username } = req.body;
+
+    if (!new_username || !new_username.trim()) {
+      return res.status(400).json({ error: "أدخل اسم المستخدم الجديد" });
+    }
+
+    // يحق للمستخدم فقط تغيير اسمه
+    if (userId !== req.user.id) {
+      return res.status(403).json({ error: "غير مصرح" });
+    }
+
+    // تأكد مفيش يوزر تاني بنفس الاسم
+    const existing = await pool.query(
+      "SELECT id FROM users WHERE username = $1 AND id != $2",
+      [new_username.trim(), userId],
+    );
+    if (existing.rows.length) {
+      return res.status(400).json({ error: "اسم المستخدم موجود بالفعل" });
+    }
+
+    await pool.query("UPDATE users SET username = $1 WHERE id = $2", [
+      new_username.trim(),
+      userId,
+    ]);
+
+    res.json({ success: true, username: new_username.trim() });
+  } catch (err) {
+    console.error("UPDATE USERNAME ERROR:", err);
+    res.status(500).json({ error: "فشل تحديث اسم المستخدم" });
   }
 });
 
