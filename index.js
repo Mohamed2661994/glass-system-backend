@@ -30,7 +30,7 @@ app.use(
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 const reportsRoutes = require("./reports/reports.routes");
 app.use("/reports", reportsRoutes);
@@ -2925,7 +2925,7 @@ app.post("/admin/products/import", async (req, res) => {
         if (p.barcode) {
           const existing = await client.query(
             "SELECT id FROM products WHERE barcode = $1",
-            [String(p.barcode)]
+            [String(p.barcode)],
           );
           if (existing.rows.length > 0) {
             errors.push({ row: i + 1, error: `باركود مكرر: ${p.barcode}` });
@@ -2950,16 +2950,16 @@ app.post("/admin/products/import", async (req, res) => {
             Number(p.retail_price) || 0,
             p.barcode || null,
             Number(p.discount_amount) || 0,
-          ]
+          ],
         );
 
         // لو مفيش باركود → ولّد تلقائي
         const product = insertRes.rows[0];
         if (!product.barcode) {
-          await client.query(
-            "UPDATE products SET barcode = $1 WHERE id = $2",
-            [`900000${product.id}`, product.id]
-          );
+          await client.query("UPDATE products SET barcode = $1 WHERE id = $2", [
+            `900000${product.id}`,
+            product.id,
+          ]);
         }
 
         imported++;
