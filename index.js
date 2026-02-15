@@ -101,6 +101,16 @@ pool
     console.error("❌ products.description column error:", e.message),
   );
 
+// إضافة عمود الاسم بالكامل للمستخدمين
+pool
+  .query(
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT DEFAULT ''`,
+  )
+  .then(() => console.log("✅ users.full_name column ready"))
+  .catch((e) =>
+    console.error("❌ users.full_name column error:", e.message),
+  );
+
 // 📦 migrations لـ variant_id (متسلسلة عشان الـ constraint يشتغل بعد الأعمدة)
 (async () => {
   try {
@@ -5183,7 +5193,7 @@ const bcrypt = require("bcrypt");
 
 app.post("/users", authMiddleware, async (req, res) => {
   try {
-    const { username, password, branch_id } = req.body;
+    const { username, password, branch_id, full_name } = req.body;
 
     if (!username || !password || !branch_id) {
       return res.status(400).json({ error: "بيانات ناقصة" });
@@ -5197,8 +5207,8 @@ app.post("/users", authMiddleware, async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
 
     await pool.query(
-      "INSERT INTO users (username, password, branch_id) VALUES ($1,$2,$3)",
-      [username, hashedPassword, branchIdNum],
+      "INSERT INTO users (username, password, branch_id, full_name) VALUES ($1,$2,$3,$4)",
+      [username, hashedPassword, branchIdNum, full_name || ""],
     );
 
     res.json({ success: true });
@@ -5237,7 +5247,7 @@ app.put("/users/theme", authMiddleware, async (req, res) => {
 app.get("/users", authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, username, branch_id FROM users ORDER BY id DESC",
+      "SELECT id, username, branch_id, full_name FROM users ORDER BY id DESC",
     );
     res.json(result.rows);
   } catch (err) {
@@ -5389,6 +5399,31 @@ app.put("/users/:id/username", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("UPDATE USERNAME ERROR:", err);
     res.status(500).json({ error: "فشل تحديث اسم المستخدم" });
+  }
+});
+
+/* =========================
+   ✏️ UPDATE FULL NAME
+========================= */
+app.put("/users/:id/full-name", authMiddleware, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const { full_name } = req.body;
+
+    // يحق للمستخدم فقط تغيير اسمه الكامل
+    if (userId !== req.user.id) {
+      return res.status(403).json({ error: "غير مصرح" });
+    }
+
+    await pool.query("UPDATE users SET full_name = $1 WHERE id = $2", [
+      (full_name || "").trim(),
+      userId,
+    ]);
+
+    res.json({ success: true, full_name: (full_name || "").trim() });
+  } catch (err) {
+    console.error("UPDATE FULL NAME ERROR:", err);
+    res.status(500).json({ error: "فشل تحديث الاسم" });
   }
 });
 
@@ -5552,6 +5587,7 @@ app.post("/login", async (req, res) => {
         username: user.username,
         branch_id: user.branch_id,
         theme: user.theme,
+        full_name: user.full_name || "",
       },
     });
 
