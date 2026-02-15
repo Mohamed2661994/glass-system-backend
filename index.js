@@ -1663,7 +1663,11 @@ app.put("/invoices/:id", async (req, res) => {
     );
 
     for (const m of movementsRes.rows) {
-      if (m.movement_type === "purchase" || m.movement_type === "transfer_in" || m.movement_type === "return_sale") {
+      if (
+        m.movement_type === "purchase" ||
+        m.movement_type === "transfer_in" ||
+        m.movement_type === "return_sale"
+      ) {
         // كان فيه زيادة → نعكسها بخصم
         await client.query(
           `
@@ -1675,7 +1679,11 @@ app.put("/invoices/:id", async (req, res) => {
         );
       }
 
-      if (m.movement_type === "sale" || m.movement_type === "transfer_out" || m.movement_type === "return_purchase") {
+      if (
+        m.movement_type === "sale" ||
+        m.movement_type === "transfer_out" ||
+        m.movement_type === "return_purchase"
+      ) {
         // كان فيه خصم → نعكسه بإضافة
         await client.query(
           `
@@ -2564,7 +2572,10 @@ app.delete("/invoices/:id", async (req, res) => {
         `,
           [m.quantity, m.warehouse_id, m.product_id, m.variant_id],
         );
-      } else if (m.movement_type === "sale" || m.movement_type === "return_purchase") {
+      } else if (
+        m.movement_type === "sale" ||
+        m.movement_type === "return_purchase"
+      ) {
         // كان فيه خصم → نعكسه بإضافة
         await client.query(
           `
@@ -3048,10 +3059,11 @@ app.post("/admin/products/import", async (req, res) => {
         }
 
         // التحقق من الباركود المكرر
-        if (p.barcode) {
+        const barcodeVal = p.barcode != null && String(p.barcode).trim() !== "" ? String(p.barcode).trim() : null;
+        if (barcodeVal) {
           const existing = await client.query(
             "SELECT id FROM products WHERE barcode = $1",
-            [String(p.barcode)],
+            [barcodeVal],
           );
           if (existing.rows.length > 0) {
             errors.push({ row: i + 1, error: `باركود مكرر: ${p.barcode}` });
@@ -3074,7 +3086,7 @@ app.post("/admin/products/import", async (req, res) => {
             Number(p.retail_purchase_price) || 0,
             Number(p.wholesale_price) || 0,
             Number(p.retail_price) || 0,
-            p.barcode || null,
+            barcodeVal,
             Number(p.discount_amount) || 0,
           ],
         );
