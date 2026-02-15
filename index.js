@@ -30,7 +30,7 @@ app.use(
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: "50mb" }));
 
 const reportsRoutes = require("./reports/reports.routes");
 app.use("/reports", reportsRoutes);
@@ -5301,6 +5301,42 @@ app.put("/users/:id/password", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("CHANGE PASSWORD ERROR:", err);
     res.status(500).json({ error: "فشل تغيير كلمة المرور" });
+  }
+});
+
+/* ========================= reset another user password ========================= */
+app.put("/users/:id/reset-password", authMiddleware, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const { new_password } = req.body;
+
+    if (!new_password) {
+      return res.status(400).json({ error: "أدخل كلمة المرور الجديدة" });
+    }
+
+    if (new_password.length < 4) {
+      return res
+        .status(400)
+        .json({ error: "كلمة المرور يجب أن تكون 4 أحرف على الأقل" });
+    }
+
+    const userResult = await pool.query("SELECT id FROM users WHERE id = $1", [
+      userId,
+    ]);
+    if (!userResult.rows.length) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    const hashedPassword = await bcrypt.hash(new_password, 10);
+    await pool.query("UPDATE users SET password = $1 WHERE id = $2", [
+      hashedPassword,
+      userId,
+    ]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("RESET PASSWORD ERROR:", err);
+    res.status(500).json({ error: "فشل إعادة تعيين كلمة المرور" });
   }
 });
 
