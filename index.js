@@ -103,13 +103,9 @@ pool
 
 // إضافة عمود الاسم بالكامل للمستخدمين
 pool
-  .query(
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT DEFAULT ''`,
-  )
+  .query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name TEXT DEFAULT ''`)
   .then(() => console.log("✅ users.full_name column ready"))
-  .catch((e) =>
-    console.error("❌ users.full_name column error:", e.message),
-  );
+  .catch((e) => console.error("❌ users.full_name column error:", e.message));
 
 // 📦 migrations لـ variant_id (متسلسلة عشان الـ constraint يشتغل بعد الأعمدة)
 (async () => {
@@ -2519,6 +2515,7 @@ app.get("/admin/products", async (req, res) => {
   p.retail_price,
   p.barcode,
   p.discount_amount,
+  p.description,
   p.is_active,
   COALESCE(v.variant_count, 0) AS variant_count
 FROM products p
