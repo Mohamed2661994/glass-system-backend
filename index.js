@@ -276,6 +276,7 @@ app.get("/products", async (req, res) => {
       p.wholesale_package,
       p.retail_package,
       p.manufacturer,
+      p.description,
       CASE
         WHEN $1 = 'wholesale' THEN p.wholesale_price
         ELSE p.retail_price
@@ -288,7 +289,7 @@ app.get("/products", async (req, res) => {
       AND s.warehouse_id = $2
     WHERE p.is_active = true
     GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.wholesale_price, p.retail_price, p.discount_amount
+             p.manufacturer, p.description, p.wholesale_price, p.retail_price, p.discount_amount
     HAVING SUM(s.quantity) > 0
     ORDER BY p.name
     `,
@@ -304,6 +305,7 @@ app.get("/products", async (req, res) => {
       p.wholesale_package,
       p.retail_package,
       p.manufacturer,
+      p.description,
       CASE
         WHEN $1 = 'wholesale' THEN p.purchase_price
         ELSE p.retail_purchase_price
@@ -316,7 +318,7 @@ app.get("/products", async (req, res) => {
       AND s.warehouse_id = $2
     WHERE p.is_active = true
     GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.purchase_price, p.retail_purchase_price, p.discount_amount
+             p.manufacturer, p.description, p.purchase_price, p.retail_purchase_price, p.discount_amount
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
