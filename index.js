@@ -821,11 +821,8 @@ VALUES
     }
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع - فقط لفرع الجملة
-    if (
-      movement_type === "sale" &&
-      !is_return &&
-      Number(branch_id) === 2
-    ) {
+    let journal_posted = false;
+    if (movement_type === "sale" && !is_return && paid_amount > 0 && Number(branch_id) === 2) {
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
@@ -841,6 +838,7 @@ VALUES
           invoice_date || new Date(),
         ],
       );
+      journal_posted = true;
     }
 
     await client.query("COMMIT");
@@ -851,6 +849,7 @@ VALUES
       total,
       paid_amount,
       remaining_amount,
+      journal_posted,
     });
   } catch (err) {
     console.error("INVOICE SAVE ERROR:", err); // 👈 مهم
@@ -1083,7 +1082,8 @@ app.post("/invoices/retail", async (req, res) => {
     }
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع القطاعي
-    if (movement_type === "sale") {
+    let journal_posted = false;
+    if (movement_type === "sale" && Number(paid_amount) > 0) {
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
@@ -1099,6 +1099,7 @@ app.post("/invoices/retail", async (req, res) => {
           invoice_date || new Date(),
         ],
       );
+      journal_posted = true;
     }
 
     await client.query("COMMIT");
@@ -1108,6 +1109,7 @@ app.post("/invoices/retail", async (req, res) => {
       invoice_id: invoiceId,
       total: final_total,
       remaining_amount,
+      journal_posted,
     });
   } catch (err) {
     await client.query("ROLLBACK");
