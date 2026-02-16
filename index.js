@@ -5392,6 +5392,8 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
     "stock_movements",
     "stock_transfer_items",
     "stock_transfers",
+    "product_variants",
+    "products",
   ];
 
   // ✅ فلترة الجداول القادمة من الفرونت
@@ -5439,6 +5441,15 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
     if (safeTables.includes("stock")) {
       // نصفر الكميات بدل ما نحذف السجلات
       await client.query("UPDATE stock SET quantity = 0");
+    }
+
+    // 🧹 الأصناف (الأكواد الفرعية أولاً ثم الأصناف)
+    if (safeTables.includes("product_variants")) {
+      await client.query("DELETE FROM product_variants");
+    }
+
+    if (safeTables.includes("products")) {
+      await client.query("DELETE FROM products");
     }
 
     await client.query("COMMIT");
