@@ -405,14 +405,15 @@ app.get("/customers/search", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT c.id, c.name, c.apply_items_discount,
+      SELECT DISTINCT c.id, c.name, c.apply_items_discount,
              (SELECT phone FROM customer_phones 
               WHERE customer_id = c.id 
               ORDER BY id ASC LIMIT 1) AS phone
       FROM customers c
-      WHERE c.name ILIKE $1
+      LEFT JOIN customer_phones cp ON cp.customer_id = c.id
+      WHERE c.name ILIKE $1 OR cp.phone ILIKE $1
       ORDER BY c.name
-      LIMIT 5
+      LIMIT 10
       `,
       [`%${name}%`],
     );
@@ -3059,7 +3060,10 @@ app.post("/admin/products/import", async (req, res) => {
         }
 
         // التحقق من الباركود المكرر
-        const barcodeVal = p.barcode != null && String(p.barcode).trim() !== "" ? String(p.barcode).trim() : null;
+        const barcodeVal =
+          p.barcode != null && String(p.barcode).trim() !== ""
+            ? String(p.barcode).trim()
+            : null;
         if (barcodeVal) {
           const existing = await client.query(
             "SELECT id FROM products WHERE barcode = $1",
