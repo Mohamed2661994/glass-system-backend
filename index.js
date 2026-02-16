@@ -2656,6 +2656,127 @@ ORDER BY p.name`,
 
 console.log("TRANSFER ROUTE LOADED");
 
+// ==================== رصيد أول المدة ====================
+app.post("/admin/opening-stock", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { items, branch_id = 1, invoice_date } = req.body;
+
+    if (!items || !items.length) {
+      return res.status(400).json({ error: "لا توجد أصناف" });
+    }
+
+    await client.query("BEGIN");
+
+    // 1. جلب كل الأصناف من قاعدة البيانات بالباركود
+    const allProducts = await client.query(
+      `SELECT id, name, barcode, retail_package, wholesale_package, retail_purchase_price FROM products WHERE is_active = true`
+    );
+    const barcodeMap = new Map();
+    allProducts.rows.forEach(p => {
+      if (p.barcode) barcodeMap.set(p.barcode.trim(), p);
+    });
+
+    // 2. مطابقة الأصناف
+    const matchedItems = [];
+    const unmatchedItems = [];
+
+    for (const item of items) {
+      const code = String(item.product_code).trim();
+      const product = barcodeMap.get(code);
+      if (product) {
+        matchedItems.push({
+          product_id: product.id,
+          product_name: product.name,
+          package: item.unit || product.retail_package || "",
+          price: Number(item.price) || 0,
+          quantity: Number(item.quantity) || 0,
+          barcode: code,
+        });
+      } else {
+        unmatchedItems.push({ product_code: code, product_name: item.product_name });
+      }
+    }
+
+    if (matchedItems.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "لم يتم مطابقة أي صنف", unmatched: unmatchedItems });
+    }
+
+    // 3. حساب الإجمالي
+    let subtotal = 0;
+    for (const item of matchedItems) {
+      subtotal += item.price * item.quantity;
+    }
+
+    // 4. إنشاء فاتورة شراء
+    const invoiceRes = await client.query(
+      `INSERT INTO invoices (
+        branch_id, invoice_type, movement_type, invoice_date,
+        customer_name, subtotal, manual_discount, discount_total,
+        total, paid_amount, remaining_amount, payment_status,
+        apply_items_discount, is_return
+      ) VALUES ($1, 'retail', 'purchase', $2,
+        'رصيد أول المدة', $3, 0, 0,
+        $3, $3, 0, 'paid',
+        false, false)
+      RETURNING id`,
+      [branch_id, invoice_date || new Date(), subtotal]
+    );
+
+    const invoiceId = invoiceRes.rows[0].id;
+    const warehouseId = 1; // مخزن المعرض (retail)
+
+    // 5. إضافة الأصناف + تحديث المخزون
+    for (const item of matchedItems) {
+      const itemTotal = item.price * item.quantity;
+
+      // إضافة للفاتورة
+      await client.query(
+        `INSERT INTO invoice_items
+         (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
+         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 0, false)`,
+        [invoiceId, item.product_id, item.product_name, item.package, item.price, item.quantity, itemTotal]
+      );
+
+      // تحديث المخزون (شراء = زيادة)
+      await client.query(
+        `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+         VALUES ($1, $2, 0, $3)
+         ON CONFLICT (warehouse_id, product_id, variant_id)
+         DO UPDATE SET quantity = stock.quantity + $3`,
+        [warehouseId, item.product_id, item.quantity]
+      );
+
+      // تسجيل حركة المخزون
+      await client.query(
+        `INSERT INTO stock_movements
+         (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+         VALUES ($1, $2, $3, 0, $4, 'purchase')`,
+        [invoiceId, warehouseId, item.product_id, item.quantity]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      invoice_id: invoiceId,
+      matched: matchedItems.length,
+      unmatched: unmatchedItems.length,
+      unmatched_items: unmatchedItems,
+      total: subtotal,
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Opening stock error:", err);
+    res.status(500).json({ error: "فشل إنشاء رصيد أول المدة: " + err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // مسح جميع الأصناف
 app.delete("/admin/products/all", async (req, res) => {
   try {
