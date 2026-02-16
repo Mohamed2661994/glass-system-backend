@@ -191,8 +191,8 @@ pool
         FOR r IN
           SELECT warehouse_id, product_id, variant_id, SUM(
             CASE
-              WHEN movement_type IN ('purchase','transfer_in','replace_in') THEN quantity
-              WHEN movement_type IN ('sale','transfer_out','replace_out') THEN -quantity
+              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase') THEN -quantity
               ELSE 0
             END
           ) AS calc_qty
@@ -201,8 +201,8 @@ pool
           GROUP BY warehouse_id, product_id, variant_id
           HAVING SUM(
             CASE
-              WHEN movement_type IN ('purchase','transfer_in','replace_in') THEN quantity
-              WHEN movement_type IN ('sale','transfer_out','replace_out') THEN -quantity
+              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase') THEN -quantity
               ELSE 0
             END
           ) > 0
@@ -217,8 +217,8 @@ pool
         FOR r IN
           SELECT warehouse_id, product_id, SUM(
             CASE
-              WHEN movement_type IN ('purchase','transfer_in','replace_in') THEN quantity
-              WHEN movement_type IN ('sale','transfer_out','replace_out') THEN -quantity
+              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase') THEN -quantity
               ELSE 0
             END
           ) AS calc_qty
