@@ -2670,10 +2670,10 @@ app.post("/admin/opening-stock", async (req, res) => {
 
     // 1. جلب كل الأصناف من قاعدة البيانات بالباركود
     const allProducts = await client.query(
-      `SELECT id, name, barcode, retail_package, wholesale_package, retail_purchase_price FROM products WHERE is_active = true`
+      `SELECT id, name, barcode, retail_package, wholesale_package, retail_purchase_price FROM products WHERE is_active = true`,
     );
     const barcodeMap = new Map();
-    allProducts.rows.forEach(p => {
+    allProducts.rows.forEach((p) => {
       if (p.barcode) barcodeMap.set(p.barcode.trim(), p);
     });
 
@@ -2694,13 +2694,18 @@ app.post("/admin/opening-stock", async (req, res) => {
           barcode: code,
         });
       } else {
-        unmatchedItems.push({ product_code: code, product_name: item.product_name });
+        unmatchedItems.push({
+          product_code: code,
+          product_name: item.product_name,
+        });
       }
     }
 
     if (matchedItems.length === 0) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ error: "لم يتم مطابقة أي صنف", unmatched: unmatchedItems });
+      return res
+        .status(400)
+        .json({ error: "لم يتم مطابقة أي صنف", unmatched: unmatchedItems });
     }
 
     // 3. حساب الإجمالي
@@ -2721,7 +2726,7 @@ app.post("/admin/opening-stock", async (req, res) => {
         $3, $3, 0, 'paid',
         false, false)
       RETURNING id`,
-      [branch_id, invoice_date || new Date(), subtotal]
+      [branch_id, invoice_date || new Date(), subtotal],
     );
 
     const invoiceId = invoiceRes.rows[0].id;
@@ -2736,7 +2741,15 @@ app.post("/admin/opening-stock", async (req, res) => {
         `INSERT INTO invoice_items
          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
          VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 0, false)`,
-        [invoiceId, item.product_id, item.product_name, item.package, item.price, item.quantity, itemTotal]
+        [
+          invoiceId,
+          item.product_id,
+          item.product_name,
+          item.package,
+          item.price,
+          item.quantity,
+          itemTotal,
+        ],
       );
 
       // تحديث المخزون (شراء = زيادة)
@@ -2745,7 +2758,7 @@ app.post("/admin/opening-stock", async (req, res) => {
          VALUES ($1, $2, 0, $3)
          ON CONFLICT (warehouse_id, product_id, variant_id)
          DO UPDATE SET quantity = stock.quantity + $3`,
-        [warehouseId, item.product_id, item.quantity]
+        [warehouseId, item.product_id, item.quantity],
       );
 
       // تسجيل حركة المخزون
@@ -2753,7 +2766,7 @@ app.post("/admin/opening-stock", async (req, res) => {
         `INSERT INTO stock_movements
          (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
          VALUES ($1, $2, $3, 0, $4, 'purchase')`,
-        [invoiceId, warehouseId, item.product_id, item.quantity]
+        [invoiceId, warehouseId, item.product_id, item.quantity],
       );
     }
 
@@ -2767,7 +2780,6 @@ app.post("/admin/opening-stock", async (req, res) => {
       unmatched_items: unmatchedItems,
       total: subtotal,
     });
-
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("Opening stock error:", err);

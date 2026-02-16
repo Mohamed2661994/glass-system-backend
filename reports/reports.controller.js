@@ -263,7 +263,7 @@ exports.getInventoryValue = async (req, res) => {
         COUNT(DISTINCT s.product_id) AS total_products,   -- 🆕 عدد الأصناف
         SUM(s.quantity) AS total_quantity,                -- 🆕 إجمالي الكمية
 
-        SUM(s.quantity * p.purchase_price) AS total_value -- 💰 قيمة المخزون
+        SUM(s.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value -- 💰 قيمة المخزون
 
       FROM stock s
       JOIN products p ON p.id = s.product_id
@@ -313,9 +313,10 @@ exports.getInventoryDetails = async (req, res) => {
         s.quantity,
         s.variant_id,
         p.purchase_price,
+        p.retail_purchase_price,
         p.wholesale_package,
         p.retail_package,
-        (s.quantity * p.purchase_price) AS total_value,
+        (s.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value,
         w.id AS warehouse_id,
         w.name AS warehouse_name
       FROM stock s
@@ -339,7 +340,7 @@ exports.getInventoryDetails = async (req, res) => {
     const rows = result.rows.map((row) => {
       const vid = Number(row.variant_id) || 0;
       let pkgLabel;
-      let purchasePrice = row.purchase_price;
+      let purchasePrice = row.warehouse_id === 1 ? row.retail_purchase_price : row.purchase_price;
       if (vid === 0) {
         pkgLabel =
           [row.wholesale_package, row.retail_package]
@@ -352,7 +353,7 @@ exports.getInventoryDetails = async (req, res) => {
             [v.wholesale_package, v.retail_package]
               .filter(Boolean)
               .join(" / ") || "-";
-          purchasePrice = v.purchase_price;
+          purchasePrice = row.warehouse_id === 1 ? v.retail_purchase_price : v.purchase_price;
         } else {
           pkgLabel = "-";
         }
