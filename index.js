@@ -824,7 +824,6 @@ VALUES
     if (
       movement_type === "sale" &&
       !is_return &&
-      paid_amount > 0 &&
       Number(branch_id) === 2
     ) {
       await client.query(
@@ -1084,7 +1083,7 @@ app.post("/invoices/retail", async (req, res) => {
     }
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع القطاعي
-    if (movement_type === "sale" && Number(paid_amount) > 0) {
+    if (movement_type === "sale") {
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
