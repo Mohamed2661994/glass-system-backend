@@ -822,7 +822,12 @@ VALUES
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع - فقط لفرع الجملة
     let journal_posted = false;
-    if (movement_type === "sale" && !is_return && paid_amount > 0 && Number(branch_id) === 2) {
+    if (
+      movement_type === "sale" &&
+      !is_return &&
+      paid_amount > 0 &&
+      Number(branch_id) === 2
+    ) {
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
@@ -2650,6 +2655,18 @@ ORDER BY p.name`,
 });
 
 console.log("TRANSFER ROUTE LOADED");
+
+// مسح جميع الأصناف
+app.delete("/admin/products/all", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM product_variants");
+    await pool.query("DELETE FROM products");
+    res.json({ message: "تم مسح جميع الأصناف بنجاح" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "فشل مسح الأصناف" });
+  }
+});
 
 // إضافة صنف جديد
 app.post("/admin/products", async (req, res) => {
