@@ -340,7 +340,8 @@ exports.getInventoryDetails = async (req, res) => {
     const rows = result.rows.map((row) => {
       const vid = Number(row.variant_id) || 0;
       let pkgLabel;
-      let purchasePrice = row.warehouse_id === 1 ? row.retail_purchase_price : row.purchase_price;
+      let purchasePrice =
+        row.warehouse_id === 1 ? row.retail_purchase_price : row.purchase_price;
       if (vid === 0) {
         pkgLabel =
           [row.wholesale_package, row.retail_package]
@@ -353,7 +354,8 @@ exports.getInventoryDetails = async (req, res) => {
             [v.wholesale_package, v.retail_package]
               .filter(Boolean)
               .join(" / ") || "-";
-          purchasePrice = row.warehouse_id === 1 ? v.retail_purchase_price : v.purchase_price;
+          purchasePrice =
+            row.warehouse_id === 1 ? v.retail_purchase_price : v.purchase_price;
         } else {
           pkgLabel = "-";
         }

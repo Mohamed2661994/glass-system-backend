@@ -287,12 +287,13 @@ app.get("/products", async (req, res) => {
     let productsResult;
 
     if (movement_type === "sale") {
-      // 🔹 بيع → لازم رصيد (نجمع كل الـ variants في سطر واحد)
+      // 🔹 بيع → كل الأصناف (اللي رصيدها 0 هتكون disabled في الفرونت)
       productsResult = await pool.query(
         `
      SELECT
       p.id,
       p.name,
+      p.barcode,
       p.wholesale_package,
       p.retail_package,
       p.manufacturer,
@@ -304,13 +305,12 @@ app.get("/products", async (req, res) => {
       p.discount_amount,
       COALESCE(SUM(s.quantity), 0) AS available_quantity
     FROM products p
-    JOIN stock s
+    LEFT JOIN stock s
       ON s.product_id = p.id
       AND s.warehouse_id = $2
     WHERE p.is_active = true
-    GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
+    GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
              p.manufacturer, p.description, p.wholesale_price, p.retail_price, p.discount_amount
-    HAVING SUM(s.quantity) > 0
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
@@ -322,6 +322,7 @@ app.get("/products", async (req, res) => {
    SELECT
       p.id,
       p.name,
+      p.barcode,
       p.wholesale_package,
       p.retail_package,
       p.manufacturer,
@@ -337,7 +338,7 @@ app.get("/products", async (req, res) => {
       ON s.product_id = p.id
       AND s.warehouse_id = $2
     WHERE p.is_active = true
-    GROUP BY p.id, p.name, p.wholesale_package, p.retail_package,
+    GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
              p.manufacturer, p.description, p.purchase_price, p.retail_purchase_price, p.discount_amount
     ORDER BY p.name
     `,
