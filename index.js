@@ -718,13 +718,14 @@ VALUES
       let paramIdx = 1;
 
       for (const item of items) {
-        const itemTotal = item.price * item.quantity - (item.discount || 0) * item.quantity;
+        const itemTotal =
+          item.price * item.quantity - (item.discount || 0) * item.quantity;
         const packageText = item.package || "";
         const variantId = item.variant_id || 0;
         const itemIsReturn = item.is_return || false;
 
         itemValues.push(
-          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`,
         );
         itemParams.push(
           invoiceId,
@@ -736,7 +737,7 @@ VALUES
           item.discount || 0,
           itemTotal,
           variantId,
-          itemIsReturn
+          itemIsReturn,
         );
       }
 
@@ -744,7 +745,7 @@ VALUES
         `INSERT INTO invoice_items
           (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
          VALUES ${itemValues.join(",")}`,
-        itemParams
+        itemParams,
       );
     }
 
@@ -1052,12 +1053,13 @@ app.post("/invoices/retail", async (req, res) => {
       let paramIdx = 1;
 
       for (const item of items) {
-        const itemTotal = item.price * item.quantity - (item.discount || 0) * item.quantity;
+        const itemTotal =
+          item.price * item.quantity - (item.discount || 0) * item.quantity;
         const variantId = item.variant_id || 0;
         const itemIsReturn = item.is_return || false;
 
         itemValues.push(
-          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`,
         );
         itemParams.push(
           invoiceId,
@@ -1069,7 +1071,7 @@ app.post("/invoices/retail", async (req, res) => {
           item.discount || 0,
           itemTotal,
           variantId,
-          itemIsReturn
+          itemIsReturn,
         );
       }
 
@@ -1077,7 +1079,7 @@ app.post("/invoices/retail", async (req, res) => {
         `INSERT INTO invoice_items
           (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
          VALUES ${itemValues.join(",")}`,
-        itemParams
+        itemParams,
       );
     }
 
@@ -2633,7 +2635,8 @@ app.get("/invoices", async (req, res) => {
 app.get("/dashboard/stats", async (req, res) => {
   try {
     const { invoice_type } = req.query;
-    if (!invoice_type) return res.status(400).json({ error: "invoice_type مطلوب" });
+    if (!invoice_type)
+      return res.status(400).json({ error: "invoice_type مطلوب" });
 
     const warehouseId = invoice_type === "retail" ? 1 : 2;
 
@@ -2648,7 +2651,7 @@ app.get("/dashboard/stats", async (req, res) => {
            AND is_return = false
            AND created_at >= CURRENT_DATE
            AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-        [invoice_type]
+        [invoice_type],
       ),
       // Today's cash collected
       pool.query(
@@ -2657,14 +2660,14 @@ app.get("/dashboard/stats", async (req, res) => {
          WHERE invoice_type = $1
            AND created_at >= CURRENT_DATE
            AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-        [invoice_type]
+        [invoice_type],
       ),
       // Low stock count (quantity <= 5)
       pool.query(
         `SELECT COUNT(DISTINCT product_id) AS count
          FROM stock
          WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
-        [warehouseId]
+        [warehouseId],
       ),
     ]);
 
@@ -2770,7 +2773,9 @@ app.get("/admin/products", async (req, res) => {
     let idx = 1;
 
     if (search) {
-      conditions.push(`(p.name ILIKE $${idx} OR p.barcode ILIKE $${idx} OR p.description ILIKE $${idx})`);
+      conditions.push(
+        `(p.name ILIKE $${idx} OR p.barcode ILIKE $${idx} OR p.description ILIKE $${idx})`,
+      );
       values.push(`%${search}%`);
       idx++;
     }
@@ -2780,8 +2785,10 @@ app.get("/admin/products", async (req, res) => {
       values.push(manufacturer);
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-    const limitClause = Number(limit) > 0 ? `LIMIT $${idx++} OFFSET $${idx++}` : "";
+    const whereClause =
+      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const limitClause =
+      Number(limit) > 0 ? `LIMIT $${idx++} OFFSET $${idx++}` : "";
     if (Number(limit) > 0) {
       values.push(Number(limit), Number(offset));
     }
@@ -3652,6 +3659,105 @@ app.delete("/admin/products/variants/:variantId", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// ==================== Manufacturers CRUD ====================
+
+// جلب كل المصانع
+app.get("/admin/manufacturers", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM manufacturers ORDER BY name ASC",
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// إضافة مصنع جديد
+app.post("/admin/manufacturers", async (req, res) => {
+  try {
+    const { name, percentage } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "اسم المصنع مطلوب" });
+    }
+    const result = await pool.query(
+      "INSERT INTO manufacturers (name, percentage) VALUES ($1, $2) RETURNING *",
+      [name.trim(), percentage || 0],
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(400).json({ error: "المصنع موجود بالفعل" });
+    }
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// تعديل مصنع
+app.put("/admin/manufacturers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, percentage } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "اسم المصنع مطلوب" });
+    }
+    const result = await pool.query(
+      "UPDATE manufacturers SET name = $1, percentage = $2 WHERE id = $3 RETURNING *",
+      [name.trim(), percentage || 0, id],
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "المصنع غير موجود" });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(400).json({ error: "المصنع موجود بالفعل" });
+    }
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// حذف مصنع
+app.delete("/admin/manufacturers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      "DELETE FROM manufacturers WHERE id = $1 RETURNING id",
+      [id],
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "المصنع غير موجود" });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// تعبئة المصانع من جدول الأصناف
+app.post("/admin/manufacturers/seed", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      INSERT INTO manufacturers (name)
+      SELECT DISTINCT manufacturer
+      FROM products
+      WHERE manufacturer IS NOT NULL AND manufacturer <> ''
+      ON CONFLICT (name) DO NOTHING
+      RETURNING *
+    `);
+    res.json({ added: result.rows.length, manufacturers: result.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ==================== End Manufacturers ====================
 
 app.post("/stock/transfer", async (req, res) => {
   const client = await pool.connect();
