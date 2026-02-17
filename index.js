@@ -253,6 +253,27 @@ pool
   }
 })();
 
+// 📊 Database indexes for performance
+(async () => {
+  try {
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_invoices_type_date ON invoices (invoice_type, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices (customer_name);
+      CREATE INDEX IF NOT EXISTS idx_invoices_movement ON invoices (movement_type);
+      CREATE INDEX IF NOT EXISTS idx_invoices_payment ON invoices (payment_status);
+      CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items (invoice_id);
+      CREATE INDEX IF NOT EXISTS idx_invoice_items_product ON invoice_items (product_id);
+      CREATE INDEX IF NOT EXISTS idx_stock_warehouse_product ON stock (warehouse_id, product_id);
+      CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements (product_id);
+      CREATE INDEX IF NOT EXISTS idx_stock_movements_warehouse ON stock_movements (warehouse_id);
+      CREATE INDEX IF NOT EXISTS idx_cash_in_invoice ON cash_in (invoice_id);
+    `);
+    console.log("✅ database indexes ready");
+  } catch (e) {
+    console.error("❌ database indexes error:", e.message);
+  }
+})();
+
 function getWarehouseIdByInvoiceType(invoice_type) {
   if (invoice_type === "retail") {
     return 1; // مخزن المعرض
@@ -690,33 +711,22 @@ VALUES
     /* ================== المخزن ================== */
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
 
-    for (const item of items) {
-      const itemTotal =
-        item.price * item.quantity - (item.discount || 0) * item.quantity;
-      const packageText = item.package || "";
+    // 🚀 Batch INSERT for invoice_items
+    if (items.length > 0) {
+      const itemValues = [];
+      const itemParams = [];
+      let paramIdx = 1;
 
-      const variantId = item.variant_id || 0;
-      const itemIsReturn = item.is_return || false;
+      for (const item of items) {
+        const itemTotal = item.price * item.quantity - (item.discount || 0) * item.quantity;
+        const packageText = item.package || "";
+        const variantId = item.variant_id || 0;
+        const itemIsReturn = item.is_return || false;
 
-      // إضافة item للفاتورة
-      await client.query(
-        `
-        INSERT INTO invoice_items
-        (
-          invoice_id,
-          product_id,
-          product_name,
-          package, 
-          price,
-          quantity,
-          discount,
-          total,
-          variant_id,
-          is_return
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        `,
-        [
+        itemValues.push(
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`
+        );
+        itemParams.push(
           invoiceId,
           item.product_id,
           item.product_name,
@@ -726,9 +736,22 @@ VALUES
           item.discount || 0,
           itemTotal,
           variantId,
-          itemIsReturn,
-        ],
+          itemIsReturn
+        );
+      }
+
+      await client.query(
+        `INSERT INTO invoice_items
+          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
+         VALUES ${itemValues.join(",")}`,
+        itemParams
       );
+    }
+
+    // Stock updates per item (need conditional logic)
+    for (const item of items) {
+      const variantId = item.variant_id || 0;
+      const itemIsReturn = item.is_return || false;
 
       /* ===== تحديث المخزن ===== */
       if (movement_type === "purchase") {
@@ -1022,30 +1045,21 @@ app.post("/invoices/retail", async (req, res) => {
     const warehouseId = getWarehouseIdByInvoiceType("retail");
 
     /* ================== الأصناف + المخزن ================== */
-    for (const item of items) {
-      const itemTotal =
-        item.price * item.quantity - (item.discount || 0) * item.quantity;
-      const variantId = item.variant_id || 0;
-      const itemIsReturn = item.is_return || false;
+    // 🚀 Batch INSERT for invoice_items
+    if (items.length > 0) {
+      const itemValues = [];
+      const itemParams = [];
+      let paramIdx = 1;
 
-      await client.query(
-        `
-        INSERT INTO invoice_items
-        (
-          invoice_id,
-          product_id,
-          product_name,
-          package,
-          price,
-          quantity,
-          discount,
-          total,
-          variant_id,
-          is_return
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        `,
-        [
+      for (const item of items) {
+        const itemTotal = item.price * item.quantity - (item.discount || 0) * item.quantity;
+        const variantId = item.variant_id || 0;
+        const itemIsReturn = item.is_return || false;
+
+        itemValues.push(
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`
+        );
+        itemParams.push(
           invoiceId,
           item.product_id,
           item.product_name,
@@ -1055,9 +1069,22 @@ app.post("/invoices/retail", async (req, res) => {
           item.discount || 0,
           itemTotal,
           variantId,
-          itemIsReturn,
-        ],
+          itemIsReturn
+        );
+      }
+
+      await client.query(
+        `INSERT INTO invoice_items
+          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
+         VALUES ${itemValues.join(",")}`,
+        itemParams
       );
+    }
+
+    // Stock updates per item
+    for (const item of items) {
+      const variantId = item.variant_id || 0;
+      const itemIsReturn = item.is_return || false;
 
       if (movement_type === "sale") {
         if (itemIsReturn) {
@@ -2515,6 +2542,9 @@ app.get("/invoices", async (req, res) => {
       movement_type,
       customer_name,
       is_return,
+      invoice_id,
+      date_from,
+      date_to,
       limit = 50,
       offset = 0,
     } = req.query;
@@ -2522,6 +2552,11 @@ app.get("/invoices", async (req, res) => {
     let conditions = [];
     let values = [];
     let idx = 1;
+
+    if (invoice_id) {
+      conditions.push(`id = $${idx++}`);
+      values.push(Number(invoice_id));
+    }
 
     if (branch_id) {
       conditions.push(`branch_id = $${idx++}`);
@@ -2546,6 +2581,16 @@ app.get("/invoices", async (req, res) => {
     if (customer_name) {
       conditions.push(`customer_name ILIKE  $${idx++}`);
       values.push(`%${customer_name}%`);
+    }
+
+    if (date_from) {
+      conditions.push(`created_at >= $${idx++}`);
+      values.push(date_from);
+    }
+
+    if (date_to) {
+      conditions.push(`created_at < ($${idx++}::date + INTERVAL '1 day')`);
+      values.push(date_to);
     }
 
     const whereClause =
@@ -2578,6 +2623,57 @@ app.get("/invoices", async (req, res) => {
     );
 
     res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ========== Dashboard Stats ==========
+app.get("/dashboard/stats", async (req, res) => {
+  try {
+    const { invoice_type } = req.query;
+    if (!invoice_type) return res.status(400).json({ error: "invoice_type مطلوب" });
+
+    const warehouseId = invoice_type === "retail" ? 1 : 2;
+
+    // Run queries in parallel
+    const [salesToday, cashToday, lowStockCount] = await Promise.all([
+      // Today's sales total
+      pool.query(
+        `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
+         FROM invoices
+         WHERE invoice_type = $1
+           AND movement_type = 'sale'
+           AND is_return = false
+           AND created_at >= CURRENT_DATE
+           AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
+        [invoice_type]
+      ),
+      // Today's cash collected
+      pool.query(
+        `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
+         FROM invoices
+         WHERE invoice_type = $1
+           AND created_at >= CURRENT_DATE
+           AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
+        [invoice_type]
+      ),
+      // Low stock count (quantity <= 5)
+      pool.query(
+        `SELECT COUNT(DISTINCT product_id) AS count
+         FROM stock
+         WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
+        [warehouseId]
+      ),
+    ]);
+
+    res.json({
+      today_sales: Number(salesToday.rows[0].total_sales),
+      today_invoices_count: Number(salesToday.rows[0].count),
+      today_cash: Number(cashToday.rows[0].total_cash),
+      low_stock_count: Number(lowStockCount.rows[0].count),
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Database error" });
@@ -2667,6 +2763,29 @@ app.delete("/invoices/:id", async (req, res) => {
 // جلب كل الأصناف (للإدارة)
 app.get("/admin/products", async (req, res) => {
   try {
+    const { search, manufacturer, limit = 0, offset = 0 } = req.query;
+
+    let conditions = [];
+    let values = [];
+    let idx = 1;
+
+    if (search) {
+      conditions.push(`(p.name ILIKE $${idx} OR p.barcode ILIKE $${idx} OR p.description ILIKE $${idx})`);
+      values.push(`%${search}%`);
+      idx++;
+    }
+
+    if (manufacturer && manufacturer !== "الكل") {
+      conditions.push(`p.manufacturer = $${idx++}`);
+      values.push(manufacturer);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const limitClause = Number(limit) > 0 ? `LIMIT $${idx++} OFFSET $${idx++}` : "";
+    if (Number(limit) > 0) {
+      values.push(Number(limit), Number(offset));
+    }
+
     const result = await pool.query(
       `SELECT 
   p.id,
@@ -2689,7 +2808,10 @@ LEFT JOIN (
   FROM product_variants
   GROUP BY product_id
 ) v ON v.product_id = p.id
-ORDER BY p.name`,
+${whereClause}
+ORDER BY p.name
+${limitClause}`,
+      values,
     );
     res.json(result.rows);
   } catch (err) {
