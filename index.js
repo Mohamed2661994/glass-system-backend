@@ -2690,13 +2690,13 @@ app.delete("/invoices/:id", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // 0️⃣ تحقق من اليومية
-    const cashCheck = await client.query(
-      `SELECT id FROM cash_in WHERE invoice_id = $1`,
+    // 0️⃣ مسح قيد اليومية المرتبط بالفاتورة (لو موجود)
+    const cashDeleted = await client.query(
+      `DELETE FROM cash_in WHERE invoice_id = $1 RETURNING id`,
       [invoiceId],
     );
-    if (cashCheck.rowCount > 0) {
-      throw new Error("لا يمكن مسح الفاتورة لأنها مرتبطة بقيد خزنة");
+    if (cashDeleted.rowCount > 0) {
+      console.log(`🗑️ تم مسح قيد يومية مرتبط بالفاتورة ${invoiceId} (cash_in id: ${cashDeleted.rows.map(r => r.id).join(', ')})`);
     }
 
     // 1️⃣ هات الحركات
@@ -2840,7 +2840,7 @@ app.post("/admin/opening-stock/validate", async (req, res) => {
     }
 
     const allProducts = await pool.query(
-      `SELECT id, name, barcode FROM products WHERE is_active = true`
+      `SELECT id, name, barcode FROM products WHERE is_active = true`,
     );
     const barcodeMap = new Map();
     allProducts.rows.forEach((p) => {
@@ -2855,7 +2855,11 @@ app.post("/admin/opening-stock/validate", async (req, res) => {
       if (!trimmed) continue;
       const product = barcodeMap.get(trimmed);
       if (product) {
-        matched.push({ code: trimmed, product_id: product.id, product_name: product.name });
+        matched.push({
+          code: trimmed,
+          product_id: product.id,
+          product_name: product.name,
+        });
       } else {
         unmatched.push(trimmed);
       }
