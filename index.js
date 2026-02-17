@@ -60,7 +60,21 @@ pool
   .then(() => console.log("✅ user_activity table ready"))
   .catch((e) => console.error("❌ user_activity table error:", e.message));
 
-// 📦 إنشاء جدول الأكواد الفرعية (عبوات بديلة) لو مش موجود
+// � أعمدة تتبع اليوزر في الفواتير
+pool
+  .query(
+    `
+  ALTER TABLE invoices
+    ADD COLUMN IF NOT EXISTS created_by INTEGER,
+    ADD COLUMN IF NOT EXISTS created_by_name VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS updated_by INTEGER,
+    ADD COLUMN IF NOT EXISTS updated_by_name VARCHAR(100)
+  `,
+  )
+  .then(() => console.log("✅ invoices audit columns ready"))
+  .catch((e) => console.error("❌ invoices audit columns error:", e.message));
+
+// �📦 إنشاء جدول الأكواد الفرعية (عبوات بديلة) لو مش موجود
 pool
   .query(
     `
@@ -525,6 +539,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       apply_items_discount = false,
       manual_discount = 0,
       is_return = false,
+      created_by_name,
     } = req.body;
     // ✅ نخليه جملة فقط
     if (invoice_type !== "wholesale") {
@@ -638,10 +653,12 @@ app.post("/invoices", authMiddleware, async (req, res) => {
   remaining_amount,
   payment_status,
   apply_items_discount,
-  is_return
+  is_return,
+  created_by,
+  created_by_name
 )
 VALUES
-($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       RETURNING id
       `,
       [
@@ -662,6 +679,8 @@ VALUES
         payment_status,
         apply_items_discount,
         is_return,
+        created_by || null,
+        created_by_name || null,
       ],
     );
 
@@ -890,6 +909,8 @@ app.post("/invoices/retail", async (req, res) => {
       is_return = false,
     } = req.body;
 
+    const { created_by, created_by_name } = req.body;
+
     if (
       !branch_id ||
       !movement_type ||
@@ -965,10 +986,12 @@ app.post("/invoices/retail", async (req, res) => {
         remaining_amount,
         payment_status,
         apply_items_discount,
-        is_return
+        is_return,
+        created_by,
+        created_by_name
       )
       VALUES
-      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       RETURNING id
       `,
       [
@@ -988,6 +1011,8 @@ app.post("/invoices/retail", async (req, res) => {
         payment_status,
         apply_items_discount,
         is_return,
+        created_by || null,
+        created_by_name || null,
       ],
     );
 
@@ -1209,6 +1234,8 @@ app.put("/invoices/retail/:id", async (req, res) => {
       apply_items_discount = false,
     } = req.body;
 
+    const { updated_by, updated_by_name } = req.body;
+
     if (!items || !items.length || final_total === undefined) {
       throw new Error("بيانات غير مكتملة");
     }
@@ -1335,8 +1362,10 @@ SET
   paid_amount = $8,
   remaining_amount = $9,
   payment_status = $10,
-  apply_items_discount = $11   -- ✅ جديد
-WHERE id = $12
+  apply_items_discount = $11,
+  updated_by = $12,
+  updated_by_name = $13
+WHERE id = $14
       `,
       [
         customer_name,
@@ -1349,7 +1378,9 @@ WHERE id = $12
         Number(paid_amount),
         remaining_amount,
         payment_status,
-        apply_items_discount, // ✅
+        apply_items_discount,
+        updated_by || null,
+        updated_by_name || null,
         invoiceId,
       ],
     );
@@ -1544,6 +1575,11 @@ app.get("/invoices/:id/edit", async (req, res) => {
       apply_items_discount: invoice.apply_items_discount,
       is_return: invoice.is_return || false,
 
+      created_by: invoice.created_by,
+      created_by_name: invoice.created_by_name,
+      updated_by: invoice.updated_by,
+      updated_by_name: invoice.updated_by_name,
+
       items: itemsRes.rows,
     });
   } catch (err) {
@@ -1652,6 +1688,8 @@ app.put("/invoices/:id", async (req, res) => {
       apply_items_discount = false,
       manual_discount = 0,
     } = req.body;
+
+    const { updated_by, updated_by_name } = req.body;
 
     if (!items || !items.length) {
       throw new Error("لا يوجد أصناف في الفاتورة");
@@ -1851,8 +1889,10 @@ SET
   paid_amount = $8,
   remaining_amount = $9,
   payment_status = $10,
-  apply_items_discount = $11   -- ✅
-WHERE id = $12
+  apply_items_discount = $11,
+  updated_by = $12,
+  updated_by_name = $13
+WHERE id = $14
   `,
       [
         customer_name,
@@ -1866,6 +1906,8 @@ WHERE id = $12
         remaining,
         payment_status,
         apply_items_discount,
+        updated_by || null,
+        updated_by_name || null,
         invoiceId,
       ],
     );
@@ -2525,7 +2567,8 @@ app.get("/invoices", async (req, res) => {
         paid_amount,
         remaining_amount,
         payment_status,
-        created_at
+        created_at,
+        created_by_name
       FROM invoices
       ${whereClause}
       ORDER BY created_at DESC
