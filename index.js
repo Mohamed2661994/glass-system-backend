@@ -2830,6 +2830,44 @@ ${limitClause}`,
 console.log("TRANSFER ROUTE LOADED");
 
 // ==================== رصيد أول المدة ====================
+
+// التحقق من أكواد الأصناف قبل الاستيراد
+app.post("/admin/opening-stock/validate", async (req, res) => {
+  try {
+    const { codes } = req.body;
+    if (!codes || !codes.length) {
+      return res.status(400).json({ error: "لا توجد أكواد" });
+    }
+
+    const allProducts = await pool.query(
+      `SELECT id, name, barcode FROM products WHERE is_active = true`
+    );
+    const barcodeMap = new Map();
+    allProducts.rows.forEach((p) => {
+      if (p.barcode) barcodeMap.set(p.barcode.trim(), p);
+    });
+
+    const matched = [];
+    const unmatched = [];
+
+    for (const code of codes) {
+      const trimmed = String(code).trim();
+      if (!trimmed) continue;
+      const product = barcodeMap.get(trimmed);
+      if (product) {
+        matched.push({ code: trimmed, product_id: product.id, product_name: product.name });
+      } else {
+        unmatched.push(trimmed);
+      }
+    }
+
+    res.json({ matched, unmatched, total: codes.length });
+  } catch (err) {
+    console.error("Validate codes error:", err);
+    res.status(500).json({ error: "فشل التحقق: " + err.message });
+  }
+});
+
 app.post("/admin/opening-stock", async (req, res) => {
   const client = await pool.connect();
   try {
