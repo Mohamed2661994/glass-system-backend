@@ -410,10 +410,7 @@ exports.getCustomerBalances = async (req, res) => {
   try {
     const { from, to, customer_name, warehouse_id } = req.query;
 
-    let conditions = [
-      "i.movement_type = 'sale'",
-      "i.is_void = false",
-    ];
+    let conditions = ["i.movement_type = 'sale'", "i.is_void = false"];
 
     let values = [];
     let idx = 1;
