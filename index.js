@@ -61,6 +61,32 @@ const chatUpload = multer({
 });
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
+// Sound uploads
+const soundsDir = path.join(__dirname, "uploads", "sounds");
+if (!fs.existsSync(soundsDir)) {
+  fs.mkdirSync(soundsDir, { recursive: true });
+}
+const soundUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, soundsDir),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname) || ".mp3";
+      cb(
+        null,
+        `sound_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`,
+      );
+    },
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith("audio/")) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only audio files are allowed"));
+    }
+  },
+});
+
 app.use(express.json({ limit: "50mb" }));
 
 const reportsRoutes = require("./reports/reports.routes");
@@ -6996,6 +7022,22 @@ app.post("/push/unsubscribe", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("PUSH UNSUBSCRIBE ERROR:", err);
     res.status(500).json({ error: "فشل إلغاء الاشتراك" });
+  }
+});
+
+/* ===============================
+   🔊 SOUNDS - Upload custom notification sound
+================================ */
+app.post("/sounds/upload", authMiddleware, soundUpload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "لم يتم رفع ملف صوتي" });
+    }
+    const fileUrl = `/uploads/sounds/${req.file.filename}`;
+    res.json({ success: true, url: fileUrl, filename: req.file.filename });
+  } catch (err) {
+    console.error("SOUND UPLOAD ERROR:", err);
+    res.status(500).json({ error: "فشل رفع الملف الصوتي" });
   }
 });
 
