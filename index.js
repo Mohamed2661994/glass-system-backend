@@ -6465,34 +6465,43 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
 });
 
 /* ===============================
-   💬 CHAT SYSTEM - Tables
+   💬 CHAT SYSTEM - Tables (sequential)
 ================================ */
-pool.query(`
-  CREATE TABLE IF NOT EXISTS conversations (
-    id SERIAL PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-  )
-`).then(() => console.log("✅ conversations table ready")).catch(e => console.error("❌ conversations:", e.message));
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id SERIAL PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ conversations table ready");
 
-pool.query(`
-  CREATE TABLE IF NOT EXISTS conversation_participants (
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    PRIMARY KEY (conversation_id, user_id)
-  )
-`).then(() => console.log("✅ conversation_participants table ready")).catch(e => console.error("❌ conversation_participants:", e.message));
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS conversation_participants (
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        PRIMARY KEY (conversation_id, user_id)
+      )
+    `);
+    console.log("✅ conversation_participants table ready");
 
-pool.query(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id SERIAL PRIMARY KEY,
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    content TEXT NOT NULL,
-    is_read BOOLEAN DEFAULT false,
-    created_at TIMESTAMP DEFAULT NOW()
-  )
-`).then(() => console.log("✅ messages table ready")).catch(e => console.error("❌ messages:", e.message));
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        is_read BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ messages table ready");
+  } catch (e) {
+    console.error("❌ chat tables error:", e.message);
+  }
+})();
 
 /* ===============================
    💬 CHAT - Get all conversations for current user
@@ -6500,7 +6509,8 @@ pool.query(`
 app.get("/chat/conversations", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT c.id, c.updated_at,
         (
           SELECT json_build_object('id', u2.id, 'username', u2.username, 'full_name', u2.full_name, 'branch_id', u2.branch_id)
@@ -6523,7 +6533,9 @@ app.get("/chat/conversations", authMiddleware, async (req, res) => {
       FROM conversations c
       JOIN conversation_participants cp ON cp.conversation_id = c.id AND cp.user_id = $1
       ORDER BY c.updated_at DESC
-    `, [userId]);
+    `,
+      [userId],
+    );
 
     res.json({ success: true, data: result.rows });
   } catch (err) {
@@ -6545,27 +6557,33 @@ app.post("/chat/conversations", authMiddleware, async (req, res) => {
     }
 
     // Check if conversation already exists between these two users
-    const existing = await pool.query(`
+    const existing = await pool.query(
+      `
       SELECT cp1.conversation_id
       FROM conversation_participants cp1
       JOIN conversation_participants cp2 ON cp2.conversation_id = cp1.conversation_id
       WHERE cp1.user_id = $1 AND cp2.user_id = $2
       LIMIT 1
-    `, [userId, other_user_id]);
+    `,
+      [userId, other_user_id],
+    );
 
     if (existing.rows.length > 0) {
-      return res.json({ success: true, conversation_id: existing.rows[0].conversation_id });
+      return res.json({
+        success: true,
+        conversation_id: existing.rows[0].conversation_id,
+      });
     }
 
     // Create new conversation
     const conv = await pool.query(
-      "INSERT INTO conversations DEFAULT VALUES RETURNING id"
+      "INSERT INTO conversations DEFAULT VALUES RETURNING id",
     );
     const convId = conv.rows[0].id;
 
     await pool.query(
       "INSERT INTO conversation_participants (conversation_id, user_id) VALUES ($1, $2), ($1, $3)",
-      [convId, userId, other_user_id]
+      [convId, userId, other_user_id],
     );
 
     res.json({ success: true, conversation_id: convId });
@@ -6578,106 +6596,121 @@ app.post("/chat/conversations", authMiddleware, async (req, res) => {
 /* ===============================
    💬 CHAT - Get messages for a conversation
 ================================ */
-app.get("/chat/conversations/:id/messages", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const convId = Number(req.params.id);
+app.get(
+  "/chat/conversations/:id/messages",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const convId = Number(req.params.id);
 
-    // Verify user is a participant
-    const participant = await pool.query(
-      "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
-      [convId, userId]
-    );
-    if (!participant.rows.length) {
-      return res.status(403).json({ error: "غير مصرح" });
-    }
+      // Verify user is a participant
+      const participant = await pool.query(
+        "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+        [convId, userId],
+      );
+      if (!participant.rows.length) {
+        return res.status(403).json({ error: "غير مصرح" });
+      }
 
-    // Mark messages as read
-    await pool.query(
-      "UPDATE messages SET is_read = true WHERE conversation_id = $1 AND sender_id != $2 AND is_read = false",
-      [convId, userId]
-    );
+      // Mark messages as read
+      await pool.query(
+        "UPDATE messages SET is_read = true WHERE conversation_id = $1 AND sender_id != $2 AND is_read = false",
+        [convId, userId],
+      );
 
-    const result = await pool.query(`
+      const result = await pool.query(
+        `
       SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
              u.username, u.full_name
       FROM messages m
       JOIN users u ON u.id = m.sender_id
       WHERE m.conversation_id = $1
       ORDER BY m.created_at ASC
-    `, [convId]);
+    `,
+        [convId],
+      );
 
-    res.json({ success: true, data: result.rows });
-  } catch (err) {
-    console.error("GET MESSAGES ERROR:", err);
-    res.status(500).json({ error: "فشل تحميل الرسايل" });
-  }
-});
+      res.json({ success: true, data: result.rows });
+    } catch (err) {
+      console.error("GET MESSAGES ERROR:", err);
+      res.status(500).json({ error: "فشل تحميل الرسايل" });
+    }
+  },
+);
 
 /* ===============================
    💬 CHAT - Send a message
 ================================ */
-app.post("/chat/conversations/:id/messages", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const convId = Number(req.params.id);
-    const { content } = req.body;
+app.post(
+  "/chat/conversations/:id/messages",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const convId = Number(req.params.id);
+      const { content } = req.body;
 
-    if (!content || !content.trim()) {
-      return res.status(400).json({ error: "الرسالة فاضية" });
+      if (!content || !content.trim()) {
+        return res.status(400).json({ error: "الرسالة فاضية" });
+      }
+
+      // Verify user is a participant
+      const participant = await pool.query(
+        "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+        [convId, userId],
+      );
+      if (!participant.rows.length) {
+        return res.status(403).json({ error: "غير مصرح" });
+      }
+
+      // Insert message
+      const msgResult = await pool.query(
+        "INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1, $2, $3) RETURNING *",
+        [convId, userId, content.trim()],
+      );
+
+      // Update conversation timestamp
+      await pool.query(
+        "UPDATE conversations SET updated_at = NOW() WHERE id = $1",
+        [convId],
+      );
+
+      // Get sender info
+      const senderResult = await pool.query(
+        "SELECT username, full_name FROM users WHERE id = $1",
+        [userId],
+      );
+
+      const message = {
+        ...msgResult.rows[0],
+        username: senderResult.rows[0].username,
+        full_name: senderResult.rows[0].full_name,
+      };
+
+      // Get other participant to send real-time notification
+      const otherUser = await pool.query(
+        "SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2",
+        [convId, userId],
+      );
+
+      // Emit to the other user via socket
+      const io = req.app.get("io");
+      if (io && otherUser.rows.length) {
+        const otherUserId = otherUser.rows[0].user_id;
+        io.to(`user_${otherUserId}`).emit("new_message", {
+          conversation_id: convId,
+          message,
+        });
+      }
+
+      res.json({ success: true, data: message });
+    } catch (err) {
+      console.error("SEND MESSAGE ERROR:", err);
+      res.status(500).json({ error: "فشل إرسال الرسالة" });
     }
-
-    // Verify user is a participant
-    const participant = await pool.query(
-      "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
-      [convId, userId]
-    );
-    if (!participant.rows.length) {
-      return res.status(403).json({ error: "غير مصرح" });
-    }
-
-    // Insert message
-    const msgResult = await pool.query(
-      "INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1, $2, $3) RETURNING *",
-      [convId, userId, content.trim()]
-    );
-
-    // Update conversation timestamp
-    await pool.query("UPDATE conversations SET updated_at = NOW() WHERE id = $1", [convId]);
-
-    // Get sender info
-    const senderResult = await pool.query(
-      "SELECT username, full_name FROM users WHERE id = $1", [userId]
-    );
-
-    const message = {
-      ...msgResult.rows[0],
-      username: senderResult.rows[0].username,
-      full_name: senderResult.rows[0].full_name,
-    };
-
-    // Get other participant to send real-time notification
-    const otherUser = await pool.query(
-      "SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2",
-      [convId, userId]
-    );
-
-    // Emit to the other user via socket
-    const io = req.app.get("io");
-    if (io && otherUser.rows.length) {
-      const otherUserId = otherUser.rows[0].user_id;
-      io.to(`user_${otherUserId}`).emit("new_message", {
-        conversation_id: convId,
-        message,
-      });
-    }
-
-    res.json({ success: true, data: message });
-  } catch (err) {
-    console.error("SEND MESSAGE ERROR:", err);
-    res.status(500).json({ error: "فشل إرسال الرسالة" });
-  }
-});
+  },
+);
 
 /* ===============================
    💬 CHAT - Total unread count
@@ -6685,12 +6718,15 @@ app.post("/chat/conversations/:id/messages", authMiddleware, async (req, res) =>
 app.get("/chat/unread-count", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT COUNT(*)::int AS count
       FROM messages m
       JOIN conversation_participants cp ON cp.conversation_id = m.conversation_id AND cp.user_id = $1
       WHERE m.sender_id != $1 AND m.is_read = false
-    `, [userId]);
+    `,
+      [userId],
+    );
     res.json({ success: true, count: result.rows[0].count });
   } catch (err) {
     console.error("CHAT UNREAD COUNT ERROR:", err);
@@ -6706,7 +6742,7 @@ app.get("/chat/users", authMiddleware, async (req, res) => {
     const userId = req.user.id;
     const result = await pool.query(
       "SELECT id, username, full_name, branch_id FROM users WHERE id != $1 ORDER BY full_name, username",
-      [userId]
+      [userId],
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
@@ -6757,7 +6793,9 @@ io.on("connection", (socket) => {
       socket.join(`branch_${branch_id}`);
       socket.join(`user_${user_id}`);
 
-      console.log(`User ${user_id} joined branch_${branch_id} + user_${user_id}`);
+      console.log(
+        `User ${user_id} joined branch_${branch_id} + user_${user_id}`,
+      );
     } catch (err) {
       console.error("Socket register error:", err);
     }
@@ -6765,17 +6803,29 @@ io.on("connection", (socket) => {
 
   // 💬 Chat: typing indicator
   socket.on("chat_typing", ({ conversation_id, user_id, to_user_id }) => {
-    io.to(`user_${to_user_id}`).emit("chat_typing", { conversation_id, user_id });
+    io.to(`user_${to_user_id}`).emit("chat_typing", {
+      conversation_id,
+      user_id,
+    });
   });
 
   socket.on("chat_stop_typing", ({ conversation_id, user_id, to_user_id }) => {
-    io.to(`user_${to_user_id}`).emit("chat_stop_typing", { conversation_id, user_id });
+    io.to(`user_${to_user_id}`).emit("chat_stop_typing", {
+      conversation_id,
+      user_id,
+    });
   });
 
   // 💬 Chat: mark messages as read in real-time
-  socket.on("chat_messages_read", ({ conversation_id, reader_id, to_user_id }) => {
-    io.to(`user_${to_user_id}`).emit("chat_messages_read", { conversation_id, reader_id });
-  });
+  socket.on(
+    "chat_messages_read",
+    ({ conversation_id, reader_id, to_user_id }) => {
+      io.to(`user_${to_user_id}`).emit("chat_messages_read", {
+        conversation_id,
+        reader_id,
+      });
+    },
+  );
 
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
