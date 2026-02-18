@@ -483,7 +483,7 @@ app.post("/customers/:id/phones", async (req, res) => {
 app.get("/customers/:id/phones", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT phone FROM customer_phones WHERE customer_id = $1`,
+      `SELECT id, phone FROM customer_phones WHERE customer_id = $1`,
       [req.params.id],
     );
 
@@ -526,6 +526,63 @@ app.get("/customers/by-phone", async (req, res) => {
     }
 
     res.json(Array.from(customersMap.values()));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* =========================================================
+   Customer Management Endpoints
+   ========================================================= */
+
+// List all customers with phones
+app.get("/customers", async (req, res) => {
+  try {
+    const { search } = req.query;
+    let query = `
+      SELECT c.id, c.name, c.apply_items_discount,
+             COALESCE(
+               json_agg(json_build_object('id', cp.id, 'phone', cp.phone))
+               FILTER (WHERE cp.id IS NOT NULL), '[]'
+             ) AS phones
+      FROM customers c
+      LEFT JOIN customer_phones cp ON cp.customer_id = c.id
+    `;
+    const params = [];
+    if (search && search.trim().length >= 2) {
+      query += ` WHERE c.name ILIKE $1 OR c.id::text = $1 OR EXISTS (SELECT 1 FROM customer_phones cp2 WHERE cp2.customer_id = c.id AND cp2.phone ILIKE $1)`;
+      params.push(`%${search.trim()}%`);
+    }
+    query += ` GROUP BY c.id ORDER BY c.name`;
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Update customer name
+app.put("/customers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: "الاسم مطلوب" });
+    await pool.query(`UPDATE customers SET name = $1 WHERE id = $2`, [name.trim(), id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Delete a phone from customer
+app.delete("/customers/:id/phones/:phoneId", async (req, res) => {
+  try {
+    const { id, phoneId } = req.params;
+    await pool.query(`DELETE FROM customer_phones WHERE id = $1 AND customer_id = $2`, [phoneId, id]);
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
