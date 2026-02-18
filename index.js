@@ -6568,7 +6568,10 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
       `ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT`,
     );
     await pool.query(`ALTER TABLE messages ALTER COLUMN content DROP NOT NULL`);
-    console.log("✅ messages columns updated (type, file_url)");
+    await pool.query(
+      `ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER REFERENCES messages(id)`,
+    );
+    console.log("✅ messages columns updated (type, file_url, reply_to_id)");
   } catch (e) {
     console.error("❌ chat tables error:", e.message);
   }
@@ -6693,10 +6696,16 @@ app.get(
       const result = await pool.query(
         `
       SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
-             m.type, m.file_url,
-             u.username, u.full_name
+             m.type, m.file_url, m.reply_to_id,
+             u.username, u.full_name,
+             rm.content AS reply_content,
+             rm.sender_id AS reply_sender_id,
+             ru.full_name AS reply_sender_name,
+             rm.type AS reply_type
       FROM messages m
       JOIN users u ON u.id = m.sender_id
+      LEFT JOIN messages rm ON rm.id = m.reply_to_id
+      LEFT JOIN users ru ON ru.id = rm.sender_id
       WHERE m.conversation_id = $1
       ORDER BY m.created_at ASC
     `,
@@ -6793,7 +6802,7 @@ app.post(
     try {
       const userId = req.user.id;
       const convId = Number(req.params.id);
-      const { content } = req.body;
+      const { content, reply_to_id } = req.body;
 
       if (!content || !content.trim()) {
         return res.status(400).json({ error: "الرسالة فاضية" });
@@ -6810,8 +6819,8 @@ app.post(
 
       // Insert message
       const msgResult = await pool.query(
-        "INSERT INTO messages (conversation_id, sender_id, content) VALUES ($1, $2, $3) RETURNING *",
-        [convId, userId, content.trim()],
+        "INSERT INTO messages (conversation_id, sender_id, content, reply_to_id) VALUES ($1, $2, $3, $4) RETURNING *",
+        [convId, userId, content.trim(), reply_to_id || null],
       );
 
       // Update conversation timestamp
@@ -6831,6 +6840,20 @@ app.post(
         username: senderResult.rows[0].username,
         full_name: senderResult.rows[0].full_name,
       };
+
+      // If replying, attach reply info
+      if (reply_to_id) {
+        const replyResult = await pool.query(
+          "SELECT m.content, m.sender_id, m.type, u.full_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.id = $1",
+          [reply_to_id],
+        );
+        if (replyResult.rows.length) {
+          message.reply_content = replyResult.rows[0].content;
+          message.reply_sender_id = replyResult.rows[0].sender_id;
+          message.reply_sender_name = replyResult.rows[0].full_name;
+          message.reply_type = replyResult.rows[0].type;
+        }
+      }
 
       // Get other participant to send real-time notification
       const otherUser = await pool.query(
