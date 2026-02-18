@@ -412,7 +412,6 @@ exports.getCustomerBalances = async (req, res) => {
 
     let conditions = [
       "i.movement_type = 'sale'",
-      "i.remaining_amount > 0",
       "i.is_void = false",
     ];
 
@@ -449,7 +448,7 @@ exports.getCustomerBalances = async (req, res) => {
         SUM(i.total) AS total_sales,
         SUM(i.paid_amount) + COALESCE(cp.extra_paid, 0) AS total_paid,
         GREATEST(
-          SUM(i.remaining_amount) - COALESCE(cp.extra_paid, 0),
+          SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
           0
         ) AS balance_due,
         MAX(i.invoice_date) AS last_invoice_date
@@ -463,7 +462,7 @@ exports.getCustomerBalances = async (req, res) => {
       ${whereClause}
       GROUP BY i.customer_name, cp.extra_paid
       HAVING GREATEST(
-        SUM(i.remaining_amount) - COALESCE(cp.extra_paid, 0),
+        SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
         0
       ) > 0
       ORDER BY balance_due DESC
