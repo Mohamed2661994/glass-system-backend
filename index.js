@@ -9,12 +9,16 @@ const puppeteer = require("puppeteer");
 const webPush = require("web-push");
 
 // VAPID keys for Web Push
-const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "BE_kwDw7wWI1zcNDVcuzNvqGQTAclRtQq1P92xfHrMlzTzRaDnD9nh5byh545XCZ_4seODj7BbHrdee8kTMxkuQ";
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "zDbY6LS9Ixyxr7ej8Ocp3zdCnt_7Q6xY2v7c5Ikf43U";
+const VAPID_PUBLIC_KEY =
+  process.env.VAPID_PUBLIC_KEY ||
+  "BE_kwDw7wWI1zcNDVcuzNvqGQTAclRtQq1P92xfHrMlzTzRaDnD9nh5byh545XCZ_4seODj7BbHrdee8kTMxkuQ";
+const VAPID_PRIVATE_KEY =
+  process.env.VAPID_PRIVATE_KEY ||
+  "zDbY6LS9Ixyxr7ej8Ocp3zdCnt_7Q6xY2v7c5Ikf43U";
 webPush.setVapidDetails(
   "mailto:admin@glass-system.com",
   VAPID_PUBLIC_KEY,
-  VAPID_PRIVATE_KEY
+  VAPID_PRIVATE_KEY,
 );
 const pool = require("./db");
 const {
@@ -991,6 +995,9 @@ VALUES
         type: "invoice_wholesale",
         reference_id: invoiceId,
       });
+
+      // 📲 Push notification حتى لو الويب مقفول
+      sendPushToBranch(MAIN_WAREHOUSE_ID, title, message, { type: "invoice_wholesale", invoice_id: invoiceId });
     }
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع - فقط لفرع الجملة
@@ -4121,7 +4128,10 @@ app.post("/stock/transfer", authMiddleware, async (req, res) => {
 
     // 🔔 Notification to destination branch
     try {
-      const senderRes = await pool.query("SELECT full_name FROM users WHERE id = $1", [req.user.id]);
+      const senderRes = await pool.query(
+        "SELECT full_name FROM users WHERE id = $1",
+        [req.user.id],
+      );
       const senderName = senderRes.rows[0]?.full_name || "مستخدم";
       const title = "تحويل مخزون جديد";
       const message = `قام ${senderName} بتحويل ${items.length} صنف إلى فرعكم`;
@@ -4129,15 +4139,20 @@ app.post("/stock/transfer", authMiddleware, async (req, res) => {
       await pool.query(
         `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [title, message, req.user.id, to_branch_id, "stock_transfer", null]
+        [title, message, req.user.id, to_branch_id, "stock_transfer", null],
       );
 
       const io = req.app.get("io");
       io.to(`branch_${to_branch_id}`).emit("new_notification", {
-        title, message, type: "stock_transfer", reference_id: null,
+        title,
+        message,
+        type: "stock_transfer",
+        reference_id: null,
       });
 
-      sendPushToBranch(to_branch_id, title, message, { type: "stock_transfer" });
+      sendPushToBranch(to_branch_id, title, message, {
+        type: "stock_transfer",
+      });
     } catch (notifErr) {
       console.error("TRANSFER NOTIFICATION ERROR:", notifErr);
     }
@@ -5143,140 +5158,149 @@ FROM products
   }
 });
 
-app.post("/stock/wholesale-to-retail/execute", authMiddleware, async (req, res) => {
-  const client = await pool.connect();
+app.post(
+  "/stock/wholesale-to-retail/execute",
+  authMiddleware,
+  async (req, res) => {
+    const client = await pool.connect();
 
-  try {
-    const { from_branch_id, to_branch_id, items, note, created_by } = req.body;
+    try {
+      const { from_branch_id, to_branch_id, items, note, created_by } =
+        req.body;
 
-    if (
-      !from_branch_id ||
-      !to_branch_id ||
-      !Array.isArray(items) ||
-      items.length === 0
-    ) {
-      return res.status(400).json({ error: "بيانات ناقصة" });
-    }
+      if (
+        !from_branch_id ||
+        !to_branch_id ||
+        !Array.isArray(items) ||
+        items.length === 0
+      ) {
+        return res.status(400).json({ error: "بيانات ناقصة" });
+      }
 
-    await client.query("BEGIN");
+      await client.query("BEGIN");
 
-    // ✅ مخزن الجملة (المصدر)
-    const wholesaleWarehouseId = await getWholesaleWarehouseByBranch(
-      from_branch_id,
-      client,
-    );
+      // ✅ مخزن الجملة (المصدر)
+      const wholesaleWarehouseId = await getWholesaleWarehouseByBranch(
+        from_branch_id,
+        client,
+      );
 
-    // ✅ مخزن القطاعي (الوجهة)
-    const retailWarehouseId = await getWholesaleWarehouseByBranch(
-      to_branch_id,
-      client,
-    );
+      // ✅ مخزن القطاعي (الوجهة)
+      const retailWarehouseId = await getWholesaleWarehouseByBranch(
+        to_branch_id,
+        client,
+      );
 
-    // 1️⃣ إنشاء رأس التحويل
-    const transferRes = await client.query(
-      `
+      // 1️⃣ إنشاء رأس التحويل
+      const transferRes = await client.query(
+        `
       INSERT INTO stock_transfers (branch_id, created_by, note)
       VALUES ($1, $2, $3)
       RETURNING id
       `,
-      [from_branch_id, created_by || null, note || null],
-    );
+        [from_branch_id, created_by || null, note || null],
+      );
 
-    const transferId = transferRes.rows[0].id;
+      const transferId = transferRes.rows[0].id;
 
-    const resultItems = [];
+      const resultItems = [];
 
-    // 2️⃣ تنفيذ العناصر
-    for (const item of items) {
-      const product_id = Number(item.product_id);
-      const quantity = Number(item.quantity);
-      const variantId = Number(item.variant_id) || 0;
+      // 2️⃣ تنفيذ العناصر
+      for (const item of items) {
+        const product_id = Number(item.product_id);
+        const quantity = Number(item.quantity);
+        const variantId = Number(item.variant_id) || 0;
 
-      if (!product_id || quantity <= 0) {
-        throw new Error("INVALID_ITEM_DATA");
-      }
+        if (!product_id || quantity <= 0) {
+          throw new Error("INVALID_ITEM_DATA");
+        }
 
-      // 🔹 بيانات الصنف
-      const productRes = await client.query(
-        `
+        // 🔹 بيانات الصنف
+        const productRes = await client.query(
+          `
         SELECT id, name, wholesale_package, retail_package
         FROM products
         WHERE id = $1 AND is_active = true
         `,
-        [product_id],
-      );
-
-      if (!productRes.rows.length) {
-        throw new Error(`PRODUCT_NOT_FOUND:${product_id}`);
-      }
-
-      const product = productRes.rows[0];
-
-      // بيانات العبوة (من الأصناف الفرعية لو variant_id مش 0)
-      let wholesalePkg = product.wholesale_package;
-      let retailPkg = product.retail_package;
-
-      if (variantId !== 0) {
-        const vRes = await client.query(
-          `SELECT wholesale_package, retail_package FROM product_variants WHERE id = $1`,
-          [variantId],
+          [product_id],
         );
-        if (vRes.rows.length) {
-          wholesalePkg = vRes.rows[0].wholesale_package || wholesalePkg;
-          retailPkg = vRes.rows[0].retail_package || retailPkg;
-        }
-      }
 
-      // 🔹 رصيد الجملة (قفل الصف)
-      const stockRes = await client.query(
-        `
+        if (!productRes.rows.length) {
+          throw new Error(`PRODUCT_NOT_FOUND:${product_id}`);
+        }
+
+        const product = productRes.rows[0];
+
+        // بيانات العبوة (من الأصناف الفرعية لو variant_id مش 0)
+        let wholesalePkg = product.wholesale_package;
+        let retailPkg = product.retail_package;
+
+        if (variantId !== 0) {
+          const vRes = await client.query(
+            `SELECT wholesale_package, retail_package FROM product_variants WHERE id = $1`,
+            [variantId],
+          );
+          if (vRes.rows.length) {
+            wholesalePkg = vRes.rows[0].wholesale_package || wholesalePkg;
+            retailPkg = vRes.rows[0].retail_package || retailPkg;
+          }
+        }
+
+        // 🔹 رصيد الجملة (قفل الصف)
+        const stockRes = await client.query(
+          `
         SELECT quantity
         FROM stock
         WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = $3
         FOR UPDATE
         `,
-        [wholesaleWarehouseId, product_id, variantId],
-      );
+          [wholesaleWarehouseId, product_id, variantId],
+        );
 
-      const available = stockRes.rows.length
-        ? Number(stockRes.rows[0].quantity)
-        : 0;
+        const available = stockRes.rows.length
+          ? Number(stockRes.rows[0].quantity)
+          : 0;
 
-      if (available < quantity) {
-        throw new Error(`INSUFFICIENT_STOCK:${product.name}`);
-      }
+        if (available < quantity) {
+          throw new Error(`INSUFFICIENT_STOCK:${product.name}`);
+        }
 
-      // 🔹 التحويل
-      const conversion = convertWholesaleToRetail({
-        wholesale_package: wholesalePkg,
-        retail_package: retailPkg,
-        wholesale_quantity: quantity,
-      });
+        // 🔹 التحويل
+        const conversion = convertWholesaleToRetail({
+          wholesale_package: wholesalePkg,
+          retail_package: retailPkg,
+          wholesale_quantity: quantity,
+        });
 
-      // 3️⃣ خصم من الجملة
-      await client.query(
-        `
+        // 3️⃣ خصم من الجملة
+        await client.query(
+          `
         UPDATE stock
         SET quantity = quantity - $1
         WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
         `,
-        [quantity, wholesaleWarehouseId, product_id, variantId],
-      );
+          [quantity, wholesaleWarehouseId, product_id, variantId],
+        );
 
-      // 4️⃣ إضافة للقطاعي
-      await client.query(
-        `
+        // 4️⃣ إضافة للقطاعي
+        await client.query(
+          `
         INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (warehouse_id, product_id, variant_id)
         DO UPDATE SET quantity = stock.quantity + $4
         `,
-        [retailWarehouseId, product_id, variantId, conversion.retail_quantity],
-      );
+          [
+            retailWarehouseId,
+            product_id,
+            variantId,
+            conversion.retail_quantity,
+          ],
+        );
 
-      // 5️⃣ تفاصيل التحويل
-      await client.query(
-        `
+        // 5️⃣ تفاصيل التحويل
+        await client.query(
+          `
         INSERT INTO stock_transfer_items
         (
           transfer_id,
@@ -5289,20 +5313,20 @@ app.post("/stock/wholesale-to-retail/execute", authMiddleware, async (req, res) 
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7)
         `,
-        [
-          transferId,
-          product_id,
-          wholesaleWarehouseId,
-          retailWarehouseId,
-          quantity,
-          conversion.retail_quantity,
-          item.final_price || 0,
-        ],
-      );
+          [
+            transferId,
+            product_id,
+            wholesaleWarehouseId,
+            retailWarehouseId,
+            quantity,
+            conversion.retail_quantity,
+            item.final_price || 0,
+          ],
+        );
 
-      // 6️⃣ حركة مخزون (خروج)
-      await client.query(
-        `
+        // 6️⃣ حركة مخزون (خروج)
+        await client.query(
+          `
         INSERT INTO stock_movements
         (
           warehouse_id,
@@ -5316,19 +5340,19 @@ app.post("/stock/wholesale-to-retail/execute", authMiddleware, async (req, res) 
         )
         VALUES ($1,$2,$3,$4,'transfer_out','transfer',$5,$6)
         `,
-        [
-          wholesaleWarehouseId,
-          product_id,
-          variantId,
-          quantity,
-          transferId,
-          "تحويل من الجملة إلى القطاعي",
-        ],
-      );
+          [
+            wholesaleWarehouseId,
+            product_id,
+            variantId,
+            quantity,
+            transferId,
+            "تحويل من الجملة إلى القطاعي",
+          ],
+        );
 
-      // 7️⃣ حركة مخزون (دخول)
-      await client.query(
-        `
+        // 7️⃣ حركة مخزون (دخول)
+        await client.query(
+          `
         INSERT INTO stock_movements
         (
           warehouse_id,
@@ -5342,66 +5366,83 @@ app.post("/stock/wholesale-to-retail/execute", authMiddleware, async (req, res) 
         )
         VALUES ($1,$2,$3,$4,'transfer_in','transfer',$5,$6)
         `,
-        [
-          retailWarehouseId,
+          [
+            retailWarehouseId,
+            product_id,
+            variantId,
+            conversion.retail_quantity,
+            transferId,
+            "تحويل من الجملة إلى القطاعي",
+          ],
+        );
+
+        resultItems.push({
           product_id,
-          variantId,
-          conversion.retail_quantity,
-          transferId,
-          "تحويل من الجملة إلى القطاعي",
-        ],
-      );
+          product_name: product.name,
+          from_quantity: quantity,
+          to_quantity: conversion.retail_quantity,
+        });
+      }
 
-      resultItems.push({
-        product_id,
-        product_name: product.name,
-        from_quantity: quantity,
-        to_quantity: conversion.retail_quantity,
-      });
-    }
+      await client.query("COMMIT");
 
-    await client.query("COMMIT");
+      // 🔔 Notification to destination branch
+      try {
+        const senderRes = await pool.query(
+          "SELECT full_name FROM users WHERE id = $1",
+          [req.user.id],
+        );
+        const senderName = senderRes.rows[0]?.full_name || "مستخدم";
+        const title = "تحويل مخزون جديد";
+        const message = `قام ${senderName} بتحويل ${items.length} صنف (جملة ← قطاعي) - رقم #${transferId}`;
 
-    // 🔔 Notification to destination branch
-    try {
-      const senderRes = await pool.query("SELECT full_name FROM users WHERE id = $1", [req.user.id]);
-      const senderName = senderRes.rows[0]?.full_name || "مستخدم";
-      const title = "تحويل مخزون جديد";
-      const message = `قام ${senderName} بتحويل ${items.length} صنف (جملة ← قطاعي) - رقم #${transferId}`;
-
-      await pool.query(
-        `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
+        await pool.query(
+          `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [title, message, req.user.id, to_branch_id, "stock_transfer", transferId]
-      );
+          [
+            title,
+            message,
+            req.user.id,
+            to_branch_id,
+            "stock_transfer",
+            transferId,
+          ],
+        );
 
-      const io = req.app.get("io");
-      io.to(`branch_${to_branch_id}`).emit("new_notification", {
-        title, message, type: "stock_transfer", reference_id: transferId,
+        const io = req.app.get("io");
+        io.to(`branch_${to_branch_id}`).emit("new_notification", {
+          title,
+          message,
+          type: "stock_transfer",
+          reference_id: transferId,
+        });
+
+        sendPushToBranch(to_branch_id, title, message, {
+          type: "stock_transfer",
+          transfer_id: transferId,
+        });
+      } catch (notifErr) {
+        console.error("TRANSFER NOTIFICATION ERROR:", notifErr);
+      }
+
+      res.json({
+        success: true,
+        transfer_id: transferId,
+        items: resultItems,
       });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("EXECUTE TRANSFER ERROR:", err);
 
-      sendPushToBranch(to_branch_id, title, message, { type: "stock_transfer", transfer_id: transferId });
-    } catch (notifErr) {
-      console.error("TRANSFER NOTIFICATION ERROR:", notifErr);
+      res.status(400).json({
+        success: false,
+        error: err.message,
+      });
+    } finally {
+      client.release();
     }
-
-    res.json({
-      success: true,
-      transfer_id: transferId,
-      items: resultItems,
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("EXECUTE TRANSFER ERROR:", err);
-
-    res.status(400).json({
-      success: false,
-      error: err.message,
-    });
-  } finally {
-    client.release();
-  }
-});
+  },
+);
 
 app.get("/stock-transfers", async (req, res) => {
   try {
@@ -6885,7 +6926,7 @@ app.post(
           otherUser.rows[0].user_id,
           message.full_name || message.username,
           req.file.mimetype.startsWith("image/") ? "📷 صورة" : "📄 ملف",
-          convId
+          convId,
         );
       }
 
@@ -6978,12 +7019,15 @@ app.post(
 
       // Send push notification to other user
       if (otherUser.rows.length) {
-        const preview = content.trim().length > 80 ? content.trim().substring(0, 80) + "..." : content.trim();
+        const preview =
+          content.trim().length > 80
+            ? content.trim().substring(0, 80) + "..."
+            : content.trim();
         sendPushToUser(
           otherUser.rows[0].user_id,
           senderResult.rows[0].full_name,
           preview,
-          convId
+          convId,
         );
       }
 
@@ -7003,14 +7047,18 @@ async function sendPushToBranch(targetBranchId, title, body, data = {}) {
     // Get all users in the target branch
     const usersRes = await pool.query(
       "SELECT id FROM users WHERE branch_id = $1",
-      [targetBranchId]
+      [targetBranchId],
     );
     for (const user of usersRes.rows) {
       const subs = await pool.query(
         "SELECT * FROM push_subscriptions WHERE user_id = $1",
-        [user.id]
+        [user.id],
       );
-      const payload = JSON.stringify({ title, body, data: { ...data, url: "/" } });
+      const payload = JSON.stringify({
+        title,
+        body,
+        data: { ...data, url: "/" },
+      });
       for (const sub of subs.rows) {
         const pushSub = {
           endpoint: sub.endpoint,
@@ -7020,7 +7068,9 @@ async function sendPushToBranch(targetBranchId, title, body, data = {}) {
           await webPush.sendNotification(pushSub, payload);
         } catch (err) {
           if (err.statusCode === 410 || err.statusCode === 404) {
-            await pool.query("DELETE FROM push_subscriptions WHERE id = $1", [sub.id]);
+            await pool.query("DELETE FROM push_subscriptions WHERE id = $1", [
+              sub.id,
+            ]);
           }
         }
       }
@@ -7034,7 +7084,7 @@ async function sendPushToUser(targetUserId, senderName, body, convId) {
   try {
     const subs = await pool.query(
       "SELECT * FROM push_subscriptions WHERE user_id = $1",
-      [targetUserId]
+      [targetUserId],
     );
     const payload = JSON.stringify({
       title: senderName,
@@ -7050,7 +7100,9 @@ async function sendPushToUser(targetUserId, senderName, body, convId) {
         await webPush.sendNotification(pushSub, payload);
       } catch (err) {
         if (err.statusCode === 410 || err.statusCode === 404) {
-          await pool.query("DELETE FROM push_subscriptions WHERE id = $1", [sub.id]);
+          await pool.query("DELETE FROM push_subscriptions WHERE id = $1", [
+            sub.id,
+          ]);
         }
       }
     }
@@ -7080,7 +7132,7 @@ app.post("/push/subscribe", authMiddleware, async (req, res) => {
       `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (endpoint) DO UPDATE SET user_id = $1, p256dh = $3, auth = $4`,
-      [userId, endpoint, keys.p256dh, keys.auth]
+      [userId, endpoint, keys.p256dh, keys.auth],
     );
     res.json({ success: true });
   } catch (err) {
@@ -7095,7 +7147,9 @@ app.post("/push/subscribe", authMiddleware, async (req, res) => {
 app.post("/push/unsubscribe", authMiddleware, async (req, res) => {
   try {
     const { endpoint } = req.body;
-    await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [endpoint]);
+    await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [
+      endpoint,
+    ]);
     res.json({ success: true });
   } catch (err) {
     console.error("PUSH UNSUBSCRIBE ERROR:", err);
@@ -7106,18 +7160,23 @@ app.post("/push/unsubscribe", authMiddleware, async (req, res) => {
 /* ===============================
    🔊 SOUNDS - Upload custom notification sound
 ================================ */
-app.post("/sounds/upload", authMiddleware, soundUpload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "لم يتم رفع ملف صوتي" });
+app.post(
+  "/sounds/upload",
+  authMiddleware,
+  soundUpload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "لم يتم رفع ملف صوتي" });
+      }
+      const fileUrl = `/uploads/sounds/${req.file.filename}`;
+      res.json({ success: true, url: fileUrl, filename: req.file.filename });
+    } catch (err) {
+      console.error("SOUND UPLOAD ERROR:", err);
+      res.status(500).json({ error: "فشل رفع الملف الصوتي" });
     }
-    const fileUrl = `/uploads/sounds/${req.file.filename}`;
-    res.json({ success: true, url: fileUrl, filename: req.file.filename });
-  } catch (err) {
-    console.error("SOUND UPLOAD ERROR:", err);
-    res.status(500).json({ error: "فشل رفع الملف الصوتي" });
-  }
-});
+  },
+);
 
 /* ===============================
    �💬 CHAT - Total unread count
