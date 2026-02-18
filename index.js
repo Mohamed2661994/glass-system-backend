@@ -6,6 +6,16 @@ const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
 const puppeteer = require("puppeteer");
+const webPush = require("web-push");
+
+// VAPID keys for Web Push
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "BE_kwDw7wWI1zcNDVcuzNvqGQTAclRtQq1P92xfHrMlzTzRaDnD9nh5byh545XCZ_4seODj7BbHrdee8kTMxkuQ";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "zDbY6LS9Ixyxr7ej8Ocp3zdCnt_7Q6xY2v7c5Ikf43U";
+webPush.setVapidDetails(
+  "mailto:admin@glass-system.com",
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY
+);
 const pool = require("./db");
 const {
   convertWholesaleToRetail,
@@ -6572,6 +6582,19 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
       `ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER REFERENCES messages(id)`,
     );
     console.log("✅ messages columns updated (type, file_url, reply_to_id)");
+
+    // Push subscriptions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ push_subscriptions table ready");
   } catch (e) {
     console.error("❌ chat tables error:", e.message);
   }
@@ -6784,6 +6807,16 @@ app.post(
         });
       }
 
+      // Send push notification to other user
+      if (otherUser.rows.length) {
+        sendPushToUser(
+          otherUser.rows[0].user_id,
+          message.full_name || message.username,
+          req.file.mimetype.startsWith("image/") ? "📷 صورة" : "📄 ملف",
+          convId
+        );
+      }
+
       res.json({ success: true, data: message });
     } catch (err) {
       console.error("CHAT UPLOAD ERROR:", err);
@@ -6871,6 +6904,17 @@ app.post(
         });
       }
 
+      // Send push notification to other user
+      if (otherUser.rows.length) {
+        const preview = content.trim().length > 80 ? content.trim().substring(0, 80) + "..." : content.trim();
+        sendPushToUser(
+          otherUser.rows[0].user_id,
+          senderResult.rows[0].full_name,
+          preview,
+          convId
+        );
+      }
+
       res.json({ success: true, data: message });
     } catch (err) {
       console.error("SEND MESSAGE ERROR:", err);
@@ -6880,7 +6924,83 @@ app.post(
 );
 
 /* ===============================
-   💬 CHAT - Total unread count
+   � PUSH - Helper: send push to user
+================================ */
+async function sendPushToUser(targetUserId, senderName, body, convId) {
+  try {
+    const subs = await pool.query(
+      "SELECT * FROM push_subscriptions WHERE user_id = $1",
+      [targetUserId]
+    );
+    const payload = JSON.stringify({
+      title: senderName,
+      body,
+      data: { conversation_id: convId, url: "/" },
+    });
+    for (const sub of subs.rows) {
+      const pushSub = {
+        endpoint: sub.endpoint,
+        keys: { p256dh: sub.p256dh, auth: sub.auth },
+      };
+      try {
+        await webPush.sendNotification(pushSub, payload);
+      } catch (err) {
+        if (err.statusCode === 410 || err.statusCode === 404) {
+          await pool.query("DELETE FROM push_subscriptions WHERE id = $1", [sub.id]);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("PUSH NOTIFICATION ERROR:", err);
+  }
+}
+
+/* ===============================
+   🔔 PUSH - Get VAPID public key
+================================ */
+app.get("/push/vapid-key", (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+/* ===============================
+   🔔 PUSH - Subscribe
+================================ */
+app.post("/push/subscribe", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { endpoint, keys } = req.body;
+    if (!endpoint || !keys?.p256dh || !keys?.auth) {
+      return res.status(400).json({ error: "بيانات الاشتراك ناقصة" });
+    }
+    await pool.query(
+      `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (endpoint) DO UPDATE SET user_id = $1, p256dh = $3, auth = $4`,
+      [userId, endpoint, keys.p256dh, keys.auth]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("PUSH SUBSCRIBE ERROR:", err);
+    res.status(500).json({ error: "فشل تسجيل الاشتراك" });
+  }
+});
+
+/* ===============================
+   🔔 PUSH - Unsubscribe
+================================ */
+app.post("/push/unsubscribe", authMiddleware, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [endpoint]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("PUSH UNSUBSCRIBE ERROR:", err);
+    res.status(500).json({ error: "فشل إلغاء الاشتراك" });
+  }
+});
+
+/* ===============================
+   �💬 CHAT - Total unread count
 ================================ */
 app.get("/chat/unread-count", authMiddleware, async (req, res) => {
   try {
