@@ -2493,10 +2493,39 @@ app.get("/customers/:id/last-balance", async (req, res) => {
       [id],
     );
 
+    const lastRemaining = result.rows.length
+      ? Number(result.rows[0].remaining_amount)
+      : 0;
+
+    // طرح سندات الدفع بعد آخر فاتورة
+    const customerRes = await pool.query(
+      `SELECT name FROM customers WHERE id = $1`,
+      [id],
+    );
+    const customerName = customerRes.rows[0]?.name;
+
+    let totalPayments = 0;
+    if (customerName) {
+      const paymentsRes = await pool.query(
+        `
+        SELECT COALESCE(SUM(amount), 0) AS total_payments
+        FROM cash_in
+        WHERE source_type = 'customer_payment'
+          AND customer_name = $1
+          AND created_at > (
+            SELECT COALESCE(MAX(created_at), '1970-01-01')
+            FROM invoices
+            WHERE customer_id = $2
+              AND is_void = false
+          )
+        `,
+        [customerName, id],
+      );
+      totalPayments = Number(paymentsRes.rows[0].total_payments);
+    }
+
     res.json({
-      previous_balance: result.rows.length
-        ? result.rows[0].remaining_amount
-        : 0,
+      previous_balance: Math.max(0, lastRemaining - totalPayments),
     });
   } catch (err) {
     console.error(err);
@@ -2514,6 +2543,7 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "invoice_type مطلوب" });
     }
 
+    // remaining_amount من آخر فاتورة
     const result = await pool.query(
       `
       SELECT remaining_amount
@@ -2521,14 +2551,49 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
       WHERE customer_id = $1
         AND branch_id = $2
         AND invoice_type = $3
+        AND is_void = false
       ORDER BY created_at DESC
       LIMIT 1
       `,
       [customerId, branch_id, invoice_type],
     );
 
+    const lastRemaining = result.rows.length
+      ? Number(result.rows[0].remaining_amount)
+      : 0;
+
+    // طرح سندات الدفع بعد آخر فاتورة
+    const customerRes = await pool.query(
+      `SELECT name FROM customers WHERE id = $1`,
+      [customerId],
+    );
+    const customerName = customerRes.rows[0]?.name;
+
+    let totalPayments = 0;
+    if (customerName) {
+      const paymentsRes = await pool.query(
+        `
+        SELECT COALESCE(SUM(amount), 0) AS total_payments
+        FROM cash_in
+        WHERE source_type = 'customer_payment'
+          AND customer_name = $1
+          AND branch_id = $2
+          AND created_at > (
+            SELECT COALESCE(MAX(created_at), '1970-01-01')
+            FROM invoices
+            WHERE customer_id = $3
+              AND branch_id = $2
+              AND invoice_type = $4
+              AND is_void = false
+          )
+        `,
+        [customerName, branch_id, customerId, invoice_type],
+      );
+      totalPayments = Number(paymentsRes.rows[0].total_payments);
+    }
+
     res.json({
-      balance: result.rows.length ? Number(result.rows[0].remaining_amount) : 0,
+      balance: Math.max(0, lastRemaining - totalPayments),
     });
   } catch (err) {
     console.error("GET CUSTOMER BALANCE ERROR:", err);
@@ -4580,50 +4645,9 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       ],
     );
 
-    // ✅ خصم سند الدفع من آخر مديونية للعميل (نظام الرصيد المرحّل)
-    if (source_type === "customer_payment" && customer_name) {
-      let paymentAmount = Number(amount);
-
-      const lastInvoiceRes = await client.query(
-        `
-    SELECT id, remaining_amount, paid_amount
-    FROM invoices
-    WHERE customer_name = $1
-      AND branch_id = $2
-      AND remaining_amount > 0
-    ORDER BY created_at DESC
-    LIMIT 1
-    `,
-        [customer_name, branch_id],
-      );
-
-      if (lastInvoiceRes.rows.length) {
-        const invoice = lastInvoiceRes.rows[0];
-
-        const newRemaining = Math.max(
-          0,
-          Number(invoice.remaining_amount) - paymentAmount,
-        );
-
-        const newPaid = Number(invoice.paid_amount) + paymentAmount;
-
-        await client.query(
-          `
-  UPDATE invoices
-  SET
-    paid_amount = $1::numeric,
-    remaining_amount = $2::numeric,
-    payment_status =
-      CASE
-        WHEN $2::numeric <= 0 THEN 'paid'
-        ELSE 'partial'
-      END
-  WHERE id = $3::integer
-  `,
-          [newPaid, newRemaining, invoice.id],
-        );
-      }
-    }
+    // سندات الدفع تُسجَّل في cash_in فقط
+    // وتظهر كأسطر منفصلة في كشف حساب العميل
+    // بدون تعديل الفاتورة (لتجنب الحساب المزدوج)
 
     await client.query("COMMIT");
 
