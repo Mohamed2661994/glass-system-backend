@@ -97,6 +97,14 @@ pool
   .then(() => console.log("✅ product_variants table ready"))
   .catch((e) => console.error("❌ product_variants table error:", e.message));
 
+// 📋 عمود تفضيلات اليوزر (JSON)
+pool
+  .query(
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'`
+  )
+  .then(() => console.log("✅ users.preferences column ready"))
+  .catch((e) => console.error("❌ users.preferences column error:", e.message));
+
 // إضافة عمود الخصم لو مش موجود
 pool
   .query(
@@ -5961,6 +5969,38 @@ app.put("/users/theme", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("SAVE THEME ERROR:", err);
     res.status(500).json({ error: "فشل حفظ الثيم" });
+  }
+});
+
+/* ─── User Preferences (dashboard config, widgets, quick links, etc.) ─── */
+app.get("/user/preferences", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT preferences FROM users WHERE id = $1",
+      [req.user.id]
+    );
+    if (rows.length === 0) return res.json({});
+    res.json(rows[0].preferences || {});
+  } catch (err) {
+    console.error("GET PREFERENCES ERROR:", err);
+    res.status(500).json({ error: "فشل جلب التفضيلات" });
+  }
+});
+
+app.put("/user/preferences", authMiddleware, async (req, res) => {
+  try {
+    const prefs = req.body;
+    if (!prefs || typeof prefs !== "object") {
+      return res.status(400).json({ error: "بيانات غير صالحة" });
+    }
+    await pool.query(
+      "UPDATE users SET preferences = $1 WHERE id = $2",
+      [JSON.stringify(prefs), req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("SAVE PREFERENCES ERROR:", err);
+    res.status(500).json({ error: "فشل حفظ التفضيلات" });
   }
 });
 
