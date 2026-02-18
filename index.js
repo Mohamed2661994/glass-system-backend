@@ -997,7 +997,10 @@ VALUES
       });
 
       // 📲 Push notification حتى لو الويب مقفول
-      sendPushToBranch(MAIN_WAREHOUSE_ID, title, message, { type: "invoice_wholesale", invoice_id: invoiceId });
+      sendPushToBranch(MAIN_WAREHOUSE_ID, title, message, {
+        type: "invoice_wholesale",
+        invoice_id: invoiceId,
+      });
     }
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع - فقط لفرع الجملة
@@ -7170,13 +7173,37 @@ app.post(
         return res.status(400).json({ error: "لم يتم رفع ملف صوتي" });
       }
       const fileUrl = `/uploads/sounds/${req.file.filename}`;
-      res.json({ success: true, url: fileUrl, filename: req.file.filename });
+      res.json({ success: true, url: fileUrl, filename: req.file.filename, originalName: req.file.originalname });
     } catch (err) {
       console.error("SOUND UPLOAD ERROR:", err);
       res.status(500).json({ error: "فشل رفع الملف الصوتي" });
     }
   },
 );
+
+/* ===============================
+   🔊 SOUNDS - List uploaded sounds
+================================ */
+app.get("/sounds/list", authMiddleware, async (req, res) => {
+  try {
+    const soundsPath = path.join(__dirname, "uploads", "sounds");
+    if (!fs.existsSync(soundsPath)) {
+      return res.json({ sounds: [] });
+    }
+    const files = fs.readdirSync(soundsPath).filter((f) => {
+      const ext = path.extname(f).toLowerCase();
+      return [".mp3", ".wav", ".ogg", ".m4a", ".aac", ".webm"].includes(ext);
+    });
+    const sounds = files.map((f) => ({
+      filename: f,
+      url: `/uploads/sounds/${f}`,
+    }));
+    res.json({ sounds });
+  } catch (err) {
+    console.error("SOUNDS LIST ERROR:", err);
+    res.status(500).json({ error: "فشل تحميل قائمة الأصوات" });
+  }
+});
 
 /* ===============================
    �💬 CHAT - Total unread count
