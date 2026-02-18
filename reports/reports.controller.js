@@ -201,7 +201,7 @@ exports.getLowStock = async (req, res) => {
       JOIN products p ON p.id = s.product_id
       JOIN warehouses w ON w.id = s.warehouse_id
       ${where}
-      ORDER BY s.quantity ASC
+      ORDER BY CASE WHEN s.quantity <= 0 THEN 1 ELSE 0 END, s.quantity ASC
       `,
       values,
     );

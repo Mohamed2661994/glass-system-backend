@@ -2696,7 +2696,9 @@ app.delete("/invoices/:id", async (req, res) => {
       [invoiceId],
     );
     if (cashDeleted.rowCount > 0) {
-      console.log(`🗑️ تم مسح قيد يومية مرتبط بالفاتورة ${invoiceId} (cash_in id: ${cashDeleted.rows.map(r => r.id).join(', ')})`);
+      console.log(
+        `🗑️ تم مسح قيد يومية مرتبط بالفاتورة ${invoiceId} (cash_in id: ${cashDeleted.rows.map((r) => r.id).join(", ")})`,
+      );
     }
 
     // 1️⃣ هات الحركات
