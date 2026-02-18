@@ -41,7 +41,10 @@ const chatUpload = multer({
     destination: (req, file, cb) => cb(null, uploadsDir),
     filename: (req, file, cb) => {
       const ext = path.extname(file.originalname) || ".jpg";
-      cb(null, `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+      cb(
+        null,
+        `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`,
+      );
     },
   }),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
@@ -6558,8 +6561,12 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
     console.log("✅ messages table ready");
 
     // Add type and file_url columns if they don't exist
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS type VARCHAR(20) DEFAULT 'text'`);
-    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT`);
+    await pool.query(
+      `ALTER TABLE messages ADD COLUMN IF NOT EXISTS type VARCHAR(20) DEFAULT 'text'`,
+    );
+    await pool.query(
+      `ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT`,
+    );
     await pool.query(`ALTER TABLE messages ALTER COLUMN content DROP NOT NULL`);
     console.log("✅ messages columns updated (type, file_url)");
   } catch (e) {
@@ -6584,7 +6591,7 @@ app.get("/chat/conversations", authMiddleware, async (req, res) => {
           LIMIT 1
         ) AS other_user,
         (
-          SELECT json_build_object('content', m.content, 'created_at', m.created_at, 'sender_id', m.sender_id)
+          SELECT json_build_object('content', m.content, 'created_at', m.created_at, 'sender_id', m.sender_id, 'type', m.type, 'file_url', m.file_url)
           FROM messages m
           WHERE m.conversation_id = c.id
           ORDER BY m.created_at DESC LIMIT 1
@@ -6686,6 +6693,7 @@ app.get(
       const result = await pool.query(
         `
       SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
+             m.type, m.file_url,
              u.username, u.full_name
       FROM messages m
       JOIN users u ON u.id = m.sender_id
