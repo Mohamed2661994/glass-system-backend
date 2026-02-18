@@ -240,6 +240,76 @@ exports.getLowStock = async (req, res) => {
 };
 
 /* ===============================
+   ⚠️ أصناف سالبة (كمية < 0)
+================================ */
+exports.getNegativeStock = async (req, res) => {
+  try {
+    const { warehouse_id } = req.query;
+
+    let where = "WHERE s.quantity < 0";
+    let values = [];
+    let index = 1;
+
+    if (warehouse_id) {
+      where += ` AND s.warehouse_id = $${index++}`;
+      values.push(warehouse_id);
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        p.barcode,
+        p.manufacturer AS manufacturer_name,
+        w.name AS warehouse_name,
+        s.quantity AS current_stock,
+        s.variant_id,
+        p.wholesale_package,
+        p.retail_package
+      FROM stock s
+      JOIN products p ON p.id = s.product_id
+      JOIN warehouses w ON w.id = s.warehouse_id
+      ${where}
+      ORDER BY s.quantity ASC
+      `,
+      values,
+    );
+
+    // Get all variants to map variant_id -> package names
+    const variantsRes = await pool.query(
+      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`,
+    );
+    const variantsById = {};
+    for (const v of variantsRes.rows) {
+      variantsById[v.id] = v;
+    }
+
+    const rows = result.rows.map((row) => {
+      const vid = Number(row.variant_id) || 0;
+      let pkgLabel;
+      if (vid === 0) {
+        pkgLabel =
+          [row.wholesale_package, row.retail_package]
+            .filter(Boolean)
+            .join(" / ") || "-";
+      } else {
+        const v = variantsById[vid];
+        pkgLabel = v
+          ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ")
+          : "-";
+      }
+      return { ...row, package_name: pkgLabel };
+    });
+
+    res.json(rows);
+  } catch (err) {
+    console.error("NEGATIVE STOCK ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+/* ===============================
    💰 قيمة المخزون
 ================================ */
 exports.getInventoryValue = async (req, res) => {

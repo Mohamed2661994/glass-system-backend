@@ -2845,7 +2845,7 @@ app.get("/dashboard/stats", async (req, res) => {
     const warehouseId = invoice_type === "retail" ? 1 : 2;
 
     // Run queries in parallel
-    const [salesToday, cashToday, lowStockCount] = await Promise.all([
+    const [salesToday, cashToday, lowStockCount, negativeStockCount] = await Promise.all([
       // Today's sales total
       pool.query(
         `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
@@ -2873,6 +2873,13 @@ app.get("/dashboard/stats", async (req, res) => {
          WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
         [warehouseId],
       ),
+      // Negative stock count (quantity < 0)
+      pool.query(
+        `SELECT COUNT(DISTINCT product_id) AS count
+         FROM stock
+         WHERE warehouse_id = $1 AND quantity < 0`,
+        [warehouseId],
+      ),
     ]);
 
     res.json({
@@ -2880,6 +2887,7 @@ app.get("/dashboard/stats", async (req, res) => {
       today_invoices_count: Number(salesToday.rows[0].count),
       today_cash: Number(cashToday.rows[0].total_cash),
       low_stock_count: Number(lowStockCount.rows[0].count),
+      negative_stock_count: Number(negativeStockCount.rows[0].count),
     });
   } catch (err) {
     console.error(err);
@@ -3465,86 +3473,94 @@ app.put("/admin/products/:id/toggle", async (req, res) => {
 // ==================== تعطيل أصناف بالجملة ====================
 
 // التحقق من أكواد الأصناف للتعطيل
-app.post("/admin/products/bulk-deactivate/validate", authMiddleware, async (req, res) => {
-  try {
-    const { codes } = req.body;
-    if (!codes || !codes.length) {
-      return res.status(400).json({ error: "لا توجد أكواد" });
-    }
-
-    const allProducts = await pool.query(
-      `SELECT id, name, barcode, is_active FROM products`
-    );
-    const barcodeMap = new Map();
-    allProducts.rows.forEach((p) => {
-      if (p.barcode) barcodeMap.set(p.barcode.trim(), p);
-    });
-
-    const matched = [];
-    const unmatched = [];
-    const alreadyInactive = [];
-
-    for (const code of codes) {
-      const trimmed = String(code).trim();
-      if (!trimmed) continue;
-      const product = barcodeMap.get(trimmed);
-      if (product) {
-        if (!product.is_active) {
-          alreadyInactive.push({
-            code: trimmed,
-            product_id: product.id,
-            product_name: product.name,
-          });
-        } else {
-          matched.push({
-            code: trimmed,
-            product_id: product.id,
-            product_name: product.name,
-          });
-        }
-      } else {
-        unmatched.push(trimmed);
+app.post(
+  "/admin/products/bulk-deactivate/validate",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const { codes } = req.body;
+      if (!codes || !codes.length) {
+        return res.status(400).json({ error: "لا توجد أكواد" });
       }
-    }
 
-    res.json({ matched, unmatched, alreadyInactive, total: codes.length });
-  } catch (err) {
-    console.error("Bulk deactivate validate error:", err);
-    res.status(500).json({ error: "فشل التحقق: " + err.message });
-  }
-});
+      const allProducts = await pool.query(
+        `SELECT id, name, barcode, is_active FROM products`,
+      );
+      const barcodeMap = new Map();
+      allProducts.rows.forEach((p) => {
+        if (p.barcode) barcodeMap.set(p.barcode.trim(), p);
+      });
+
+      const matched = [];
+      const unmatched = [];
+      const alreadyInactive = [];
+
+      for (const code of codes) {
+        const trimmed = String(code).trim();
+        if (!trimmed) continue;
+        const product = barcodeMap.get(trimmed);
+        if (product) {
+          if (!product.is_active) {
+            alreadyInactive.push({
+              code: trimmed,
+              product_id: product.id,
+              product_name: product.name,
+            });
+          } else {
+            matched.push({
+              code: trimmed,
+              product_id: product.id,
+              product_name: product.name,
+            });
+          }
+        } else {
+          unmatched.push(trimmed);
+        }
+      }
+
+      res.json({ matched, unmatched, alreadyInactive, total: codes.length });
+    } catch (err) {
+      console.error("Bulk deactivate validate error:", err);
+      res.status(500).json({ error: "فشل التحقق: " + err.message });
+    }
+  },
+);
 
 // تنفيذ التعطيل بالجملة
-app.post("/admin/products/bulk-deactivate/execute", authMiddleware, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { product_ids } = req.body;
-    if (!product_ids || !product_ids.length) {
-      return res.status(400).json({ error: "لا توجد أصناف للتعطيل" });
+app.post(
+  "/admin/products/bulk-deactivate/execute",
+  authMiddleware,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const { product_ids } = req.body;
+      if (!product_ids || !product_ids.length) {
+        return res.status(400).json({ error: "لا توجد أصناف للتعطيل" });
+      }
+
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `UPDATE products SET is_active = false WHERE id = ANY($1::int[]) AND is_active = true RETURNING id, name, barcode`,
+        [product_ids],
+      );
+
+      await client.query("COMMIT");
+
+      res.json({
+        success: true,
+        deactivated: result.rows.length,
+        items: result.rows,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Bulk deactivate execute error:", err);
+      res.status(500).json({ error: "فشل التعطيل: " + err.message });
+    } finally {
+      client.release();
     }
-
-    await client.query("BEGIN");
-
-    const result = await client.query(
-      `UPDATE products SET is_active = false WHERE id = ANY($1::int[]) AND is_active = true RETURNING id, name, barcode`,
-      [product_ids]
-    );
-
-    await client.query("COMMIT");
-
-    res.json({
-      success: true,
-      deactivated: result.rows.length,
-      items: result.rows,
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("Bulk deactivate execute error:", err);
-    res.status(500).json({ error: "فشل التعطيل: " + err.message });
-  } finally {
-    client.release();
-  }
-});
+  },
+);
 
 // بحث باركود صنف
 app.get("/products/by-barcode/:barcode", async (req, res) => {

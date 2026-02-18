@@ -5,6 +5,7 @@ const reports = require("./reports.controller");
 router.get("/inventory-summary", reports.getInventorySummary);
 router.get("/product-movement", reports.getProductMovement);
 router.get("/low-stock", reports.getLowStock);
+router.get("/negative-stock", reports.getNegativeStock);
 router.get("/inventory-value", reports.getInventoryValue);
 
 // ✅ أضف السطر ده
