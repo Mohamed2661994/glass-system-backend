@@ -4,6 +4,7 @@ require("dotenv").config();
 const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const multer = require("multer");
 const puppeteer = require("puppeteer");
 const pool = require("./db");
 const {
@@ -29,6 +30,23 @@ app.use(
 );
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
+
+// Chat uploads
+const uploadsDir = path.join(__dirname, "uploads", "chat");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+const chatUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadsDir),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname) || ".jpg";
+      cb(null, `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+});
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 app.use(express.json({ limit: "50mb" }));
 
@@ -100,7 +118,7 @@ pool
 // 📋 عمود تفضيلات اليوزر (JSON)
 pool
   .query(
-    `ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'`
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'`,
   )
   .then(() => console.log("✅ users.preferences column ready"))
   .catch((e) => console.error("❌ users.preferences column error:", e.message));
@@ -5977,7 +5995,7 @@ app.get("/user/preferences", authMiddleware, async (req, res) => {
   try {
     const { rows } = await pool.query(
       "SELECT preferences FROM users WHERE id = $1",
-      [req.user.id]
+      [req.user.id],
     );
     if (rows.length === 0) return res.json({});
     res.json(rows[0].preferences || {});
@@ -5993,10 +6011,10 @@ app.put("/user/preferences", authMiddleware, async (req, res) => {
     if (!prefs || typeof prefs !== "object") {
       return res.status(400).json({ error: "بيانات غير صالحة" });
     }
-    await pool.query(
-      "UPDATE users SET preferences = $1 WHERE id = $2",
-      [JSON.stringify(prefs), req.user.id]
-    );
+    await pool.query("UPDATE users SET preferences = $1 WHERE id = $2", [
+      JSON.stringify(prefs),
+      req.user.id,
+    ]);
     res.json({ success: true });
   } catch (err) {
     console.error("SAVE PREFERENCES ERROR:", err);
@@ -6538,6 +6556,12 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
       )
     `);
     console.log("✅ messages table ready");
+
+    // Add type and file_url columns if they don't exist
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS type VARCHAR(20) DEFAULT 'text'`);
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT`);
+    await pool.query(`ALTER TABLE messages ALTER COLUMN content DROP NOT NULL`);
+    console.log("✅ messages columns updated (type, file_url)");
   } catch (e) {
     console.error("❌ chat tables error:", e.message);
   }
@@ -6675,6 +6699,78 @@ app.get(
     } catch (err) {
       console.error("GET MESSAGES ERROR:", err);
       res.status(500).json({ error: "فشل تحميل الرسايل" });
+    }
+  },
+);
+
+/* ===============================
+   💬 CHAT - Upload file/image for chat
+================================ */
+app.post(
+  "/chat/conversations/:id/upload",
+  authMiddleware,
+  chatUpload.single("file"),
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const convId = Number(req.params.id);
+
+      if (!req.file) {
+        return res.status(400).json({ error: "لم يتم رفع ملف" });
+      }
+
+      // Verify participant
+      const participant = await pool.query(
+        "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+        [convId, userId],
+      );
+      if (!participant.rows.length) {
+        return res.status(403).json({ error: "غير مصرح" });
+      }
+
+      const fileUrl = `/uploads/chat/${req.file.filename}`;
+      const isImage = req.file.mimetype.startsWith("image/");
+      const msgType = isImage ? "image" : "file";
+
+      const msgResult = await pool.query(
+        "INSERT INTO messages (conversation_id, sender_id, content, type, file_url) VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        [convId, userId, req.file.originalname, msgType, fileUrl],
+      );
+
+      await pool.query(
+        "UPDATE conversations SET updated_at = NOW() WHERE id = $1",
+        [convId],
+      );
+
+      const senderResult = await pool.query(
+        "SELECT username, full_name FROM users WHERE id = $1",
+        [userId],
+      );
+
+      const message = {
+        ...msgResult.rows[0],
+        username: senderResult.rows[0].username,
+        full_name: senderResult.rows[0].full_name,
+      };
+
+      const otherUser = await pool.query(
+        "SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2",
+        [convId, userId],
+      );
+
+      const io = req.app.get("io");
+      if (io && otherUser.rows.length) {
+        const otherUserId = otherUser.rows[0].user_id;
+        io.to(`user_${otherUserId}`).emit("new_message", {
+          conversation_id: convId,
+          message,
+        });
+      }
+
+      res.json({ success: true, data: message });
+    } catch (err) {
+      console.error("CHAT UPLOAD ERROR:", err);
+      res.status(500).json({ error: "فشل رفع الملف" });
     }
   },
 );
