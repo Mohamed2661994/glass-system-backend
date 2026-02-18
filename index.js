@@ -4035,7 +4035,7 @@ app.post("/admin/manufacturers/seed", async (req, res) => {
 
 // ==================== End Manufacturers ====================
 
-app.post("/stock/transfer", async (req, res) => {
+app.post("/stock/transfer", authMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     const { from_branch_id, to_branch_id, items } = req.body;
@@ -4118,6 +4118,29 @@ app.post("/stock/transfer", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    // 🔔 Notification to destination branch
+    try {
+      const senderRes = await pool.query("SELECT full_name FROM users WHERE id = $1", [req.user.id]);
+      const senderName = senderRes.rows[0]?.full_name || "مستخدم";
+      const title = "تحويل مخزون جديد";
+      const message = `قام ${senderName} بتحويل ${items.length} صنف إلى فرعكم`;
+
+      await pool.query(
+        `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [title, message, req.user.id, to_branch_id, "stock_transfer", null]
+      );
+
+      const io = req.app.get("io");
+      io.to(`branch_${to_branch_id}`).emit("new_notification", {
+        title, message, type: "stock_transfer", reference_id: null,
+      });
+
+      sendPushToBranch(to_branch_id, title, message, { type: "stock_transfer" });
+    } catch (notifErr) {
+      console.error("TRANSFER NOTIFICATION ERROR:", notifErr);
+    }
 
     res.json({ success: true });
   } catch (err) {
@@ -5120,7 +5143,7 @@ FROM products
   }
 });
 
-app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
+app.post("/stock/wholesale-to-retail/execute", authMiddleware, async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -5338,6 +5361,29 @@ app.post("/stock/wholesale-to-retail/execute", async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    // 🔔 Notification to destination branch
+    try {
+      const senderRes = await pool.query("SELECT full_name FROM users WHERE id = $1", [req.user.id]);
+      const senderName = senderRes.rows[0]?.full_name || "مستخدم";
+      const title = "تحويل مخزون جديد";
+      const message = `قام ${senderName} بتحويل ${items.length} صنف (جملة ← قطاعي) - رقم #${transferId}`;
+
+      await pool.query(
+        `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [title, message, req.user.id, to_branch_id, "stock_transfer", transferId]
+      );
+
+      const io = req.app.get("io");
+      io.to(`branch_${to_branch_id}`).emit("new_notification", {
+        title, message, type: "stock_transfer", reference_id: transferId,
+      });
+
+      sendPushToBranch(to_branch_id, title, message, { type: "stock_transfer", transfer_id: transferId });
+    } catch (notifErr) {
+      console.error("TRANSFER NOTIFICATION ERROR:", notifErr);
+    }
 
     res.json({
       success: true,
@@ -6952,6 +6998,38 @@ app.post(
 /* ===============================
    � PUSH - Helper: send push to user
 ================================ */
+async function sendPushToBranch(targetBranchId, title, body, data = {}) {
+  try {
+    // Get all users in the target branch
+    const usersRes = await pool.query(
+      "SELECT id FROM users WHERE branch_id = $1",
+      [targetBranchId]
+    );
+    for (const user of usersRes.rows) {
+      const subs = await pool.query(
+        "SELECT * FROM push_subscriptions WHERE user_id = $1",
+        [user.id]
+      );
+      const payload = JSON.stringify({ title, body, data: { ...data, url: "/" } });
+      for (const sub of subs.rows) {
+        const pushSub = {
+          endpoint: sub.endpoint,
+          keys: { p256dh: sub.p256dh, auth: sub.auth },
+        };
+        try {
+          await webPush.sendNotification(pushSub, payload);
+        } catch (err) {
+          if (err.statusCode === 410 || err.statusCode === 404) {
+            await pool.query("DELETE FROM push_subscriptions WHERE id = $1", [sub.id]);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("PUSH TO BRANCH ERROR:", err);
+  }
+}
+
 async function sendPushToUser(targetUserId, senderName, body, convId) {
   try {
     const subs = await pool.query(
