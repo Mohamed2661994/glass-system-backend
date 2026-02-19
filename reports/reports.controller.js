@@ -665,12 +665,36 @@ exports.stockDebug = async (req, res) => {
        ORDER BY id`
     );
 
+    // Check DB constraints on stock table
+    const constraints = await pool.query(
+      `SELECT conname, contype, pg_get_constraintdef(oid) AS def
+       FROM pg_constraint
+       WHERE conrelid = 'stock'::regclass`
+    );
+
+    // Check triggers on stock table
+    const triggers = await pool.query(
+      `SELECT tgname, pg_get_triggerdef(oid) as def
+       FROM pg_trigger
+       WHERE tgrelid = 'stock'::regclass AND NOT tgisinternal`
+    );
+
+    // Check column defaults/type for quantity
+    const colInfo = await pool.query(
+      `SELECT column_name, data_type, column_default, is_nullable
+       FROM information_schema.columns
+       WHERE table_name = 'stock' AND column_name = 'quantity'`
+    );
+
     res.json({
       stock_range: range.rows[0],
       lowest_10: lowestSample.rows,
       invoice_395_negative_items: inv395neg.rows,
       invoice_395_all_movements: inv395moves.rows,
       opening_invoices: openingInvoices.rows,
+      db_constraints: constraints.rows,
+      db_triggers: triggers.rows,
+      quantity_column_info: colInfo.rows[0],
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
