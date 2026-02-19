@@ -2845,42 +2845,43 @@ app.get("/dashboard/stats", async (req, res) => {
     const warehouseId = invoice_type === "retail" ? 1 : 2;
 
     // Run queries in parallel
-    const [salesToday, cashToday, lowStockCount, negativeStockCount] = await Promise.all([
-      // Today's sales total
-      pool.query(
-        `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
+    const [salesToday, cashToday, lowStockCount, negativeStockCount] =
+      await Promise.all([
+        // Today's sales total
+        pool.query(
+          `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
          FROM invoices
          WHERE invoice_type = $1
            AND movement_type = 'sale'
            AND is_return = false
            AND created_at >= CURRENT_DATE
            AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-        [invoice_type],
-      ),
-      // Today's cash collected
-      pool.query(
-        `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
+          [invoice_type],
+        ),
+        // Today's cash collected
+        pool.query(
+          `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
          FROM invoices
          WHERE invoice_type = $1
            AND created_at >= CURRENT_DATE
            AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-        [invoice_type],
-      ),
-      // Low stock count (quantity <= 5)
-      pool.query(
-        `SELECT COUNT(DISTINCT product_id) AS count
+          [invoice_type],
+        ),
+        // Low stock count (quantity <= 5)
+        pool.query(
+          `SELECT COUNT(DISTINCT product_id) AS count
          FROM stock
          WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
-        [warehouseId],
-      ),
-      // Negative stock count (quantity < 0)
-      pool.query(
-        `SELECT COUNT(DISTINCT product_id) AS count
+          [warehouseId],
+        ),
+        // Negative stock count (quantity < 0)
+        pool.query(
+          `SELECT COUNT(DISTINCT product_id) AS count
          FROM stock
          WHERE warehouse_id = $1 AND quantity < 0`,
-        [warehouseId],
-      ),
-    ]);
+          [warehouseId],
+        ),
+      ]);
 
     res.json({
       today_sales: Number(salesToday.rows[0].total_sales),

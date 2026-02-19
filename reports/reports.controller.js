@@ -255,6 +255,12 @@ exports.getNegativeStock = async (req, res) => {
       values.push(warehouse_id);
     }
 
+    // Debug: check min quantity
+    const debugRange = await pool.query(
+      "SELECT MIN(quantity) as min_qty, MAX(quantity) as max_qty, COUNT(*) as total, COUNT(*) FILTER (WHERE quantity < 0) as neg_count FROM stock"
+    );
+    console.log("STOCK DEBUG:", debugRange.rows[0]);
+
     const result = await pool.query(
       `
       SELECT
@@ -275,6 +281,8 @@ exports.getNegativeStock = async (req, res) => {
       `,
       values,
     );
+
+    console.log("NEGATIVE STOCK QUERY RETURNED:", result.rows.length, "rows");
 
     // Get all variants to map variant_id -> package names
     const variantsRes = await pool.query(
