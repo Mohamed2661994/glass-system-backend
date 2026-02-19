@@ -255,12 +255,6 @@ exports.getNegativeStock = async (req, res) => {
       values.push(warehouse_id);
     }
 
-    // Debug: check min quantity
-    const debugRange = await pool.query(
-      "SELECT MIN(quantity) as min_qty, MAX(quantity) as max_qty, COUNT(*) as total, COUNT(*) FILTER (WHERE quantity < 0) as neg_count FROM stock"
-    );
-    console.log("STOCK DEBUG:", debugRange.rows[0]);
-
     const result = await pool.query(
       `
       SELECT
@@ -281,8 +275,6 @@ exports.getNegativeStock = async (req, res) => {
       `,
       values,
     );
-
-    console.log("NEGATIVE STOCK QUERY RETURNED:", result.rows.length, "rows");
 
     // Get all variants to map variant_id -> package names
     const variantsRes = await pool.query(
@@ -627,5 +619,29 @@ exports.getCustomerDebtDetails = async (req, res) => {
   } catch (err) {
     console.error("CUSTOMER DEBT DETAILS ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
+
+/* ===============================
+   🔍 Debug stock table stats
+================================ */
+exports.stockDebug = async (req, res) => {
+  try {
+    const range = await pool.query(
+      "SELECT MIN(quantity) as min_qty, MAX(quantity) as max_qty, COUNT(*) as total, COUNT(*) FILTER (WHERE quantity < 0) as neg_count, COUNT(*) FILTER (WHERE quantity = 0) as zero_count FROM stock"
+    );
+    const negSample = await pool.query(
+      "SELECT s.quantity, s.warehouse_id, s.product_id, p.name, p.barcode FROM stock s JOIN products p ON p.id = s.product_id WHERE s.quantity < 0 ORDER BY s.quantity LIMIT 10"
+    );
+    const lowestSample = await pool.query(
+      "SELECT s.quantity, s.warehouse_id, s.product_id, p.name, p.barcode FROM stock s JOIN products p ON p.id = s.product_id ORDER BY s.quantity ASC LIMIT 10"
+    );
+    res.json({
+      stock_range: range.rows[0],
+      negative_sample: negSample.rows,
+      lowest_10: lowestSample.rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 };
