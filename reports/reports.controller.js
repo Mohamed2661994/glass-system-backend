@@ -630,16 +630,47 @@ exports.stockDebug = async (req, res) => {
     const range = await pool.query(
       "SELECT MIN(quantity) as min_qty, MAX(quantity) as max_qty, COUNT(*) as total, COUNT(*) FILTER (WHERE quantity < 0) as neg_count, COUNT(*) FILTER (WHERE quantity = 0) as zero_count FROM stock"
     );
-    const negSample = await pool.query(
-      "SELECT s.quantity, s.warehouse_id, s.product_id, p.name, p.barcode FROM stock s JOIN products p ON p.id = s.product_id WHERE s.quantity < 0 ORDER BY s.quantity LIMIT 10"
-    );
     const lowestSample = await pool.query(
       "SELECT s.quantity, s.warehouse_id, s.product_id, p.name, p.barcode FROM stock s JOIN products p ON p.id = s.product_id ORDER BY s.quantity ASC LIMIT 10"
     );
+
+    // Check invoice 395 items with negative quantities
+    const inv395neg = await pool.query(
+      `SELECT ii.product_id, ii.product_name, ii.quantity as invoice_qty, ii.price,
+              s.quantity as current_stock, p.barcode
+       FROM invoice_items ii
+       JOIN products p ON p.id = ii.product_id
+       LEFT JOIN stock s ON s.product_id = ii.product_id AND s.warehouse_id = 1 AND s.variant_id = 0
+       WHERE ii.invoice_id = 395 AND ii.quantity < 0
+       ORDER BY ii.quantity ASC
+       LIMIT 20`
+    );
+
+    // Check stock_movements for those negative items
+    const inv395moves = await pool.query(
+      `SELECT sm.product_id, p.name, sm.quantity, sm.movement_type, sm.invoice_id
+       FROM stock_movements sm
+       JOIN products p ON p.id = sm.product_id
+       WHERE sm.product_id IN (
+         SELECT product_id FROM invoice_items WHERE invoice_id = 395 AND quantity < 0
+       )
+       ORDER BY sm.product_id, sm.invoice_id`
+    );
+
+    // Count how many invoices exist with type 'purchase' and name 'رصيد أول المدة'
+    const openingInvoices = await pool.query(
+      `SELECT id, invoice_date, subtotal, branch_id
+       FROM invoices
+       WHERE customer_name = 'رصيد أول المدة'
+       ORDER BY id`
+    );
+
     res.json({
       stock_range: range.rows[0],
-      negative_sample: negSample.rows,
       lowest_10: lowestSample.rows,
+      invoice_395_negative_items: inv395neg.rows,
+      invoice_395_all_movements: inv395moves.rows,
+      opening_invoices: openingInvoices.rows,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
