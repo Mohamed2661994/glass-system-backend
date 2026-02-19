@@ -190,6 +190,16 @@ pool
   .then(() => console.log("✅ users.full_name column ready"))
   .catch((e) => console.error("❌ users.full_name column error:", e.message));
 
+// إضافة عمود has_wholesale للأصناف
+pool
+  .query(
+    `ALTER TABLE products ADD COLUMN IF NOT EXISTS has_wholesale BOOLEAN DEFAULT true`,
+  )
+  .then(() => console.log("✅ products.has_wholesale column ready"))
+  .catch((e) =>
+    console.error("❌ products.has_wholesale column error:", e.message),
+  );
+
 // إضافة عمود المرتجع للفواتير
 pool
   .query(
@@ -402,6 +412,7 @@ app.get("/products", async (req, res) => {
       p.retail_package,
       p.manufacturer,
       p.description,
+      p.has_wholesale,
       CASE
         WHEN $1 = 'wholesale' THEN p.wholesale_price
         ELSE p.retail_price
@@ -414,7 +425,7 @@ app.get("/products", async (req, res) => {
       AND s.warehouse_id = $2
     WHERE p.is_active = true
     GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.description, p.wholesale_price, p.retail_price, p.discount_amount
+             p.manufacturer, p.description, p.has_wholesale, p.wholesale_price, p.retail_price, p.discount_amount
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
@@ -431,6 +442,7 @@ app.get("/products", async (req, res) => {
       p.retail_package,
       p.manufacturer,
       p.description,
+      p.has_wholesale,
       CASE
         WHEN $1 = 'wholesale' THEN p.purchase_price
         ELSE p.retail_purchase_price
@@ -443,7 +455,7 @@ app.get("/products", async (req, res) => {
       AND s.warehouse_id = $2
     WHERE p.is_active = true
     GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.description, p.purchase_price, p.retail_purchase_price, p.discount_amount
+             p.manufacturer, p.description, p.has_wholesale, p.purchase_price, p.retail_purchase_price, p.discount_amount
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
@@ -3027,6 +3039,7 @@ app.get("/admin/products", async (req, res) => {
   p.discount_amount,
   p.description,
   p.is_active,
+  p.has_wholesale,
   COALESCE(v.variant_count, 0) AS variant_count
 FROM products p
 LEFT JOIN (
@@ -3225,13 +3238,22 @@ app.post("/admin/opening-stock", async (req, res) => {
 
 // مسح جميع الأصناف
 app.delete("/admin/products/all", async (req, res) => {
+  const client = await pool.connect();
   try {
-    await pool.query("DELETE FROM product_variants");
-    await pool.query("DELETE FROM products");
+    await client.query("BEGIN");
+    await client.query("DELETE FROM product_variants");
+    await client.query("DELETE FROM stock_movements WHERE product_id IN (SELECT id FROM products)");
+    await client.query("DELETE FROM invoice_items WHERE product_id IN (SELECT id FROM products)");
+    await client.query("DELETE FROM stock WHERE product_id IN (SELECT id FROM products)");
+    await client.query("DELETE FROM products");
+    await client.query("COMMIT");
     res.json({ message: "تم مسح جميع الأصناف بنجاح" });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
-    res.status(500).json({ error: "فشل مسح الأصناف" });
+    res.status(500).json({ error: "فشل مسح الأصناف", message: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -3255,21 +3277,29 @@ app.get("/admin/products/:id", async (req, res) => {
 // مسح صنف واحد
 app.delete("/admin/products/:id", async (req, res) => {
   const { id } = req.params;
+  const client = await pool.connect();
   try {
-    await pool.query("DELETE FROM product_variants WHERE product_id = $1", [
-      id,
-    ]);
-    const result = await pool.query(
+    await client.query("BEGIN");
+    await client.query("DELETE FROM product_variants WHERE product_id = $1", [id]);
+    await client.query("DELETE FROM stock_movements WHERE product_id = $1", [id]);
+    await client.query("DELETE FROM invoice_items WHERE product_id = $1", [id]);
+    await client.query("DELETE FROM stock WHERE product_id = $1", [id]);
+    const result = await client.query(
       "DELETE FROM products WHERE id = $1 RETURNING id",
       [id],
     );
     if (result.rowCount === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ error: "الصنف غير موجود" });
     }
+    await client.query("COMMIT");
     res.json({ message: "تم مسح الصنف بنجاح" });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(err);
-    res.status(500).json({ error: "فشل مسح الصنف" });
+    res.status(500).json({ error: "فشل مسح الصنف", message: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -3288,18 +3318,16 @@ app.post("/admin/products", async (req, res) => {
       barcode,
       discount_amount = 0,
       description = "",
+      has_wholesale = true,
     } = req.body;
     const nameNormalized = normalizeNumbers(name);
-    const wholesalePackageNormalized = normalizeNumbers(wholesale_package);
+    const wholesalePackageNormalized = normalizeNumbers(wholesale_package || "");
     const retailPackageNormalized = normalizeNumbers(retail_package);
 
     if (
       !name ||
-      !wholesale_package ||
       !retail_package ||
-      purchase_price === undefined ||
       retail_purchase_price === undefined ||
-      wholesale_price === undefined ||
       retail_price === undefined
     ) {
       return res.status(400).json({ error: "بيانات ناقصة" });
@@ -3319,9 +3347,10 @@ app.post("/admin/products", async (req, res) => {
   wholesale_price,
   retail_price,
   discount_amount,
-  description
+  description,
+  has_wholesale
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 RETURNING *
 
       `,
@@ -3332,11 +3361,12 @@ RETURNING *
         manufacturer,
         retail_purchase_price,
         barcode || null,
-        purchase_price,
-        wholesale_price,
+        purchase_price || 0,
+        wholesale_price || 0,
         retail_price,
         discount_amount,
         description || "",
+        has_wholesale,
       ],
     );
 
@@ -3382,18 +3412,16 @@ app.put("/admin/products/:id", async (req, res) => {
       retail_price,
       discount_amount = 0,
       description = "",
+      has_wholesale = true,
     } = req.body;
     const nameNormalized = normalizeNumbers(name);
-    const wholesalePackageNormalized = normalizeNumbers(wholesale_package);
+    const wholesalePackageNormalized = normalizeNumbers(wholesale_package || "");
     const retailPackageNormalized = normalizeNumbers(retail_package);
 
     if (
       !name ||
-      !wholesale_package ||
       !retail_package ||
-      purchase_price === undefined ||
       retail_purchase_price === undefined ||
-      wholesale_price === undefined ||
       retail_price === undefined
     ) {
       return res.status(400).json({ error: "بيانات ناقصة" });
@@ -3413,8 +3441,9 @@ SET
   wholesale_price = $8,
   retail_price = $9,
   discount_amount = $10,
-  description = $11
-WHERE id = $12
+  description = $11,
+  has_wholesale = $12
+WHERE id = $13
 RETURNING *
       `,
       [
@@ -3423,12 +3452,13 @@ RETURNING *
         retailPackageNormalized,
         manufacturer,
         barcode || null,
-        purchase_price,
+        purchase_price || 0,
         retail_purchase_price,
-        wholesale_price,
+        wholesale_price || 0,
         retail_price,
         discount_amount,
         description || "",
+        has_wholesale,
         id,
       ],
     );
