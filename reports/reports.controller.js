@@ -625,7 +625,3 @@ exports.getCustomerDebtDetails = async (req, res) => {
     res.status(500).json({ error: "Server error", details: err.message });
   }
 };
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
