@@ -2874,11 +2874,15 @@ app.get("/dashboard/stats", async (req, res) => {
          WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
           [warehouseId],
         ),
-        // Negative stock count (quantity < 0)
+        // Negative stock count — calculated from stock_movements
         pool.query(
-          `SELECT COUNT(DISTINCT product_id) AS count
-         FROM stock
-         WHERE warehouse_id = $1 AND quantity < 0`,
+          `SELECT COUNT(*) AS count FROM (
+            SELECT product_id
+            FROM stock_movements
+            WHERE warehouse_id = $1
+            GROUP BY product_id, variant_id
+            HAVING SUM(quantity) < 0
+          ) neg`,
           [warehouseId],
         ),
       ]);

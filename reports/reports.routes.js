@@ -6,7 +6,6 @@ router.get("/inventory-summary", reports.getInventorySummary);
 router.get("/product-movement", reports.getProductMovement);
 router.get("/low-stock", reports.getLowStock);
 router.get("/negative-stock", reports.getNegativeStock);
-router.get("/stock-debug", reports.stockDebug);
 router.get("/inventory-value", reports.getInventoryValue);
 
 // ✅ أضف السطر ده

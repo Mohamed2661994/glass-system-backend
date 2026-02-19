@@ -241,17 +241,18 @@ exports.getLowStock = async (req, res) => {
 
 /* ===============================
    ⚠️ أصناف سالبة (كمية < 0)
+   — يحسب الرصيد الفعلي من حركات المخزون
 ================================ */
 exports.getNegativeStock = async (req, res) => {
   try {
     const { warehouse_id } = req.query;
 
-    let where = "WHERE s.quantity < 0";
+    let warehouseFilter = "";
     let values = [];
     let index = 1;
 
     if (warehouse_id) {
-      where += ` AND s.warehouse_id = $${index++}`;
+      warehouseFilter = `AND sm.warehouse_id = $${index++}`;
       values.push(warehouse_id);
     }
 
@@ -263,15 +264,18 @@ exports.getNegativeStock = async (req, res) => {
         p.barcode,
         p.manufacturer AS manufacturer_name,
         w.name AS warehouse_name,
-        s.quantity AS current_stock,
-        s.variant_id,
+        COALESCE(SUM(sm.quantity), 0) AS current_stock,
+        sm.variant_id,
         p.wholesale_package,
         p.retail_package
-      FROM stock s
-      JOIN products p ON p.id = s.product_id
-      JOIN warehouses w ON w.id = s.warehouse_id
-      ${where}
-      ORDER BY s.quantity ASC
+      FROM stock_movements sm
+      JOIN products p ON p.id = sm.product_id
+      JOIN warehouses w ON w.id = sm.warehouse_id
+      WHERE 1=1 ${warehouseFilter}
+      GROUP BY p.id, p.name, p.barcode, p.manufacturer, w.id, w.name,
+               sm.variant_id, p.wholesale_package, p.retail_package
+      HAVING COALESCE(SUM(sm.quantity), 0) < 0
+      ORDER BY COALESCE(SUM(sm.quantity), 0) ASC
       `,
       values,
     );
@@ -621,81 +625,6 @@ exports.getCustomerDebtDetails = async (req, res) => {
     res.status(500).json({ error: "Server error", details: err.message });
   }
 };
-
-/* ===============================
-   🔍 Debug stock table stats
-================================ */
-exports.stockDebug = async (req, res) => {
-  try {
-    const range = await pool.query(
-      "SELECT MIN(quantity) as min_qty, MAX(quantity) as max_qty, COUNT(*) as total, COUNT(*) FILTER (WHERE quantity < 0) as neg_count, COUNT(*) FILTER (WHERE quantity = 0) as zero_count FROM stock"
-    );
-    const lowestSample = await pool.query(
-      "SELECT s.quantity, s.warehouse_id, s.product_id, p.name, p.barcode FROM stock s JOIN products p ON p.id = s.product_id ORDER BY s.quantity ASC LIMIT 10"
-    );
-
-    // Check invoice 395 items with negative quantities
-    const inv395neg = await pool.query(
-      `SELECT ii.product_id, ii.product_name, ii.quantity as invoice_qty, ii.price,
-              s.quantity as current_stock, p.barcode
-       FROM invoice_items ii
-       JOIN products p ON p.id = ii.product_id
-       LEFT JOIN stock s ON s.product_id = ii.product_id AND s.warehouse_id = 1 AND s.variant_id = 0
-       WHERE ii.invoice_id = 395 AND ii.quantity < 0
-       ORDER BY ii.quantity ASC
-       LIMIT 20`
-    );
-
-    // Check stock_movements for those negative items
-    const inv395moves = await pool.query(
-      `SELECT sm.product_id, p.name, sm.quantity, sm.movement_type, sm.invoice_id
-       FROM stock_movements sm
-       JOIN products p ON p.id = sm.product_id
-       WHERE sm.product_id IN (
-         SELECT product_id FROM invoice_items WHERE invoice_id = 395 AND quantity < 0
-       )
-       ORDER BY sm.product_id, sm.invoice_id`
-    );
-
-    // Count how many invoices exist with type 'purchase' and name 'رصيد أول المدة'
-    const openingInvoices = await pool.query(
-      `SELECT id, invoice_date, subtotal, branch_id
-       FROM invoices
-       WHERE customer_name = 'رصيد أول المدة'
-       ORDER BY id`
-    );
-
-    // Check DB constraints on stock table
-    const constraints = await pool.query(
-      `SELECT conname, contype, pg_get_constraintdef(oid) AS def
-       FROM pg_constraint
-       WHERE conrelid = 'stock'::regclass`
-    );
-
-    // Check triggers on stock table
-    const triggers = await pool.query(
-      `SELECT tgname, pg_get_triggerdef(oid) as def
-       FROM pg_trigger
-       WHERE tgrelid = 'stock'::regclass AND NOT tgisinternal`
-    );
-
-    // Check column defaults/type for quantity
-    const colInfo = await pool.query(
-      `SELECT column_name, data_type, column_default, is_nullable
-       FROM information_schema.columns
-       WHERE table_name = 'stock' AND column_name = 'quantity'`
-    );
-
-    res.json({
-      stock_range: range.rows[0],
-      lowest_10: lowestSample.rows,
-      invoice_395_negative_items: inv395neg.rows,
-      invoice_395_all_movements: inv395moves.rows,
-      opening_invoices: openingInvoices.rows,
-      db_constraints: constraints.rows,
-      db_triggers: triggers.rows,
-      quantity_column_info: colInfo.rows[0],
-    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
