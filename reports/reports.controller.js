@@ -177,7 +177,7 @@ exports.getLowStock = async (req, res) => {
   try {
     const { limit_quantity = 5, warehouse_id } = req.query;
 
-    let where = "WHERE s.quantity <= $1";
+    let where = "WHERE s.quantity <= $1 AND p.is_active = true";
     let values = [limit_quantity];
     let index = 2;
 
@@ -271,7 +271,7 @@ exports.getNegativeStock = async (req, res) => {
       FROM stock_movements sm
       JOIN products p ON p.id = sm.product_id
       JOIN warehouses w ON w.id = sm.warehouse_id
-      WHERE 1=1 ${warehouseFilter}
+      WHERE p.is_active = true ${warehouseFilter}
       GROUP BY p.id, p.name, p.barcode, p.manufacturer, w.id, w.name,
                sm.variant_id, p.wholesale_package, p.retail_package
       HAVING COALESCE(SUM(sm.quantity), 0) < 0
