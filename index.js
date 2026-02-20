@@ -3242,9 +3242,15 @@ app.delete("/admin/products/all", async (req, res) => {
   try {
     await client.query("BEGIN");
     await client.query("DELETE FROM product_variants");
-    await client.query("DELETE FROM stock_movements WHERE product_id IN (SELECT id FROM products)");
-    await client.query("DELETE FROM invoice_items WHERE product_id IN (SELECT id FROM products)");
-    await client.query("DELETE FROM stock WHERE product_id IN (SELECT id FROM products)");
+    await client.query(
+      "DELETE FROM stock_movements WHERE product_id IN (SELECT id FROM products)",
+    );
+    await client.query(
+      "DELETE FROM invoice_items WHERE product_id IN (SELECT id FROM products)",
+    );
+    await client.query(
+      "DELETE FROM stock WHERE product_id IN (SELECT id FROM products)",
+    );
     await client.query("DELETE FROM products");
     await client.query("COMMIT");
     res.json({ message: "تم مسح جميع الأصناف بنجاح" });
@@ -3280,8 +3286,12 @@ app.delete("/admin/products/:id", async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query("DELETE FROM product_variants WHERE product_id = $1", [id]);
-    await client.query("DELETE FROM stock_movements WHERE product_id = $1", [id]);
+    await client.query("DELETE FROM product_variants WHERE product_id = $1", [
+      id,
+    ]);
+    await client.query("DELETE FROM stock_movements WHERE product_id = $1", [
+      id,
+    ]);
     await client.query("DELETE FROM invoice_items WHERE product_id = $1", [id]);
     await client.query("DELETE FROM stock WHERE product_id = $1", [id]);
     const result = await client.query(
@@ -3321,7 +3331,9 @@ app.post("/admin/products", async (req, res) => {
       has_wholesale = true,
     } = req.body;
     const nameNormalized = normalizeNumbers(name);
-    const wholesalePackageNormalized = normalizeNumbers(wholesale_package || "");
+    const wholesalePackageNormalized = normalizeNumbers(
+      wholesale_package || "",
+    );
     const retailPackageNormalized = normalizeNumbers(retail_package);
 
     if (
@@ -3415,7 +3427,9 @@ app.put("/admin/products/:id", async (req, res) => {
       has_wholesale = true,
     } = req.body;
     const nameNormalized = normalizeNumbers(name);
-    const wholesalePackageNormalized = normalizeNumbers(wholesale_package || "");
+    const wholesalePackageNormalized = normalizeNumbers(
+      wholesale_package || "",
+    );
     const retailPackageNormalized = normalizeNumbers(retail_package);
 
     if (
