@@ -33,6 +33,11 @@ function normalizeNumbers(text) {
   return text.replace(/[٠-٩]/g, (d) => english[arabic.indexOf(d)]);
 }
 
+/** Return today's date as YYYY-MM-DD in Africa/Cairo timezone */
+function getCairoDate() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Cairo" });
+}
+
 const app = express();
 app.use(
   cors({
@@ -831,7 +836,7 @@ VALUES
         branch_id,
         invoice_type,
         movement_type,
-        invoice_date || new Date(),
+        invoice_date || getCairoDate(),
         customerId,
         customer_name,
         customer_phone,
@@ -1035,7 +1040,7 @@ VALUES
           paid_amount,
           remaining_amount,
           `فاتورة جملة رقم #${invoiceId}`,
-          invoice_date || new Date(),
+          invoice_date || getCairoDate(),
         ],
       );
       journal_posted = true;
@@ -1172,7 +1177,7 @@ app.post("/invoices/retail", async (req, res) => {
       [
         branch_id,
         movement_type,
-        invoice_date || new Date(),
+        invoice_date || getCairoDate(),
         customerId,
         customer_name,
         customer_phone,
@@ -1307,7 +1312,7 @@ app.post("/invoices/retail", async (req, res) => {
           Number(paid_amount),
           remaining_amount,
           `فاتورة قطاعي رقم #${invoiceId}`,
-          invoice_date || new Date(),
+          invoice_date || getCairoDate(),
         ],
       );
       journal_posted = true;
@@ -3173,7 +3178,7 @@ app.post("/admin/opening-stock", async (req, res) => {
         $3, $3, 0, 'paid',
         false, false)
       RETURNING id`,
-      [branch_id, invoice_date || new Date(), subtotal],
+      [branch_id, invoice_date || getCairoDate(), subtotal],
     );
 
     const invoiceId = invoiceRes.rows[0].id;
@@ -4954,7 +4959,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
   `,
       [
         Number(branch_id), // 1
-        transaction_date || new Date().toISOString().slice(0, 10), // 2
+        transaction_date || getCairoDate(), // 2
         source_type || "manual", // 3
         customer_name || "وارد يدوي", // 4
         description || "", // 5

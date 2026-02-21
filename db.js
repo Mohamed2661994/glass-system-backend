@@ -10,4 +10,10 @@ const pool = new Pool({
   ssl: process.env.DB_SSL === "true" ? { rejectUnauthorized: false } : false,
 });
 
+// Set timezone to Africa/Cairo for every new connection
+// so CURRENT_DATE, NOW(), etc. return Egypt local time
+pool.on("connect", (client) => {
+  client.query("SET timezone = 'Africa/Cairo'");
+});
+
 module.exports = pool;
