@@ -138,6 +138,7 @@ exports.getProductMovement = async (req, res) => {
         sm.movement_type,
         sm.quantity,
         sm.note,
+        sm.invoice_id,
 
         -- اسم العميل أو المورد من الفاتورة
         i.customer_name AS party_name,
