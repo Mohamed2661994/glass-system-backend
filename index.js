@@ -1104,9 +1104,9 @@ app.post("/invoices/retail", async (req, res) => {
     await client.query("BEGIN");
 
     const totalWithPrevious =
-      Number(final_total) + Number(previous_balance || 0);
+      Math.round((Number(final_total) + Number(previous_balance || 0)) * 100) / 100;
 
-    const remaining_amount = totalWithPrevious - Number(paid_amount || 0);
+    const remaining_amount = Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
 
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
@@ -1525,10 +1525,10 @@ app.put("/invoices/retail/:id", async (req, res) => {
     const subtotal = Number(total_before_discount);
     const manualDiscount = Number(extra_discount || 0);
     const discountTotal = manualDiscount;
-    const total = Number(final_total);
+    const total = Math.round(Number(final_total) * 100) / 100;
 
-    const totalWithPrevious = total + Number(prevBalance || 0);
-    const remaining_amount = totalWithPrevious - Number(paid_amount || 0);
+    const totalWithPrevious = Math.round((total + Number(prevBalance || 0)) * 100) / 100;
+    const remaining_amount = Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
 
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
