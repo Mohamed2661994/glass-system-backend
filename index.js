@@ -1104,9 +1104,11 @@ app.post("/invoices/retail", async (req, res) => {
     await client.query("BEGIN");
 
     const totalWithPrevious =
-      Math.round((Number(final_total) + Number(previous_balance || 0)) * 100) / 100;
+      Math.round((Number(final_total) + Number(previous_balance || 0)) * 100) /
+      100;
 
-    const remaining_amount = Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
+    const remaining_amount =
+      Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
 
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
@@ -1527,8 +1529,10 @@ app.put("/invoices/retail/:id", async (req, res) => {
     const discountTotal = manualDiscount;
     const total = Math.round(Number(final_total) * 100) / 100;
 
-    const totalWithPrevious = Math.round((total + Number(prevBalance || 0)) * 100) / 100;
-    const remaining_amount = Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
+    const totalWithPrevious =
+      Math.round((total + Number(prevBalance || 0)) * 100) / 100;
+    const remaining_amount =
+      Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
 
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
@@ -1554,7 +1558,7 @@ WHERE id = $14
       `,
       [
         customer_name,
-        customer_phone,
+        customer_phone || null,
         prevBalance,
         subtotal,
         manualDiscount,
@@ -2081,7 +2085,7 @@ WHERE id = $14
   `,
       [
         customer_name,
-        customer_phone,
+        customer_phone || null,
         Number(previous_balance || 0),
         subtotal,
         extraDiscount,
