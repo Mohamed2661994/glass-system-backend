@@ -50,6 +50,24 @@ app.use(
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
+// ONE-TIME migration: fix retail cash_in branch_id (REMOVE AFTER USE)
+app.get("/migrate/fix-retail-branch", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      UPDATE cash_in
+      SET branch_id = 1
+      WHERE source_type = 'invoice'
+        AND branch_id = 2
+        AND invoice_id IN (
+          SELECT id FROM invoices WHERE invoice_type = 'retail'
+        )
+    `);
+    res.json({ success: true, fixed_rows: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Chat uploads
 const uploadsDir = path.join(__dirname, "uploads", "chat");
 if (!fs.existsSync(uploadsDir)) {
