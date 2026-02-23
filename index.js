@@ -1782,7 +1782,8 @@ app.put("/invoices/retail/:id", async (req, res) => {
       apply_items_discount = false,
     } = req.body;
 
-    const { updated_by, updated_by_name, supplier_name, supplier_phone } = req.body;
+    const { updated_by, updated_by_name, supplier_name, supplier_phone } =
+      req.body;
 
     if (!items || !items.length || final_total === undefined) {
       throw new Error("بيانات غير مكتملة");
@@ -2273,7 +2274,8 @@ app.put("/invoices/:id", async (req, res) => {
       manual_discount = 0,
     } = req.body;
 
-    const { updated_by, updated_by_name, supplier_name, supplier_phone } = req.body;
+    const { updated_by, updated_by_name, supplier_name, supplier_phone } =
+      req.body;
 
     if (!items || !items.length) {
       throw new Error("لا يوجد أصناف في الفاتورة");
@@ -3259,6 +3261,8 @@ app.get("/invoices", async (req, res) => {
         is_return,
         customer_name,
         customer_phone,
+        supplier_name,
+        supplier_phone,
         subtotal,
         discount_total,
         total,
