@@ -428,6 +428,13 @@ pool
         ADD COLUMN IF NOT EXISTS supplier_phone VARCHAR(50)
     `);
     console.log("✅ invoices supplier columns ready");
+
+    // عمود المورد في المنصرفات (لدفعات الموردين)
+    await pool.query(`
+      ALTER TABLE cash_out
+        ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id)
+    `);
+    console.log("✅ cash_out supplier_id column ready");
   } catch (e) {
     console.error("❌ suppliers migration error:", e.message);
   }
@@ -937,13 +944,14 @@ app.delete("/suppliers/:id/phones/:phoneId", async (req, res) => {
   }
 });
 
-// Get supplier balance (total debt from purchase invoices)
+// Get supplier balance (total debt from purchase invoices minus supplier payments)
 app.get("/suppliers/:id/balance", async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query(
+    // إجمالي المديونية من فواتير المشتريات
+    const invoiceResult = await pool.query(
       `
-      SELECT COALESCE(SUM(remaining_amount), 0) AS balance
+      SELECT COALESCE(SUM(remaining_amount), 0) AS debt
       FROM invoices
       WHERE supplier_id = $1
         AND movement_type = 'purchase'
@@ -951,20 +959,34 @@ app.get("/suppliers/:id/balance", async (req, res) => {
       `,
       [id],
     );
-    res.json({ balance: Number(result.rows[0].balance) });
+    // إجمالي المدفوع كدفعات مورد
+    const paymentResult = await pool.query(
+      `
+      SELECT COALESCE(SUM(amount), 0) AS paid
+      FROM cash_out
+      WHERE supplier_id = $1
+        AND entry_type = 'supplier_payment'
+      `,
+      [id],
+    );
+    const debt = Number(invoiceResult.rows[0].debt);
+    const paid = Number(paymentResult.rows[0].paid);
+    res.json({ balance: debt - paid, debt, paid });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// Get supplier statement (all purchase invoices)
+// Get supplier statement (purchase invoices + supplier payments)
 app.get("/suppliers/:id/statement", async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query(
+    // فواتير المشتريات
+    const invoicesResult = await pool.query(
       `
-      SELECT id, invoice_type, invoice_date, total, paid_amount, remaining_amount, payment_status, created_at
+      SELECT id, 'invoice' AS type, invoice_type, invoice_date AS date, total AS amount,
+             paid_amount, remaining_amount, payment_status, created_at
       FROM invoices
       WHERE supplier_id = $1
         AND movement_type = 'purchase'
@@ -973,7 +995,23 @@ app.get("/suppliers/:id/statement", async (req, res) => {
       `,
       [id],
     );
-    res.json(result.rows);
+    // دفعات المورد
+    const paymentsResult = await pool.query(
+      `
+      SELECT id, 'payment' AS type, permission_number,
+             to_char(transaction_date, 'YYYY-MM-DD') AS date,
+             amount, notes, created_at
+      FROM cash_out
+      WHERE supplier_id = $1
+        AND entry_type = 'supplier_payment'
+      ORDER BY transaction_date DESC, id DESC
+      `,
+      [id],
+    );
+    res.json({
+      invoices: invoicesResult.rows,
+      payments: paymentsResult.rows,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -4965,14 +5003,18 @@ app.post("/stock/replace", async (req, res) => {
 app.post("/cash/out", authMiddleware, async (req, res) => {
   try {
     const branch_id = req.user.branch_id; // ✅ من التوكن
-    const { name, amount, notes, date, entry_type } = req.body;
+    const { name, amount, notes, date, entry_type, supplier_id } = req.body;
     const safeEntryType =
-      entry_type === "purchase" || entry_type === "expense"
+      entry_type === "purchase" || entry_type === "expense" || entry_type === "supplier_payment"
         ? entry_type
         : "expense";
 
     if (!name || !amount || !date) {
       return res.status(400).json({ error: "بيانات ناقصة" });
+    }
+
+    if (safeEntryType === "supplier_payment" && !supplier_id) {
+      return res.status(400).json({ error: "يجب اختيار المورد" });
     }
 
     // توليد رقم إذن (نفس منطق الفرونت)
@@ -4989,11 +5031,11 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
         amount,
         notes,
         transaction_date,
-       permission_number,
-        entry_type
-
+        permission_number,
+        entry_type,
+        supplier_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING id, permission_number
       `,
       [
@@ -5004,6 +5046,7 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
         date,
         permissionNumber,
         safeEntryType,
+        safeEntryType === "supplier_payment" ? supplier_id : null,
       ],
     );
 
@@ -5025,20 +5068,22 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
   try {
     const branch_id = req.user.branch_id;
     const { id } = req.params;
-    const { name, amount, notes, date, entry_type } = req.body;
+    const { name, amount, notes, date, entry_type, supplier_id } = req.body;
     const safeEntryType =
-      entry_type === "purchase" || entry_type === "expense"
+      entry_type === "purchase" || entry_type === "expense" || entry_type === "supplier_payment"
         ? entry_type
         : "expense";
 
     const result = await pool.query(
       `
       UPDATE cash_out
-      SET name=$1, amount=$2, notes=$3, transaction_date=$4, entry_type=$5
-      WHERE id=$6 AND branch_id=$7
+      SET name=$1, amount=$2, notes=$3, transaction_date=$4, entry_type=$5, supplier_id=$6
+      WHERE id=$7 AND branch_id=$8
       RETURNING *
       `,
-      [name, Number(amount), notes || null, date, safeEntryType, id, branch_id],
+      [name, Number(amount), notes || null, date, safeEntryType,
+       safeEntryType === "supplier_payment" ? supplier_id : null,
+       id, branch_id],
     );
 
     if (!result.rows.length) {
@@ -5091,17 +5136,20 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        id,
-        permission_number,
-        name,
-        amount,
-        notes,
-        to_char(transaction_date, 'YYYY-MM-DD') AS transaction_date,
-        created_at,
-         entry_type
-      FROM cash_out
-      WHERE ${conditions.join(" AND ")}
-      ORDER BY transaction_date DESC, created_at DESC, id DESC
+        co.id,
+        co.permission_number,
+        co.name,
+        co.amount,
+        co.notes,
+        to_char(co.transaction_date, 'YYYY-MM-DD') AS transaction_date,
+        co.created_at,
+        co.entry_type,
+        co.supplier_id,
+        s.name AS supplier_name
+      FROM cash_out co
+      LEFT JOIN suppliers s ON s.id = co.supplier_id
+      WHERE ${conditions.map(c => c.replace('branch_id', 'co.branch_id').replace('transaction_date', 'co.transaction_date')).join(" AND ")}
+      ORDER BY co.transaction_date DESC, co.created_at DESC, co.id DESC
       LIMIT $${idx++} OFFSET $${idx++}
       `,
       [...values, limit, offset],
@@ -5128,15 +5176,18 @@ app.get("/cash/out/:id", authMiddleware, async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        id,
-        permission_number,
-        name,
-        amount,
-        notes,
-        to_char(transaction_date, 'YYYY-MM-DD') AS transaction_date,
-        entry_type
-      FROM cash_out
-      WHERE id = $1 AND branch_id = $2
+        co.id,
+        co.permission_number,
+        co.name,
+        co.amount,
+        co.notes,
+        to_char(co.transaction_date, 'YYYY-MM-DD') AS transaction_date,
+        co.entry_type,
+        co.supplier_id,
+        s.name AS supplier_name
+      FROM cash_out co
+      LEFT JOIN suppliers s ON s.id = co.supplier_id
+      WHERE co.id = $1 AND co.branch_id = $2
       `,
       [id, branch_id],
     );
