@@ -1657,7 +1657,7 @@ WHERE id = $14
       ($1,$2,$3,$4,$4,$5,$6,'invoice',CURRENT_DATE)
       `,
           [
-            2, // أو branch_id لو عندك
+            1, // فرع القطاعي
             invoiceId,
             customer_name,
             Number(paid_amount),
