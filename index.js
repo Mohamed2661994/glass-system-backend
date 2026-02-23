@@ -98,6 +98,38 @@ const soundUpload = multer({
 
 app.use(express.json({ limit: "50mb" }));
 
+/* ========== Real-time: auto-emit socket events on successful writes ========== */
+app.use((req, res, next) => {
+  if (["POST", "PUT", "DELETE"].includes(req.method)) {
+    const originalJson = res.json.bind(res);
+    res.json = function (data) {
+      if (res.statusCode < 400) {
+        const io = req.app.get("io");
+        if (io) {
+          const p = req.originalUrl || req.url;
+          let channel = "data:misc";
+          if (p.includes("/invoices")) channel = "data:invoices";
+          else if (p.includes("/cash")) channel = "data:cash";
+          else if (p.includes("/stock") || p.includes("/transfer"))
+            channel = "data:stock";
+          else if (p.includes("/products") || p.includes("/manufacturers"))
+            channel = "data:products";
+          else if (p.includes("/customers")) channel = "data:customers";
+          else if (p.includes("/users")) channel = "data:users";
+          else if (p.includes("/opening-stock")) channel = "data:stock";
+          io.emit(channel, {
+            action: req.method,
+            path: p,
+            ts: Date.now(),
+          });
+        }
+      }
+      return originalJson(data);
+    };
+  }
+  next();
+});
+
 const reportsRoutes = require("./reports/reports.routes");
 app.use("/reports", reportsRoutes);
 
