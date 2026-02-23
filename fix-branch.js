@@ -1,5 +1,5 @@
-require('dotenv').config();
-const { Pool } = require('pg');
+require("dotenv").config();
+const { Pool } = require("pg");
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -7,7 +7,7 @@ const pool = new Pool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  ssl: process.env.DB_SSL === "true" ? { rejectUnauthorized: false } : false,
 });
 
 async function fix() {
@@ -21,9 +21,9 @@ async function fix() {
           SELECT id FROM invoices WHERE invoice_type = 'retail'
         )
     `);
-    console.log('Fixed rows:', res.rowCount);
+    console.log("Fixed rows:", res.rowCount);
   } catch (err) {
-    console.error('Error:', err.message);
+    console.error("Error:", err.message);
   } finally {
     await pool.end();
   }

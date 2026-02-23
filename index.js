@@ -68,6 +68,16 @@ app.get("/migrate/fix-retail-branch", async (req, res) => {
   }
 });
 
+// ONE-TIME: check warehouses (REMOVE AFTER USE)
+app.get("/migrate/warehouses", async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT id, name, branch_id FROM warehouses ORDER BY id`);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Chat uploads
 const uploadsDir = path.join(__dirname, "uploads", "chat");
 if (!fs.existsSync(uploadsDir)) {
