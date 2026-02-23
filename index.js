@@ -71,7 +71,9 @@ app.get("/migrate/fix-retail-branch", async (req, res) => {
 // ONE-TIME: check warehouses (REMOVE AFTER USE)
 app.get("/migrate/warehouses", async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id, name, branch_id FROM warehouses ORDER BY id`);
+    const result = await pool.query(
+      `SELECT id, name, branch_id FROM warehouses ORDER BY id`,
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -397,6 +399,40 @@ pool
   }
 })();
 
+// � جدول الموردين
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS suppliers (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ suppliers table ready");
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS supplier_phones (
+        id SERIAL PRIMARY KEY,
+        supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+        phone VARCHAR(50) UNIQUE NOT NULL
+      )
+    `);
+    console.log("✅ supplier_phones table ready");
+
+    // أعمدة المورد في الفواتير
+    await pool.query(`
+      ALTER TABLE invoices
+        ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id),
+        ADD COLUMN IF NOT EXISTS supplier_name VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS supplier_phone VARCHAR(50)
+    `);
+    console.log("✅ invoices supplier columns ready");
+  } catch (e) {
+    console.error("❌ suppliers migration error:", e.message);
+  }
+})();
+
 // 📊 Database indexes for performance
 (async () => {
   try {
@@ -411,6 +447,7 @@ pool
       CREATE INDEX IF NOT EXISTS idx_stock_movements_product ON stock_movements (product_id);
       CREATE INDEX IF NOT EXISTS idx_stock_movements_warehouse ON stock_movements (warehouse_id);
       CREATE INDEX IF NOT EXISTS idx_cash_in_invoice ON cash_in (invoice_id);
+      CREATE INDEX IF NOT EXISTS idx_invoices_supplier ON invoices (supplier_id);
     `);
     console.log("✅ database indexes ready");
   } catch (e) {
@@ -742,6 +779,207 @@ app.delete("/customers/:id/phones/:phoneId", async (req, res) => {
   }
 });
 
+/* =========================================================
+   Supplier Management Endpoints (الموردين)
+   ========================================================= */
+
+// Search suppliers by name or phone
+app.get("/suppliers/search", async (req, res) => {
+  try {
+    const { name } = req.query;
+    if (!name || name.length < 2) return res.json([]);
+
+    const result = await pool.query(
+      `
+      SELECT DISTINCT s.id, s.name,
+             (SELECT phone FROM supplier_phones
+              WHERE supplier_id = s.id
+              ORDER BY id ASC LIMIT 1) AS phone
+      FROM suppliers s
+      LEFT JOIN supplier_phones sp ON sp.supplier_id = s.id
+      WHERE s.name ILIKE $1 OR sp.phone ILIKE $1
+      ORDER BY s.name
+      LIMIT 10
+      `,
+      [`%${name}%`],
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// List all suppliers with phones
+app.get("/suppliers", async (req, res) => {
+  try {
+    const { search } = req.query;
+    let query = `
+      SELECT s.id, s.name,
+             COALESCE(
+               json_agg(json_build_object('id', sp.id, 'phone', sp.phone))
+               FILTER (WHERE sp.id IS NOT NULL), '[]'
+             ) AS phones
+      FROM suppliers s
+      LEFT JOIN supplier_phones sp ON sp.supplier_id = s.id
+    `;
+    const params = [];
+    if (search && search.trim().length >= 2) {
+      query += ` WHERE s.name ILIKE $1 OR s.id::text = $1 OR EXISTS (SELECT 1 FROM supplier_phones sp2 WHERE sp2.supplier_id = s.id AND sp2.phone ILIKE $1)`;
+      params.push(`%${search.trim()}%`);
+    }
+    query += ` GROUP BY s.id ORDER BY s.name`;
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get single supplier
+app.get("/suppliers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supplierRes = await pool.query(
+      `SELECT id, name FROM suppliers WHERE id = $1`,
+      [id],
+    );
+    if (!supplierRes.rows.length)
+      return res.status(404).json({ error: "مورد غير موجود" });
+
+    const phonesRes = await pool.query(
+      `SELECT id, phone FROM supplier_phones WHERE supplier_id = $1`,
+      [id],
+    );
+
+    res.json({ ...supplierRes.rows[0], phones: phonesRes.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Update supplier name
+app.put("/suppliers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim())
+      return res.status(400).json({ error: "الاسم مطلوب" });
+    await pool.query(`UPDATE suppliers SET name = $1 WHERE id = $2`, [
+      name.trim(),
+      id,
+    ]);
+
+    const io = req.app.get("io");
+    if (io) io.emit("data:suppliers", { action: "update" });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Add phone to supplier
+app.post("/suppliers/:id/phones", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: "رقم الهاتف مطلوب" });
+
+    await pool.query(
+      `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2)`,
+      [id, phone],
+    );
+
+    const io = req.app.get("io");
+    if (io) io.emit("data:suppliers", { action: "update" });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: "الرقم مسجل بالفعل" });
+  }
+});
+
+// List supplier phones
+app.get("/suppliers/:id/phones", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, phone FROM supplier_phones WHERE supplier_id = $1`,
+      [req.params.id],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Delete a phone from supplier
+app.delete("/suppliers/:id/phones/:phoneId", async (req, res) => {
+  try {
+    const { id, phoneId } = req.params;
+    await pool.query(
+      `DELETE FROM supplier_phones WHERE id = $1 AND supplier_id = $2`,
+      [phoneId, id],
+    );
+
+    const io = req.app.get("io");
+    if (io) io.emit("data:suppliers", { action: "update" });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get supplier balance (total debt from purchase invoices)
+app.get("/suppliers/:id/balance", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `
+      SELECT COALESCE(SUM(remaining_amount), 0) AS balance
+      FROM invoices
+      WHERE supplier_id = $1
+        AND movement_type = 'purchase'
+        AND is_void IS NOT TRUE
+      `,
+      [id],
+    );
+    res.json({ balance: Number(result.rows[0].balance) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get supplier statement (all purchase invoices)
+app.get("/suppliers/:id/statement", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `
+      SELECT id, invoice_type, invoice_date, total, paid_amount, remaining_amount, payment_status, created_at
+      FROM invoices
+      WHERE supplier_id = $1
+        AND movement_type = 'purchase'
+        AND is_void IS NOT TRUE
+      ORDER BY invoice_date DESC, id DESC
+      `,
+      [id],
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.post("/invoices", authMiddleware, async (req, res) => {
   console.log("USER FROM TOKEN:", req.user);
 
@@ -771,8 +1009,9 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       manual_discount = 0,
       is_return = false,
       created_by_name,
+      supplier_name,
+      supplier_phone,
     } = req.body;
-    // ✅ نخليه جملة فقط
     if (invoice_type !== "wholesale") {
       return res.status(400).json({
         error: "هذا المسار مخصص لفواتير الجملة فقط",
@@ -864,6 +1103,30 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       );
     }
 
+    // ===== حل المورد لفواتير الشراء =====
+    let supplierId = null;
+    if (movement_type === "purchase" && supplier_name) {
+      const existingSupplier = await client.query(
+        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
+        [supplier_name],
+      );
+      if (existingSupplier.rows.length > 0) {
+        supplierId = existingSupplier.rows[0].id;
+      } else {
+        const newSupplier = await client.query(
+          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
+          [supplier_name],
+        );
+        supplierId = newSupplier.rows[0].id;
+      }
+      if (supplier_phone) {
+        await client.query(
+          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
+          [supplierId, supplier_phone],
+        );
+      }
+    }
+
     /* ================== إنشاء الفاتورة ================== */
     const invoiceRes = await client.query(
       `
@@ -886,10 +1149,13 @@ app.post("/invoices", authMiddleware, async (req, res) => {
   apply_items_discount,
   is_return,
   created_by,
-  created_by_name
+  created_by_name,
+  supplier_id,
+  supplier_name,
+  supplier_phone
 )
 VALUES
-($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
       RETURNING id
       `,
       [
@@ -912,6 +1178,9 @@ VALUES
         is_return,
         created_by || null,
         created_by_name || null,
+        supplierId,
+        supplier_name || null,
+        supplier_phone || null,
       ],
     );
 
@@ -1149,7 +1418,8 @@ app.post("/invoices/retail", async (req, res) => {
       is_return = false,
     } = req.body;
 
-    const { created_by, created_by_name } = req.body;
+    const { created_by, created_by_name, supplier_name, supplier_phone } =
+      req.body;
 
     if (
       !branch_id ||
@@ -1208,6 +1478,31 @@ app.post("/invoices/retail", async (req, res) => {
         [apply_items_discount, customerId],
       );
     }
+
+    // ===== حل المورد لفواتير الشراء =====
+    let supplierId = null;
+    if (movement_type === "purchase" && supplier_name) {
+      const existingSupplier = await client.query(
+        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
+        [supplier_name],
+      );
+      if (existingSupplier.rows.length > 0) {
+        supplierId = existingSupplier.rows[0].id;
+      } else {
+        const newSupplier = await client.query(
+          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
+          [supplier_name],
+        );
+        supplierId = newSupplier.rows[0].id;
+      }
+      if (supplier_phone) {
+        await client.query(
+          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
+          [supplierId, supplier_phone],
+        );
+      }
+    }
+
     /* ================== إنشاء الفاتورة ================== */
     const invoiceRes = await client.query(
       `
@@ -1230,10 +1525,13 @@ app.post("/invoices/retail", async (req, res) => {
         apply_items_discount,
         is_return,
         created_by,
-        created_by_name
+        created_by_name,
+        supplier_id,
+        supplier_name,
+        supplier_phone
       )
       VALUES
-      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       RETURNING id
       `,
       [
@@ -1245,7 +1543,7 @@ app.post("/invoices/retail", async (req, res) => {
         customer_phone,
         Number(previous_balance) || 0,
         Number(total_before_discount),
-        Number(extra_discount || 0), // ✅ manual_discount
+        Number(extra_discount || 0),
         Number(items_discount) + Number(extra_discount),
         Number(final_total),
         Number(paid_amount),
@@ -1255,6 +1553,9 @@ app.post("/invoices/retail", async (req, res) => {
         is_return,
         created_by || null,
         created_by_name || null,
+        supplierId,
+        supplier_name || null,
+        supplier_phone || null,
       ],
     );
 
@@ -1481,7 +1782,7 @@ app.put("/invoices/retail/:id", async (req, res) => {
       apply_items_discount = false,
     } = req.body;
 
-    const { updated_by, updated_by_name } = req.body;
+    const { updated_by, updated_by_name, supplier_name, supplier_phone } = req.body;
 
     if (!items || !items.length || final_total === undefined) {
       throw new Error("بيانات غير مكتملة");
@@ -1597,6 +1898,30 @@ app.put("/invoices/retail/:id", async (req, res) => {
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
+    // ===== حل المورد لفواتير الشراء =====
+    let supplierId = null;
+    if (movement_type === "purchase" && supplier_name) {
+      const existingSupplier = await client.query(
+        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
+        [supplier_name],
+      );
+      if (existingSupplier.rows.length > 0) {
+        supplierId = existingSupplier.rows[0].id;
+      } else {
+        const newSupplier = await client.query(
+          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
+          [supplier_name],
+        );
+        supplierId = newSupplier.rows[0].id;
+      }
+      if (supplier_phone) {
+        await client.query(
+          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
+          [supplierId, supplier_phone],
+        );
+      }
+    }
+
     await client.query(
       `
     UPDATE invoices
@@ -1613,7 +1938,10 @@ SET
   payment_status = $10,
   apply_items_discount = $11,
   updated_by = $12,
-  updated_by_name = $13
+  updated_by_name = $13,
+  supplier_id = $15,
+  supplier_name = $16,
+  supplier_phone = $17
 WHERE id = $14
       `,
       [
@@ -1631,6 +1959,9 @@ WHERE id = $14
         updated_by || null,
         updated_by_name || null,
         invoiceId,
+        supplierId,
+        supplier_name || null,
+        supplier_phone || null,
       ],
     );
 
@@ -1824,6 +2155,10 @@ app.get("/invoices/:id/edit", async (req, res) => {
       apply_items_discount: invoice.apply_items_discount,
       is_return: invoice.is_return || false,
 
+      supplier_id: invoice.supplier_id,
+      supplier_name: invoice.supplier_name,
+      supplier_phone: invoice.supplier_phone,
+
       created_by: invoice.created_by,
       created_by_name: invoice.created_by_name,
       updated_by: invoice.updated_by,
@@ -1938,7 +2273,7 @@ app.put("/invoices/:id", async (req, res) => {
       manual_discount = 0,
     } = req.body;
 
-    const { updated_by, updated_by_name } = req.body;
+    const { updated_by, updated_by_name, supplier_name, supplier_phone } = req.body;
 
     if (!items || !items.length) {
       throw new Error("لا يوجد أصناف في الفاتورة");
@@ -2122,7 +2457,33 @@ app.put("/invoices/:id", async (req, res) => {
       remaining <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
     /* ================================
-       6️⃣ تحديث الفاتورة
+       6️⃣ حل المورد لفواتير الشراء
+    ================================= */
+    let supplierId = null;
+    if (movement_type === "purchase" && supplier_name) {
+      const existingSupplier = await client.query(
+        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
+        [supplier_name],
+      );
+      if (existingSupplier.rows.length > 0) {
+        supplierId = existingSupplier.rows[0].id;
+      } else {
+        const newSupplier = await client.query(
+          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
+          [supplier_name],
+        );
+        supplierId = newSupplier.rows[0].id;
+      }
+      if (supplier_phone) {
+        await client.query(
+          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
+          [supplierId, supplier_phone],
+        );
+      }
+    }
+
+    /* ================================
+       7️⃣ تحديث الفاتورة
     ================================= */
     await client.query(
       `
@@ -2140,7 +2501,10 @@ SET
   payment_status = $10,
   apply_items_discount = $11,
   updated_by = $12,
-  updated_by_name = $13
+  updated_by_name = $13,
+  supplier_id = $15,
+  supplier_name = $16,
+  supplier_phone = $17
 WHERE id = $14
   `,
       [
@@ -2158,6 +2522,9 @@ WHERE id = $14
         updated_by || null,
         updated_by_name || null,
         invoiceId,
+        supplierId,
+        supplier_name || null,
+        supplier_phone || null,
       ],
     );
 
