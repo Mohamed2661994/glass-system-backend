@@ -3273,8 +3273,9 @@ app.get("/invoices", async (req, res) => {
     }
 
     if (customer_name) {
-      conditions.push(`customer_name ILIKE  $${idx++}`);
+      conditions.push(`(customer_name ILIKE $${idx} OR supplier_name ILIKE $${idx})`);
       values.push(`%${customer_name}%`);
+      idx++;
     }
 
     if (date_from) {
