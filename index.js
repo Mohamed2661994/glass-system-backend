@@ -3405,9 +3405,9 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
 
         await client.query(
           `INSERT INTO invoice_items
-            (invoice_id, product_id, variant_id, quantity, price, discount, total)
-           VALUES ($1, $2, $3, $4, 0, 0, 0)`,
-          [invoiceId, item.product_id, variantId, adjustQty]
+            (invoice_id, product_id, product_name, variant_id, quantity, price, discount, total)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 0)`,
+          [invoiceId, item.product_id, item.product_name, variantId, adjustQty]
         );
 
         await client.query(
