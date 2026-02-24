@@ -485,56 +485,75 @@ exports.getCustomerBalances = async (req, res) => {
   try {
     const { from, to, customer_name, warehouse_id } = req.query;
 
-    let conditions = ["i.movement_type = 'sale'", "i.is_void = false"];
+    let conditions_main = ["i.movement_type = 'sale'", "i.is_void = false"];
+    let conditions_cte = ["movement_type = 'sale'", "is_void = false"];
 
     let values = [];
     let idx = 1;
 
     if (from) {
-      conditions.push(`i.invoice_date >= $${idx++}`);
+      const p = "$" + idx++;
+      conditions_main.push("i.invoice_date >= " + p);
+      conditions_cte.push("invoice_date >= " + p);
       values.push(from);
     }
 
     if (to) {
-      conditions.push(`i.invoice_date <= $${idx++}`);
+      const p = "$" + idx++;
+      conditions_main.push("i.invoice_date <= " + p);
+      conditions_cte.push("invoice_date <= " + p);
       values.push(to);
     }
 
     if (customer_name) {
-      conditions.push(`i.customer_name ILIKE $${idx++}`);
-      values.push(`%${customer_name}%`);
+      const p = "$" + idx++;
+      conditions_main.push("i.customer_name ILIKE " + p);
+      conditions_cte.push("customer_name ILIKE " + p);
+      values.push("%" + customer_name + "%");
     }
 
-    // ✅ الفصل بين الجملة والقطاعي عن طريق الفرع
     if (warehouse_id) {
-      conditions.push(`i.branch_id = $${idx++}`);
+      const p = "$" + idx++;
+      conditions_main.push("i.branch_id = " + p);
+      conditions_cte.push("branch_id = " + p);
       values.push(warehouse_id);
     }
 
-    const whereClause = `WHERE ${conditions.join(" AND ")}`;
+    const mainWhere = "WHERE " + conditions_main.join(" AND ");
+    const cteWhere = "WHERE " + conditions_cte.join(" AND ");
 
     const result = await pool.query(
       `
+      WITH opening AS (
+        SELECT DISTINCT ON (customer_name)
+          customer_name,
+          COALESCE(previous_balance, 0) AS opening_balance
+        FROM invoices
+        ${cteWhere}
+        ORDER BY customer_name, invoice_date ASC, id ASC
+      )
       SELECT
         i.customer_name,
+        COALESCE(ob.opening_balance, 0) AS opening_balance,
         SUM(i.total) AS total_sales,
         SUM(i.paid_amount) + COALESCE(cp.extra_paid, 0) AS total_paid,
         GREATEST(
-          SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
+          COALESCE(ob.opening_balance, 0) + SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
           0
         ) AS balance_due,
         MAX(i.invoice_date) AS last_invoice_date
       FROM invoices i
+      LEFT JOIN opening ob ON ob.customer_name = i.customer_name
       LEFT JOIN (
         SELECT customer_name, SUM(amount) AS extra_paid
         FROM cash_in
         WHERE source_type = 'customer_payment'
         GROUP BY customer_name
       ) cp ON cp.customer_name = i.customer_name
-      ${whereClause}
-      GROUP BY i.customer_name, cp.extra_paid
+      ${mainWhere}
+      GROUP BY i.customer_name, cp.extra_paid, ob.opening_balance
       HAVING GREATEST(
-        SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
+        COALESCE(ob.opening_balance, 0) + SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
         0
       ) > 0
       ORDER BY balance_due DESC
