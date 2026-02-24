@@ -3325,6 +3325,130 @@ app.get("/invoices", async (req, res) => {
   }
 });
 
+
+/* ================================
+   تصفير الأصناف السالبة - Zero out negative stock
+================================ */
+app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  const userBranchId = req.user.branch_id;
+  const userId = req.user.id;
+  const userName = req.user.full_name || req.user.username || "System";
+
+  try {
+    const { warehouse_id } = req.body;
+    if (!warehouse_id) {
+      return res.status(400).json({ error: "warehouse_id مطلوب" });
+    }
+
+    // 1. Get all negative stock items for this warehouse
+    const negResult = await client.query(
+      `SELECT
+        sm.product_id,
+        sm.variant_id,
+        COALESCE(SUM(sm.quantity), 0) AS current_stock,
+        p.name AS product_name,
+        p.barcode
+      FROM stock_movements sm
+      JOIN products p ON p.id = sm.product_id
+      WHERE sm.warehouse_id = $1 AND p.is_active = true
+      GROUP BY sm.product_id, sm.variant_id, p.name, p.barcode
+      HAVING COALESCE(SUM(sm.quantity), 0) < 0
+      ORDER BY COALESCE(SUM(sm.quantity), 0) ASC`,
+      [warehouse_id]
+    );
+
+    if (negResult.rows.length === 0) {
+      return res.json({ success: true, message: "لا توجد أصناف سالبة", invoices_created: 0 });
+    }
+
+    const negItems = negResult.rows;
+    const invoiceType = warehouse_id == 1 ? "retail" : "wholesale";
+
+    await client.query("BEGIN");
+
+    // 2. Create adjustment purchase invoice
+    const today = new Date().toISOString().split("T")[0];
+    const total = 0; // Zero cost adjustment
+
+    const invResult = await client.query(
+      `INSERT INTO invoices
+        (branch_id, invoice_type, movement_type, invoice_date,
+         customer_name, total, subtotal, discount, paid_amount,
+         remaining_amount, payment_status, created_by, created_by_name,
+         is_return, notes, previous_balance, apply_items_discount)
+       VALUES ($1, $2, 'purchase', $3,
+         'تصفير أصناف سالبة', 0, 0, 0, 0,
+         0, 'paid', $4, $5,
+         false, $6, 0, false)
+       RETURNING id`,
+      [
+        userBranchId,
+        invoiceType,
+        today,
+        userId,
+        userName,
+        `تصفير ${negItems.length} صنف سالب تلقائي`
+      ]
+    );
+
+    const invoiceId = invResult.rows[0].id;
+
+    // 3. Insert invoice items + stock movements + update stock
+    for (const item of negItems) {
+      const adjustQty = Math.abs(Number(item.current_stock)); // positive qty to add
+      const variantId = Number(item.variant_id) || 0;
+
+      // Insert invoice item
+      await client.query(
+        `INSERT INTO invoice_items
+          (invoice_id, product_id, variant_id, quantity, price, discount, total)
+         VALUES ($1, $2, $3, $4, 0, 0, 0)`,
+        [invoiceId, item.product_id, variantId, adjustQty]
+      );
+
+      // Update stock table
+      await client.query(
+        `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (warehouse_id, product_id, variant_id)
+         DO UPDATE SET quantity = stock.quantity + $4`,
+        [warehouse_id, item.product_id, variantId, adjustQty]
+      );
+
+      // Insert stock movement
+      await client.query(
+        `INSERT INTO stock_movements
+          (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+         VALUES ($1, $2, $3, $4, $5, 'purchase')`,
+        [invoiceId, warehouse_id, item.product_id, variantId, adjustQty]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    // Broadcast stock change
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`branch_${userBranchId}`).emit("data_changed", { type: "data:stock" });
+      io.to(`branch_${userBranchId}`).emit("data_changed", { type: "data:invoices" });
+    }
+
+    res.json({
+      success: true,
+      message: `تم تصفير ${negItems.length} صنف سالب`,
+      invoice_id: invoiceId,
+      items_count: negItems.length,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("ZERO NEGATIVE STOCK ERROR:", err);
+    res.status(500).json({ error: err.message || "فشل تصفير الأصناف السالبة" });
+  } finally {
+    client.release();
+  }
+});
+
 // ========== Dashboard Stats ==========
 app.get("/dashboard/stats", async (req, res) => {
   try {
