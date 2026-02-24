@@ -9,12 +9,10 @@ function convertWholesaleToRetail({
   retail_package,
   wholesale_quantity,
 }) {
-  console.log("🔍 CONVERT INPUT:", {
+  console.log("CONVERT INPUT:", {
     wholesale_package,
     retail_package,
     wholesale_quantity,
-    type_wholesale: typeof wholesale_package,
-    type_retail: typeof retail_package,
   });
 
   if (!wholesale_quantity || wholesale_quantity <= 0) {
@@ -28,12 +26,9 @@ function convertWholesaleToRetail({
     throw new Error("PACKAGE_NOT_ANALYZABLE");
   }
 
-  /* ==================================================
-     1️⃣ طقم (مغلق) - دائماً يتحول بالطقم فقط
-  ================================================== */
+  // 1 - set (closed unit)
   if (wholesale.unit === "set") {
     const qty = wholesale_quantity * wholesale.count;
-
     return {
       from_quantity: wholesale_quantity,
       to_quantity: qty,
@@ -42,35 +37,39 @@ function convertWholesaleToRetail({
     };
   }
 
-  /* ==================================================
-     2️⃣ حساب القطع من الجملة
-  ================================================== */
+  // 2 - calculate pieces from wholesale
   let piecesPerWholesaleUnit;
 
   if (wholesale.unit === "dozen") {
     piecesPerWholesaleUnit = wholesale.count * DOZEN_SIZE;
+  } else if (wholesale.unit === "container") {
+    piecesPerWholesaleUnit = wholesale.count;
+  } else if (wholesale.unit === "piece") {
+    piecesPerWholesaleUnit = wholesale.count;
   } else {
     throw new Error("WHOLESALE_NOT_ANALYZABLE");
   }
 
   const totalPieces = piecesPerWholesaleUnit * wholesale_quantity;
 
-  /* ==================================================
-     3️⃣ التحويل للقطاعي
-  ================================================== */
-  let piecesPerRetailUnit = 1;
-
-  if (retail.unit === "container") {
-    piecesPerRetailUnit = retail.count;
-  }
+  // 3 - convert to retail
   if (retail.unit === "piece") {
     return {
       from_quantity: wholesale_quantity,
       to_quantity: totalPieces,
       retail_quantity: totalPieces,
-      mode: "dozen_to_piece",
+      mode: wholesale.unit === "dozen" ? "dozen_to_piece" : "container_to_piece",
     };
   }
+
+  let piecesPerRetailUnit = 1;
+
+  if (retail.unit === "container") {
+    piecesPerRetailUnit = retail.count;
+  } else if (retail.unit === "dozen") {
+    piecesPerRetailUnit = retail.count * DOZEN_SIZE;
+  }
+
   const retailQuantity = totalPieces / piecesPerRetailUnit;
 
   if (!Number.isInteger(retailQuantity)) {
@@ -80,7 +79,7 @@ function convertWholesaleToRetail({
   return {
     from_quantity: wholesale_quantity,
     to_quantity: retailQuantity,
-    retail_quantity: retailQuantity, // backward compatibility
+    retail_quantity: retailQuantity,
     mode: "analyzed",
   };
 }
