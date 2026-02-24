@@ -5640,11 +5640,11 @@ app.get("/cash-in", authMiddleware, async (req, res) => {
 
     if (from_date) {
       values.push(from_date);
-      query += ` AND transaction_date >= ${values.length}::date`;
+      query += ` AND transaction_date >= $${values.length}::date`;
     }
     if (to_date) {
       values.push(to_date);
-      query += ` AND transaction_date <= ${values.length}::date`;
+      query += ` AND transaction_date <= $${values.length}::date`;
     }
 
     query += ` ORDER BY transaction_date DESC, id DESC`;
