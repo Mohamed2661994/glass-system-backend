@@ -652,9 +652,19 @@ exports.getCustomerDebtDetails = async (req, res) => {
 
 exports.getSupplierBalances = async (req, res) => {
   try {
-    const { supplier_name } = req.query;
+    const { supplier_name, warehouse_id } = req.query;
 
     let conditions = [];
+    let invConditions = ["movement_type = 'purchase'", "is_void IS NOT TRUE"];
+    let payConditions = [
+      "entry_type = 'supplier_payment'",
+      "supplier_id IS NOT NULL",
+    ];
+    let cteConditions = [
+      "movement_type = 'purchase'",
+      "is_void IS NOT TRUE",
+      "supplier_id IS NOT NULL",
+    ];
     let values = [];
     let idx = 1;
 
@@ -663,8 +673,19 @@ exports.getSupplierBalances = async (req, res) => {
       values.push(`%${supplier_name}%`);
     }
 
+    if (warehouse_id) {
+      const p = `$${idx++}`;
+      invConditions.push(`branch_id = ${p}`);
+      payConditions.push(`branch_id = ${p}`);
+      cteConditions.push(`branch_id = ${p}`);
+      values.push(warehouse_id);
+    }
+
     const whereClause =
       conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const invWhere = invConditions.join(" AND ");
+    const payWhere = payConditions.join(" AND ");
+    const cteWhere = cteConditions.join(" AND ");
 
     const result = await pool.query(
       `
@@ -673,7 +694,7 @@ exports.getSupplierBalances = async (req, res) => {
           supplier_id,
           COALESCE(previous_balance, 0) AS opening_balance
         FROM invoices
-        WHERE movement_type = 'purchase' AND is_void IS NOT TRUE AND supplier_id IS NOT NULL
+        WHERE ${cteWhere}
         ORDER BY supplier_id, invoice_date ASC, id ASC
       )
       SELECT
@@ -697,7 +718,7 @@ exports.getSupplierBalances = async (req, res) => {
           SUM(paid_amount) AS total_paid_invoices,
           MAX(invoice_date) AS last_invoice_date
         FROM invoices
-        WHERE movement_type = 'purchase' AND is_void IS NOT TRUE
+        WHERE ${invWhere}
         GROUP BY supplier_id
       ) inv ON inv.supplier_id = s.id
       LEFT JOIN (
@@ -705,7 +726,7 @@ exports.getSupplierBalances = async (req, res) => {
           supplier_id,
           SUM(amount) AS total_payments
         FROM cash_out
-        WHERE entry_type = 'supplier_payment' AND supplier_id IS NOT NULL
+        WHERE ${payWhere}
         GROUP BY supplier_id
       ) pay ON pay.supplier_id = s.id
       LEFT JOIN opening o ON o.supplier_id = s.id
@@ -724,7 +745,7 @@ exports.getSupplierBalances = async (req, res) => {
 
 exports.getSupplierDebtDetails = async (req, res) => {
   try {
-    const { supplier_id, from, to } = req.query;
+    const { supplier_id, from, to, warehouse_id } = req.query;
 
     if (!supplier_id) {
       return res.status(400).json({ error: "supplier_id مطلوب" });
@@ -735,8 +756,16 @@ exports.getSupplierDebtDetails = async (req, res) => {
       "i.movement_type = 'purchase'",
       "i.is_void IS NOT TRUE",
     ];
+    let paymentExtra = "";
     let values = [supplier_id];
     let idx = 2;
+
+    if (warehouse_id) {
+      invoiceConditions.push(`i.branch_id = $${idx}`);
+      paymentExtra += ` AND co.branch_id = $${idx}`;
+      values.push(warehouse_id);
+      idx++;
+    }
 
     if (from) {
       invoiceConditions.push(`i.invoice_date >= $${idx++}`);
@@ -781,6 +810,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
       FROM cash_out co
       WHERE co.supplier_id = $1
         AND co.entry_type = 'supplier_payment'
+      ${paymentExtra}
       ${from ? `AND co.transaction_date >= '${from}'` : ""}
       ${to ? `AND co.transaction_date <= '${to}'` : ""}
 

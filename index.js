@@ -3273,7 +3273,9 @@ app.get("/invoices", async (req, res) => {
     }
 
     if (customer_name) {
-      conditions.push(`(customer_name ILIKE $${idx} OR supplier_name ILIKE $${idx})`);
+      conditions.push(
+        `(customer_name ILIKE $${idx} OR supplier_name ILIKE $${idx})`,
+      );
       values.push(`%${customer_name}%`);
       idx++;
     }
@@ -3326,7 +3328,6 @@ app.get("/invoices", async (req, res) => {
   }
 });
 
-
 /* ================================
    تصفير الأصناف السالبة - Zero out negative stock
 ================================ */
@@ -3357,11 +3358,16 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
       GROUP BY sm.product_id, sm.variant_id, p.name, p.barcode
       HAVING COALESCE(SUM(sm.quantity), 0) < 0
       ORDER BY COALESCE(SUM(sm.quantity), 0) ASC`,
-      [warehouse_id]
+      [warehouse_id],
     );
 
     if (negResult.rows.length === 0) {
-      return res.json({ success: true, message: "لا توجد أصناف سالبة", invoices_created: 0, items_count: 0 });
+      return res.json({
+        success: true,
+        message: "لا توجد أصناف سالبة",
+        invoices_created: 0,
+        items_count: 0,
+      });
     }
 
     const negItems = negResult.rows;
@@ -3393,7 +3399,7 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
            0, 0, 'paid',
            $4, $5, false, false)
          RETURNING id`,
-        [userBranchId, invoiceType, today, userId, userName]
+        [userBranchId, invoiceType, today, userId, userName],
       );
 
       const invoiceId = invResult.rows[0].id;
@@ -3408,7 +3414,7 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
           `INSERT INTO invoice_items
             (invoice_id, product_id, product_name, variant_id, quantity, price, discount, total)
            VALUES ($1, $2, $3, $4, $5, 0, 0, 0)`,
-          [invoiceId, item.product_id, item.product_name, variantId, adjustQty]
+          [invoiceId, item.product_id, item.product_name, variantId, adjustQty],
         );
 
         await client.query(
@@ -3416,14 +3422,14 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
            VALUES ($1, $2, $3, $4)
            ON CONFLICT (warehouse_id, product_id, variant_id)
            DO UPDATE SET quantity = stock.quantity + $4`,
-          [warehouse_id, item.product_id, variantId, adjustQty]
+          [warehouse_id, item.product_id, variantId, adjustQty],
         );
 
         await client.query(
           `INSERT INTO stock_movements
             (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
            VALUES ($1, $2, $3, $4, $5, 'purchase')`,
-          [invoiceId, warehouse_id, item.product_id, variantId, adjustQty]
+          [invoiceId, warehouse_id, item.product_id, variantId, adjustQty],
         );
       }
     }
@@ -3433,8 +3439,12 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
     // Broadcast stock change
     const io = req.app.get("io");
     if (io) {
-      io.to(`branch_${userBranchId}`).emit("data_changed", { type: "data:stock" });
-      io.to(`branch_${userBranchId}`).emit("data_changed", { type: "data:invoices" });
+      io.to(`branch_${userBranchId}`).emit("data_changed", {
+        type: "data:stock",
+      });
+      io.to(`branch_${userBranchId}`).emit("data_changed", {
+        type: "data:invoices",
+      });
     }
 
     res.json({
@@ -3479,13 +3489,15 @@ app.post("/stock/reconcile", authMiddleware, async (req, res) => {
     const io = req.app.get("io");
     const userBranchId = req.user.branch_id;
     if (io) {
-      io.to(`branch_${userBranchId}`).emit("data_changed", { type: "data:stock" });
+      io.to(`branch_${userBranchId}`).emit("data_changed", {
+        type: "data:stock",
+      });
     }
 
     res.json({
       success: true,
       fixed_count: result.rowCount,
-      message: `تم تصحيح ${result.rowCount} صنف`
+      message: `تم تصحيح ${result.rowCount} صنف`,
     });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
@@ -3500,7 +3512,8 @@ app.post("/stock/reconcile", authMiddleware, async (req, res) => {
 app.get("/dashboard/stats", async (req, res) => {
   try {
     const { invoice_type } = req.query;
-    if (!invoice_type) return res.status(400).json({ error: "invoice_type مطلوب" });
+    if (!invoice_type)
+      return res.status(400).json({ error: "invoice_type مطلوب" });
 
     const cacheKey = `dashboard_stats_${invoice_type}`;
     const cached = _cache.get(cacheKey);
@@ -8122,13 +8135,18 @@ app.set("io", io);
 const _cache = new Map();
 function getCached(key, ttlMs, fetchFn) {
   const entry = _cache.get(key);
-  if (entry && Date.now() - entry.ts < ttlMs) return Promise.resolve(entry.data);
-  return fetchFn().then(data => { _cache.set(key, { data, ts: Date.now() }); return data; });
+  if (entry && Date.now() - entry.ts < ttlMs)
+    return Promise.resolve(entry.data);
+  return fetchFn().then((data) => {
+    _cache.set(key, { data, ts: Date.now() });
+    return data;
+  });
 }
 function clearCache(prefix) {
-  for (const k of _cache.keys()) { if (k.startsWith(prefix)) _cache.delete(k); }
+  for (const k of _cache.keys()) {
+    if (k.startsWith(prefix)) _cache.delete(k);
+  }
 }
-
 
 // Online users tracking: userId -> Set of socketIds
 const onlineUsers = new Map();
