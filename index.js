@@ -3329,8 +3329,11 @@ app.get("/invoices", async (req, res) => {
 app.get("/dashboard/stats", async (req, res) => {
   try {
     const { invoice_type } = req.query;
-    if (!invoice_type)
-      return res.status(400).json({ error: "invoice_type مطلوب" });
+    if (!invoice_type) return res.status(400).json({ error: "invoice_type مطلوب" });
+
+    const cacheKey = `dashboard_stats_${invoice_type}`;
+    const cached = _cache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < 30000) return res.json(cached.data);
 
     const warehouseId = invoice_type === "retail" ? 1 : 2;
 
@@ -3377,13 +3380,15 @@ app.get("/dashboard/stats", async (req, res) => {
         ),
       ]);
 
-    res.json({
+    const statsResult = {
       today_sales: Number(salesToday.rows[0].total_sales),
       today_invoices_count: Number(salesToday.rows[0].count),
       today_cash: Number(cashToday.rows[0].total_cash),
       low_stock_count: Number(lowStockCount.rows[0].count),
       negative_stock_count: Number(negativeStockCount.rows[0].count),
-    });
+    };
+    _cache.set(cacheKey, { data: statsResult, ts: Date.now() });
+    res.json(statsResult);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Database error" });
@@ -5489,10 +5494,10 @@ app.get("/cash-in", authMiddleware, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const branch_id = req.user.branch_id; // 🔐 من التوكن
+    const branch_id = req.user.branch_id;
+    const { from_date, to_date } = req.query;
 
-    const result = await client.query(
-      `
+    let query = `
       SELECT
         id,
         branch_id,
@@ -5506,11 +5511,22 @@ app.get("/cash-in", authMiddleware, async (req, res) => {
         invoice_id,
         created_at
       FROM cash_in
-       WHERE branch_id = $1
-      ORDER BY transaction_date DESC, id DESC
-      `,
-      [branch_id],
-    );
+      WHERE branch_id = $1
+    `;
+    const values = [branch_id];
+
+    if (from_date) {
+      values.push(from_date);
+      query += ` AND transaction_date >= ${values.length}::date`;
+    }
+    if (to_date) {
+      values.push(to_date);
+      query += ` AND transaction_date <= ${values.length}::date`;
+    }
+
+    query += ` ORDER BY transaction_date DESC, id DESC`;
+
+    const result = await client.query(query, values);
 
     res.json({
       success: true,
@@ -6100,15 +6116,20 @@ app.post(
 
 app.get("/stock-transfers", async (req, res) => {
   try {
-    const { branch_id, limit = 50, offset = 0 } = req.query;
+    const { branch_id, date_from, limit = 50, offset = 0 } = req.query;
 
     let conditions = [];
     let values = [];
     let idx = 1;
 
     if (branch_id) {
-      conditions.push(`st.branch_id = $${idx++}`);
+      conditions.push(`st.branch_id = ${idx++}`);
       values.push(branch_id);
+    }
+
+    if (date_from) {
+      conditions.push(`st.created_at >= ${idx++}::date`);
+      values.push(date_from);
     }
 
     const whereClause =
@@ -7914,6 +7935,18 @@ const io = new Server(server, {
 
 // نخلي io متاح في أي مكان
 app.set("io", io);
+
+// ===== Simple in-memory cache to reduce DB load =====
+const _cache = new Map();
+function getCached(key, ttlMs, fetchFn) {
+  const entry = _cache.get(key);
+  if (entry && Date.now() - entry.ts < ttlMs) return Promise.resolve(entry.data);
+  return fetchFn().then(data => { _cache.set(key, { data, ts: Date.now() }); return data; });
+}
+function clearCache(prefix) {
+  for (const k of _cache.keys()) { if (k.startsWith(prefix)) _cache.delete(k); }
+}
+
 
 // Online users tracking: userId -> Set of socketIds
 const onlineUsers = new Map();
