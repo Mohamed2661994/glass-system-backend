@@ -3334,6 +3334,7 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
   const userBranchId = req.user.branch_id;
   const userId = req.user.id;
   const userName = req.user.full_name || req.user.username || "System";
+  const BATCH_SIZE = 50;
 
   try {
     const { warehouse_id } = req.body;
@@ -3359,69 +3360,78 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
     );
 
     if (negResult.rows.length === 0) {
-      return res.json({ success: true, message: "لا توجد أصناف سالبة", invoices_created: 0 });
+      return res.json({ success: true, message: "لا توجد أصناف سالبة", invoices_created: 0, items_count: 0 });
     }
 
     const negItems = negResult.rows;
     const invoiceType = warehouse_id == 1 ? "retail" : "wholesale";
+    const today = new Date().toISOString().split("T")[0];
+
+    // Split into batches of BATCH_SIZE
+    const batches = [];
+    for (let i = 0; i < negItems.length; i += BATCH_SIZE) {
+      batches.push(negItems.slice(i, i + BATCH_SIZE));
+    }
+
+    const invoiceIds = [];
 
     await client.query("BEGIN");
 
-    // 2. Create adjustment purchase invoice
-    const today = new Date().toISOString().split("T")[0];
-    const total = 0; // Zero cost adjustment
+    for (let b = 0; b < batches.length; b++) {
+      const batch = batches[b];
 
-    const invResult = await client.query(
-      `INSERT INTO invoices
-        (branch_id, invoice_type, movement_type, invoice_date,
-         customer_name, total, subtotal, manual_discount, discount_total, paid_amount,
-         remaining_amount, payment_status, created_by, created_by_name,
-         is_return, apply_items_discount, previous_balance)
-       VALUES ($1, $2, 'purchase', $3,
-         'تصفير أصناف سالبة', 0, 0, 0, 0, 0,
-         0, 'paid', $4, $5,
-         false, false, 0)
-       RETURNING id`,
-      [
-        userBranchId,
-        invoiceType,
-        today,
-        userId,
-        userName
-      ]
-    );
-
-    const invoiceId = invResult.rows[0].id;
-
-    // 3. Insert invoice items + stock movements + update stock
-    for (const item of negItems) {
-      const adjustQty = Math.abs(Number(item.current_stock)); // positive qty to add
-      const variantId = Number(item.variant_id) || 0;
-
-      // Insert invoice item
-      await client.query(
-        `INSERT INTO invoice_items
-          (invoice_id, product_id, variant_id, quantity, price, discount, total)
-         VALUES ($1, $2, $3, $4, 0, 0, 0)`,
-        [invoiceId, item.product_id, variantId, adjustQty]
+      // Create invoice for this batch
+      const invResult = await client.query(
+        `INSERT INTO invoices
+          (branch_id, invoice_type, movement_type, invoice_date,
+           customer_name, total, subtotal, manual_discount, discount_total, paid_amount,
+           remaining_amount, payment_status, created_by, created_by_name,
+           is_return, apply_items_discount, previous_balance)
+         VALUES ($1, $2, 'purchase', $3,
+           $6, 0, 0, 0, 0, 0,
+           0, 'paid', $4, $5,
+           false, false, 0)
+         RETURNING id`,
+        [
+          userBranchId,
+          invoiceType,
+          today,
+          userId,
+          userName,
+          `تصفير أصناف سالبة (${b + 1}/${batches.length})`
+        ]
       );
 
-      // Update stock table
-      await client.query(
-        `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (warehouse_id, product_id, variant_id)
-         DO UPDATE SET quantity = stock.quantity + $4`,
-        [warehouse_id, item.product_id, variantId, adjustQty]
-      );
+      const invoiceId = invResult.rows[0].id;
+      invoiceIds.push(invoiceId);
 
-      // Insert stock movement
-      await client.query(
-        `INSERT INTO stock_movements
-          (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-         VALUES ($1, $2, $3, $4, $5, 'purchase')`,
-        [invoiceId, warehouse_id, item.product_id, variantId, adjustQty]
-      );
+      // Insert items for this batch
+      for (const item of batch) {
+        const adjustQty = Math.abs(Number(item.current_stock));
+        const variantId = Number(item.variant_id) || 0;
+
+        await client.query(
+          `INSERT INTO invoice_items
+            (invoice_id, product_id, variant_id, quantity, price, discount, total)
+           VALUES ($1, $2, $3, $4, 0, 0, 0)`,
+          [invoiceId, item.product_id, variantId, adjustQty]
+        );
+
+        await client.query(
+          `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (warehouse_id, product_id, variant_id)
+           DO UPDATE SET quantity = stock.quantity + $4`,
+          [warehouse_id, item.product_id, variantId, adjustQty]
+        );
+
+        await client.query(
+          `INSERT INTO stock_movements
+            (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+           VALUES ($1, $2, $3, $4, $5, 'purchase')`,
+          [invoiceId, warehouse_id, item.product_id, variantId, adjustQty]
+        );
+      }
     }
 
     await client.query("COMMIT");
@@ -3435,8 +3445,9 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
 
     res.json({
       success: true,
-      message: `تم تصفير ${negItems.length} صنف سالب`,
-      invoice_id: invoiceId,
+      message: `تم تصفير ${negItems.length} صنف سالب في ${batches.length} فاتورة`,
+      invoice_ids: invoiceIds,
+      invoices_created: batches.length,
       items_count: negItems.length,
     });
   } catch (err) {
