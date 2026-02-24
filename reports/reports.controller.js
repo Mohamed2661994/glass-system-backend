@@ -644,7 +644,8 @@ exports.getSupplierBalances = async (req, res) => {
       values.push(`%${supplier_name}%`);
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const whereClause =
+      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const result = await pool.query(
       `

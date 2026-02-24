@@ -7915,6 +7915,9 @@ const io = new Server(server, {
 // نخلي io متاح في أي مكان
 app.set("io", io);
 
+// Online users tracking: userId -> Set of socketIds
+const onlineUsers = new Map();
+
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
@@ -7942,8 +7945,22 @@ io.on("connection", (socket) => {
       socket.join(`branch_${branch_id}`);
       socket.join(`user_${user_id}`);
 
+      // Track online status
+      socket.userId = user_id;
+      if (!onlineUsers.has(user_id)) {
+        onlineUsers.set(user_id, new Set());
+      }
+      onlineUsers.get(user_id).add(socket.id);
+
+      // Broadcast to all that this user is online
+      io.emit("user_online", { user_id });
+
+      // Send current online users list to this socket
+      const onlineIds = Array.from(onlineUsers.keys());
+      socket.emit("online_users", { user_ids: onlineIds });
+
       console.log(
-        `User ${user_id} joined branch_${branch_id} + user_${user_id}`,
+        `User ${user_id} joined branch_${branch_id} + user_${user_id} (online)`,
       );
     } catch (err) {
       console.error("Socket register error:", err);
@@ -7977,6 +7994,15 @@ io.on("connection", (socket) => {
   );
 
   socket.on("disconnect", () => {
+    const uid = socket.userId;
+    if (uid && onlineUsers.has(uid)) {
+      onlineUsers.get(uid).delete(socket.id);
+      if (onlineUsers.get(uid).size === 0) {
+        onlineUsers.delete(uid);
+        // Broadcast to all that this user went offline
+        io.emit("user_offline", { user_id: uid });
+      }
+    }
     console.log("User disconnected:", socket.id);
   });
 });
