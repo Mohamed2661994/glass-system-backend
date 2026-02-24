@@ -678,6 +678,11 @@ exports.getSupplierBalances = async (req, res) => {
       invConditions.push(`branch_id = ${p}`);
       payConditions.push(`branch_id = ${p}`);
       cteConditions.push(`branch_id = ${p}`);
+      // Only show suppliers that have activity in this branch
+      conditions.push(
+        `(EXISTS (SELECT 1 FROM invoices WHERE supplier_id = s.id AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = ${p})
+          OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND branch_id = ${p}))`,
+      );
       values.push(warehouse_id);
     }
 
