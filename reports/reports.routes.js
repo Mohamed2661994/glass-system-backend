@@ -14,6 +14,8 @@ router.get("/customer-balances", reports.getCustomerBalances);
 router.get("/inventory-details", reports.getInventoryDetails);
 router.get("/manufacturers", reports.getManufacturers);
 router.get("/customer-debt-details", reports.getCustomerDebtDetails);
+router.get("/supplier-balances", reports.getSupplierBalances);
+router.get("/supplier-debt-details", reports.getSupplierDebtDetails);
 
 module.exports = router;
 

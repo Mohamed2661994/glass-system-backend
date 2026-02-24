@@ -626,3 +626,141 @@ exports.getCustomerDebtDetails = async (req, res) => {
     res.status(500).json({ error: "Server error", details: err.message });
   }
 };
+
+/* =========================================================
+   كشف حساب الموردين - Supplier Balances
+   ========================================================= */
+
+exports.getSupplierBalances = async (req, res) => {
+  try {
+    const { supplier_name } = req.query;
+
+    let conditions = [];
+    let values = [];
+    let idx = 1;
+
+    if (supplier_name) {
+      conditions.push(`s.name ILIKE $${idx++}`);
+      values.push(`%${supplier_name}%`);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const result = await pool.query(
+      `
+      SELECT
+        s.id AS supplier_id,
+        s.name AS supplier_name,
+        COALESCE(inv.total_purchases, 0) AS total_purchases,
+        COALESCE(inv.total_paid_invoices, 0) AS total_paid_invoices,
+        COALESCE(pay.total_payments, 0) AS total_payments,
+        GREATEST(
+          COALESCE(inv.total_purchases, 0)
+          - COALESCE(inv.total_paid_invoices, 0)
+          - COALESCE(pay.total_payments, 0),
+          0
+        ) AS balance_due,
+        inv.last_invoice_date
+      FROM suppliers s
+      LEFT JOIN (
+        SELECT
+          supplier_id,
+          SUM(total) AS total_purchases,
+          SUM(paid_amount) AS total_paid_invoices,
+          MAX(invoice_date) AS last_invoice_date
+        FROM invoices
+        WHERE movement_type = 'purchase' AND is_void IS NOT TRUE
+        GROUP BY supplier_id
+      ) inv ON inv.supplier_id = s.id
+      LEFT JOIN (
+        SELECT
+          supplier_id,
+          SUM(amount) AS total_payments
+        FROM cash_out
+        WHERE entry_type = 'supplier_payment' AND supplier_id IS NOT NULL
+        GROUP BY supplier_id
+      ) pay ON pay.supplier_id = s.id
+      ${whereClause}
+      ORDER BY balance_due DESC, s.name ASC
+      `,
+      values,
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("SUPPLIER BALANCES ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
+
+exports.getSupplierDebtDetails = async (req, res) => {
+  try {
+    const { supplier_id, from, to } = req.query;
+
+    if (!supplier_id) {
+      return res.status(400).json({ error: "supplier_id مطلوب" });
+    }
+
+    let invoiceConditions = [
+      "i.supplier_id = $1",
+      "i.movement_type = 'purchase'",
+      "i.is_void IS NOT TRUE",
+    ];
+    let values = [supplier_id];
+    let idx = 2;
+
+    if (from) {
+      invoiceConditions.push(`i.invoice_date >= $${idx++}`);
+      values.push(from);
+    }
+    if (to) {
+      invoiceConditions.push(`i.invoice_date <= $${idx++}`);
+      values.push(to);
+    }
+
+    const invoiceWhere = `WHERE ${invoiceConditions.join(" AND ")}`;
+
+    const result = await pool.query(
+      `
+      -- فواتير مشتريات
+      SELECT
+        'invoice' AS record_type,
+        i.id AS record_id,
+        i.invoice_date AS record_date,
+        i.total,
+        i.paid_amount,
+        i.remaining_amount,
+        NULL AS notes,
+        NULL AS permission_number
+      FROM invoices i
+      ${invoiceWhere}
+
+      UNION ALL
+
+      -- دفعات المورد
+      SELECT
+        'payment' AS record_type,
+        co.id AS record_id,
+        co.transaction_date AS record_date,
+        0 AS total,
+        co.amount AS paid_amount,
+        0 AS remaining_amount,
+        co.notes,
+        co.permission_number
+      FROM cash_out co
+      WHERE co.supplier_id = $1
+        AND co.entry_type = 'supplier_payment'
+      ${from ? `AND co.transaction_date >= '${from}'` : ""}
+      ${to ? `AND co.transaction_date <= '${to}'` : ""}
+
+      ORDER BY record_date ASC, record_id ASC
+      `,
+      values,
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("SUPPLIER DEBT DETAILS ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};

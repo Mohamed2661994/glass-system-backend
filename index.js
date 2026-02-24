@@ -5005,7 +5005,9 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
     const branch_id = req.user.branch_id; // ✅ من التوكن
     const { name, amount, notes, date, entry_type, supplier_id } = req.body;
     const safeEntryType =
-      entry_type === "purchase" || entry_type === "expense" || entry_type === "supplier_payment"
+      entry_type === "purchase" ||
+      entry_type === "expense" ||
+      entry_type === "supplier_payment"
         ? entry_type
         : "expense";
 
@@ -5070,7 +5072,9 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
     const { id } = req.params;
     const { name, amount, notes, date, entry_type, supplier_id } = req.body;
     const safeEntryType =
-      entry_type === "purchase" || entry_type === "expense" || entry_type === "supplier_payment"
+      entry_type === "purchase" ||
+      entry_type === "expense" ||
+      entry_type === "supplier_payment"
         ? entry_type
         : "expense";
 
@@ -5081,9 +5085,16 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
       WHERE id=$7 AND branch_id=$8
       RETURNING *
       `,
-      [name, Number(amount), notes || null, date, safeEntryType,
-       safeEntryType === "supplier_payment" ? supplier_id : null,
-       id, branch_id],
+      [
+        name,
+        Number(amount),
+        notes || null,
+        date,
+        safeEntryType,
+        safeEntryType === "supplier_payment" ? supplier_id : null,
+        id,
+        branch_id,
+      ],
     );
 
     if (!result.rows.length) {
@@ -5148,7 +5159,7 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
         s.name AS supplier_name
       FROM cash_out co
       LEFT JOIN suppliers s ON s.id = co.supplier_id
-      WHERE ${conditions.map(c => c.replace('branch_id', 'co.branch_id').replace('transaction_date', 'co.transaction_date')).join(" AND ")}
+      WHERE ${conditions.map((c) => c.replace("branch_id", "co.branch_id").replace("transaction_date", "co.transaction_date")).join(" AND ")}
       ORDER BY co.transaction_date DESC, co.created_at DESC, co.id DESC
       LIMIT $${idx++} OFFSET $${idx++}
       `,
