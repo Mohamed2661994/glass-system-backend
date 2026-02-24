@@ -750,6 +750,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
         i.total,
         i.paid_amount,
         i.remaining_amount,
+        COALESCE(i.previous_balance, 0) AS previous_balance,
         NULL AS notes,
         NULL AS permission_number
       FROM invoices i
@@ -765,6 +766,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
         0 AS total,
         co.amount AS paid_amount,
         0 AS remaining_amount,
+        0 AS previous_balance,
         co.notes,
         co.permission_number
       FROM cash_out co
