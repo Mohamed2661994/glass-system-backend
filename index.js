@@ -3374,11 +3374,11 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
     const invResult = await client.query(
       `INSERT INTO invoices
         (branch_id, invoice_type, movement_type, invoice_date,
-         customer_name, total, subtotal, discount, paid_amount,
+         customer_name, total, subtotal, manual_discount, discount_total, paid_amount,
          remaining_amount, payment_status, created_by, created_by_name,
          is_return, notes, previous_balance, apply_items_discount)
        VALUES ($1, $2, 'purchase', $3,
-         'تصفير أصناف سالبة', 0, 0, 0, 0,
+         'تصفير أصناف سالبة', 0, 0, 0, 0, 0,
          0, 'paid', $4, $5,
          false, $6, 0, false)
        RETURNING id`,
