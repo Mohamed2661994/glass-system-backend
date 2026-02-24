@@ -668,18 +668,26 @@ exports.getSupplierBalances = async (req, res) => {
 
     const result = await pool.query(
       `
+      WITH opening AS (
+        SELECT DISTINCT ON (supplier_id)
+          supplier_id,
+          COALESCE(previous_balance, 0) AS opening_balance
+        FROM invoices
+        WHERE movement_type = 'purchase' AND is_void IS NOT TRUE AND supplier_id IS NOT NULL
+        ORDER BY supplier_id, invoice_date ASC, id ASC
+      )
       SELECT
         s.id AS supplier_id,
         s.name AS supplier_name,
         COALESCE(inv.total_purchases, 0) AS total_purchases,
         COALESCE(inv.total_paid_invoices, 0) AS total_paid_invoices,
         COALESCE(pay.total_payments, 0) AS total_payments,
-        GREATEST(
-          COALESCE(inv.total_purchases, 0)
+        COALESCE(o.opening_balance, 0) AS opening_balance,
+        COALESCE(o.opening_balance, 0)
+          + COALESCE(inv.total_purchases, 0)
           - COALESCE(inv.total_paid_invoices, 0)
-          - COALESCE(pay.total_payments, 0),
-          0
-        ) AS balance_due,
+          - COALESCE(pay.total_payments, 0)
+        AS balance_due,
         inv.last_invoice_date
       FROM suppliers s
       LEFT JOIN (
@@ -700,6 +708,7 @@ exports.getSupplierBalances = async (req, res) => {
         WHERE entry_type = 'supplier_payment' AND supplier_id IS NOT NULL
         GROUP BY supplier_id
       ) pay ON pay.supplier_id = s.id
+      LEFT JOIN opening o ON o.supplier_id = s.id
       ${whereClause}
       ORDER BY balance_due DESC, s.name ASC
       `,
