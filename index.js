@@ -3497,11 +3497,12 @@ app.get("/dashboard/stats", async (req, res) => {
         // Negative stock count — calculated from stock_movements
         pool.query(
           `SELECT COUNT(*) AS count FROM (
-            SELECT product_id
-            FROM stock_movements
-            WHERE warehouse_id = $1
-            GROUP BY product_id, variant_id
-            HAVING SUM(quantity) < 0
+            SELECT sm.product_id
+            FROM stock_movements sm
+            JOIN products p ON p.id = sm.product_id
+            WHERE sm.warehouse_id = $1 AND p.is_active = true
+            GROUP BY sm.product_id, sm.variant_id
+            HAVING SUM(sm.quantity) < 0
           ) neg`,
           [warehouseId],
         ),
