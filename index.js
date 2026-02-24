@@ -3452,6 +3452,49 @@ app.post("/invoices/zero-negative-stock", authMiddleware, async (req, res) => {
   }
 });
 
+// ========== Reconcile Stock ==========
+app.post("/stock/reconcile", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Recalculate stock from stock_movements
+    const result = await client.query(`
+      UPDATE stock s
+      SET quantity = COALESCE(sm_sum.total, 0)
+      FROM (
+        SELECT warehouse_id, product_id, variant_id, SUM(quantity) AS total
+        FROM stock_movements
+        GROUP BY warehouse_id, product_id, variant_id
+      ) sm_sum
+      WHERE s.warehouse_id = sm_sum.warehouse_id
+        AND s.product_id = sm_sum.product_id
+        AND COALESCE(s.variant_id, 0) = COALESCE(sm_sum.variant_id, 0)
+        AND s.quantity != COALESCE(sm_sum.total, 0)
+    `);
+
+    await client.query("COMMIT");
+
+    const io = req.app.get("io");
+    const userBranchId = req.user.branch_id;
+    if (io) {
+      io.to(`branch_${userBranchId}`).emit("data_changed", { type: "data:stock" });
+    }
+
+    res.json({
+      success: true,
+      fixed_count: result.rowCount,
+      message: `تم تصحيح ${result.rowCount} صنف`
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("RECONCILE ERROR:", err);
+    res.status(500).json({ error: err.message || "فشل تصحيح الأرصدة" });
+  } finally {
+    client.release();
+  }
+});
+
 // ========== Dashboard Stats ==========
 app.get("/dashboard/stats", async (req, res) => {
   try {
