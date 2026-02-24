@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
 const { exec } = require("child_process");
@@ -5771,30 +5771,40 @@ app.put("/cash-in/:id", authMiddleware, async (req, res) => {
       return res.status(403).json({ error: "غير مسموح بالتعديل" });
     }
 
-    if (checkRes.rows[0].source_type !== "manual") {
-      return res.status(400).json({ error: "لا يمكن تعديل قيد غير يدوي" });
-    }
+    const sourceType = checkRes.rows[0].source_type;
 
-    await client.query(
-      `
-      UPDATE cash_in
-      SET
-        customer_name = $1,
-        description = $2,
-        amount = $3,
-        paid_amount = $3,
-        transaction_date = $4::date
-      WHERE id = $5 AND branch_id = $6
-      `,
-      [
-        customer_name,
-        description,
-        Number(amount),
-        transaction_date,
-        id,
-        branch_id,
-      ],
-    );
+    if (sourceType === "invoice") {
+      // For invoice entries, only allow updating the date
+      await client.query(
+        `
+        UPDATE cash_in
+        SET transaction_date = $1::date
+        WHERE id = $2 AND branch_id = $3
+        `,
+        [transaction_date, id, branch_id],
+      );
+    } else {
+      await client.query(
+        `
+        UPDATE cash_in
+        SET
+          customer_name = $1,
+          description = $2,
+          amount = $3,
+          paid_amount = $3,
+          transaction_date = $4::date
+        WHERE id = $5 AND branch_id = $6
+        `,
+        [
+          customer_name,
+          description,
+          Number(amount),
+          transaction_date,
+          id,
+          branch_id,
+        ],
+      );
+    }
 
     await client.query("COMMIT");
 
