@@ -41,7 +41,11 @@ function getCairoDate() {
 const app = express();
 app.use(
   cors({
-    origin: "*", // مؤقتًا للتجربة
+    origin: [
+      "https://homeglass-web.vercel.app",
+      "http://localhost:3000",
+      "http://192.168.1.63:3000",
+    ],
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
@@ -50,34 +54,32 @@ app.use(
 
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
-// ONE-TIME migration: fix retail cash_in branch_id (REMOVE AFTER USE)
-app.get("/migrate/fix-retail-branch", async (req, res) => {
+// Global auth middleware — protects ALL routes except public ones
+const PUBLIC_PATHS = ["/login", "/health"];
+const jwt_auth = require("jsonwebtoken");
+app.use((req, res, next) => {
+  // Allow public paths
+  if (PUBLIC_PATHS.some((p) => req.path === p || req.path.startsWith(p + "/"))) return next();
+  // Allow static files
+  if (req.path.startsWith("/assets") || req.path.startsWith("/uploads")) return next();
+  // Allow Socket.IO
+  if (req.path.startsWith("/socket.io")) return next();
+  // Check auth
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
+  const token = authHeader.split(" ")[1];
   try {
-    const result = await pool.query(`
-      UPDATE cash_in
-      SET branch_id = 1
-      WHERE source_type = 'invoice'
-        AND branch_id = 2
-        AND invoice_id IN (
-          SELECT id FROM invoices WHERE invoice_type = 'retail'
-        )
-    `);
-    res.json({ success: true, fixed_rows: result.rowCount });
+    const decoded = jwt_auth.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(401).json({ error: "Token غير صالح" });
   }
 });
 
-// ONE-TIME: check warehouses (REMOVE AFTER USE)
-app.get("/migrate/warehouses", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, name, branch_id FROM warehouses ORDER BY id`,
-    );
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// Health check endpoint (for Render / monitoring)
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
 // Chat uploads
@@ -7292,17 +7294,6 @@ app.post("/system/restore", authMiddleware, (req, res) => {
       res.json({ success: true });
     },
   );
-});
-
-app.get("/fix-admin", async (req, res) => {
-  const bcrypt = require("bcrypt");
-  const hash = await bcrypt.hash("123456", 10);
-
-  await pool.query("UPDATE users SET password = $1 WHERE username = 'admin'", [
-    hash,
-  ]);
-
-  res.send("admin password fixed");
 });
 
 /* =========================
