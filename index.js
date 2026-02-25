@@ -55,7 +55,7 @@ app.use(
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
 // Global auth middleware — protects ALL routes except public ones
-const PUBLIC_PATHS = ["/login", "/health"];
+const PUBLIC_PATHS = ["/login", "/health", "/public"];
 const jwt_auth = require("jsonwebtoken");
 app.use((req, res, next) => {
   // Allow public paths
@@ -805,7 +805,9 @@ app.delete("/customers/:id", async (req, res) => {
         .json({ error: "لا يمكن حذف عميل لديه فواتير مسجلة" });
     }
     // Delete phones first, then customer
-    await pool.query(`DELETE FROM customer_phones WHERE customer_id = $1`, [id]);
+    await pool.query(`DELETE FROM customer_phones WHERE customer_id = $1`, [
+      id,
+    ]);
     await pool.query(`DELETE FROM customers WHERE id = $1`, [id]);
     res.json({ success: true });
   } catch (err) {
