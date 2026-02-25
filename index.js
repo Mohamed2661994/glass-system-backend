@@ -45,6 +45,7 @@ app.use(
       "https://homeglass-web.vercel.app",
       "https://house-of-glass-phi.vercel.app",
       "http://localhost:3000",
+      "http://localhost:8000",
       "http://192.168.1.63:3000",
     ],
     methods: ["GET", "POST", "PUT", "DELETE"],
