@@ -531,6 +531,8 @@ app.get("/products", async (req, res) => {
         WHEN $1 = 'wholesale' THEN p.wholesale_price
         ELSE p.retail_price
       END AS price,
+      p.wholesale_price,
+      p.retail_price,
       p.discount_amount,
       COALESCE(SUM(s.quantity), 0) AS available_quantity
     FROM products p
