@@ -3667,11 +3667,22 @@ app.delete("/invoices/:id", async (req, res) => {
 // جلب كل الأصناف (للإدارة)
 app.get("/admin/products", async (req, res) => {
   try {
-    const { search, manufacturer, limit = 0, offset = 0 } = req.query;
+    const { search, manufacturer, limit = 0, offset = 0, active } = req.query;
 
     let conditions = [];
     let values = [];
     let idx = 1;
+
+    // active filter: "true" = active only, "false" = inactive only, "all" = everything
+    // When searching, search ALL products regardless of active filter
+    if (!search) {
+      if (active === "false") {
+        conditions.push(`p.is_active = false`);
+      } else if (active !== "all") {
+        // Default: active only (when not searching)
+        conditions.push(`p.is_active = true`);
+      }
+    }
 
     if (search) {
       conditions.push(
