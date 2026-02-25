@@ -43,6 +43,7 @@ app.use(
   cors({
     origin: [
       "https://homeglass-web.vercel.app",
+      "https://house-of-glass-phi.vercel.app",
       "http://localhost:3000",
       "http://192.168.1.63:3000",
     ],
