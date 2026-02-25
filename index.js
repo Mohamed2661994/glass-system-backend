@@ -59,9 +59,11 @@ const PUBLIC_PATHS = ["/login", "/health"];
 const jwt_auth = require("jsonwebtoken");
 app.use((req, res, next) => {
   // Allow public paths
-  if (PUBLIC_PATHS.some((p) => req.path === p || req.path.startsWith(p + "/"))) return next();
+  if (PUBLIC_PATHS.some((p) => req.path === p || req.path.startsWith(p + "/")))
+    return next();
   // Allow static files
-  if (req.path.startsWith("/assets") || req.path.startsWith("/uploads")) return next();
+  if (req.path.startsWith("/assets") || req.path.startsWith("/uploads"))
+    return next();
   // Allow Socket.IO
   if (req.path.startsWith("/socket.io")) return next();
   // Check auth
@@ -781,6 +783,30 @@ app.delete("/customers/:id/phones/:phoneId", async (req, res) => {
       `DELETE FROM customer_phones WHERE id = $1 AND customer_id = $2`,
       [phoneId, id],
     );
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Delete a customer (only if no invoices reference them)
+app.delete("/customers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Check if customer has any invoices
+    const { rows } = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM invoices WHERE customer_id = $1`,
+      [id],
+    );
+    if (rows[0].cnt > 0) {
+      return res
+        .status(400)
+        .json({ error: "لا يمكن حذف عميل لديه فواتير مسجلة" });
+    }
+    // Delete phones first, then customer
+    await pool.query(`DELETE FROM customer_phones WHERE customer_id = $1`, [id]);
+    await pool.query(`DELETE FROM customers WHERE id = $1`, [id]);
     res.json({ success: true });
   } catch (err) {
     console.error(err);
