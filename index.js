@@ -3316,12 +3316,12 @@ app.get("/invoices", async (req, res) => {
     }
 
     if (date_from) {
-      conditions.push(`created_at >= $${idx++}`);
+      conditions.push(`COALESCE(invoice_date, created_at) >= $${idx++}`);
       values.push(date_from);
     }
 
     if (date_to) {
-      conditions.push(`created_at < ($${idx++}::date + INTERVAL '1 day')`);
+      conditions.push(`COALESCE(invoice_date, created_at) < ($${idx++}::date + INTERVAL '1 day')`);
       values.push(date_to);
     }
 
@@ -3346,11 +3346,12 @@ app.get("/invoices", async (req, res) => {
         paid_amount,
         remaining_amount,
         payment_status,
+        invoice_date,
         created_at,
         created_by_name
       FROM invoices
       ${whereClause}
-      ORDER BY created_at DESC
+      ORDER BY COALESCE(invoice_date, created_at) DESC
       LIMIT $${idx++} OFFSET $${idx++}
       `,
       [...values, limit, offset],
