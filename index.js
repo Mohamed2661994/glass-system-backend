@@ -1855,7 +1855,7 @@ app.put("/invoices/retail/:id", async (req, res) => {
       apply_items_discount = false,
     } = req.body;
 
-    const { updated_by, updated_by_name, supplier_name, supplier_phone } =
+    const { updated_by, updated_by_name, supplier_name, supplier_phone, invoice_date } =
       req.body;
 
     if (!items || !items.length || final_total === undefined) {
@@ -2015,7 +2015,8 @@ SET
   updated_by_name = $13,
   supplier_id = $15,
   supplier_name = $16,
-  supplier_phone = $17
+  supplier_phone = $17,
+  invoice_date = COALESCE($18::date, invoice_date)
 WHERE id = $14
       `,
       [
@@ -2036,6 +2037,7 @@ WHERE id = $14
         supplierId,
         supplier_name || null,
         supplier_phone || null,
+        invoice_date || null,
       ],
     );
 
@@ -2064,11 +2066,11 @@ WHERE id = $14
         paid_amount = $1,
         remaining_amount = $2,
         customer_name = $3,
-        transaction_date = CURRENT_DATE
+        transaction_date = COALESCE($5::date, transaction_date)
       WHERE invoice_id = $4
         AND source_type = 'invoice'
       `,
-          [Number(paid_amount), remaining_amount, customer_name, invoiceId],
+          [Number(paid_amount), remaining_amount, customer_name, invoiceId, invoice_date || null],
         );
       } else {
         // 🟢 إنشاء قيد جديد
@@ -2087,7 +2089,7 @@ WHERE id = $14
         transaction_date
       )
       VALUES
-      ($1,$2,$3,$4,$4,$5,$6,'invoice',CURRENT_DATE)
+      ($1,$2,$3,$4,$4,$5,$6,'invoice',COALESCE($7::date, CURRENT_DATE))
       `,
           [
             1, // فرع القطاعي
@@ -2096,6 +2098,7 @@ WHERE id = $14
             Number(paid_amount),
             remaining_amount,
             `تحصيل تعديل فاتورة قطاعي رقم ${invoiceId}`,
+            invoice_date || null,
           ],
         );
       }
@@ -2347,10 +2350,8 @@ app.put("/invoices/:id", async (req, res) => {
       manual_discount = 0,
     } = req.body;
 
-    const { updated_by, updated_by_name, supplier_name, supplier_phone } =
-      req.body;
-
-    if (!items || !items.length) {
+    const { updated_by, updated_by_name, supplier_name, supplier_phone, invoice_date } =
+      req.body;    if (!items || !items.length) {
       throw new Error("لا يوجد أصناف في الفاتورة");
     }
 
@@ -2579,7 +2580,8 @@ SET
   updated_by_name = $13,
   supplier_id = $15,
   supplier_name = $16,
-  supplier_phone = $17
+  supplier_phone = $17,
+  invoice_date = COALESCE($18::date, invoice_date)
 WHERE id = $14
   `,
       [
@@ -2600,6 +2602,7 @@ WHERE id = $14
         supplierId,
         supplier_name || null,
         supplier_phone || null,
+        invoice_date || null,
       ],
     );
 
@@ -2628,11 +2631,11 @@ WHERE id = $14
         paid_amount = $1,
         remaining_amount = $2,
         customer_name = $3,
-        transaction_date = CURRENT_DATE
+        transaction_date = COALESCE($5::date, transaction_date)
       WHERE invoice_id = $4
         AND source_type = 'invoice'
       `,
-          [Number(paid_amount), remaining, customer_name, invoiceId],
+          [Number(paid_amount), remaining, customer_name, invoiceId, invoice_date || null],
         );
       } else {
         // 🟢 إنشاء قيد جديد
@@ -2651,7 +2654,7 @@ WHERE id = $14
         transaction_date
       )
       VALUES
-      ($1,$2,$3,$4,$4,$5,$6,'invoice',CURRENT_DATE)
+      ($1,$2,$3,$4,$4,$5,$6,'invoice',COALESCE($7::date, CURRENT_DATE))
       `,
           [
             /* branch_id */ 2, // أو خده من الفاتورة لو موجود
@@ -2660,6 +2663,7 @@ WHERE id = $14
             Number(paid_amount),
             remaining,
             `تحصيل تعديل فاتورة رقم ${invoiceId}`,
+            invoice_date || null,
           ],
         );
       }
@@ -3321,7 +3325,9 @@ app.get("/invoices", async (req, res) => {
     }
 
     if (date_to) {
-      conditions.push(`COALESCE(invoice_date, created_at) < ($${idx++}::date + INTERVAL '1 day')`);
+      conditions.push(
+        `COALESCE(invoice_date, created_at) < ($${idx++}::date + INTERVAL '1 day')`,
+      );
       values.push(date_to);
     }
 
