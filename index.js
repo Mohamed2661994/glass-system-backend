@@ -118,6 +118,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     activeDb: pool.activeDb,
+    manualOverride: pool.isManualOverride || false,
     lastFailoverTime: pool.lastFailoverTime
       ? new Date(pool.lastFailoverTime).toISOString()
       : null,
@@ -335,15 +336,33 @@ app.post("/admin/backup", (req, res) => {
           { timeout: 120000 },
           (uploadErr) => {
             if (uploadErr) {
-              send(100, `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB) — فشل الرفع على Drive`, true, false, { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) });
+              send(
+                100,
+                `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB) — فشل الرفع على Drive`,
+                true,
+                false,
+                { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
+              );
             } else {
-              send(100, `تم الباك أب + الرفع على Drive: ${path.basename(backupFile)} (${sizeMB} MB)`, true, false, { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) });
+              send(
+                100,
+                `تم الباك أب + الرفع على Drive: ${path.basename(backupFile)} (${sizeMB} MB)`,
+                true,
+                false,
+                { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
+              );
             }
           },
         );
       } else {
         // No Drive credentials — try env-based upload
-        send(100, `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB)`, true, false, { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) });
+        send(
+          100,
+          `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB)`,
+          true,
+          false,
+          { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
+        );
       }
     } catch (e) {
       send(0, e.message, false, true);
@@ -429,7 +448,9 @@ app.post("/admin/restore", async (req, res) => {
       }
       await client.query("COMMIT");
     } catch (txErr) {
-      try { await client.query("ROLLBACK"); } catch {}
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
       throw txErr;
     } finally {
       client.release();
@@ -437,12 +458,24 @@ app.post("/admin/restore", async (req, res) => {
     }
 
     // Cleanup
-    try { fs.unlinkSync(tmpFile); } catch {}
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {}
 
-    send(100, `تم الريستور: ${dl.fileName} (${errors > 0 ? errors + " تحذيرات" : "بدون أخطاء"})`, true, false, { file: dl.fileName, target });
+    send(
+      100,
+      `تم الريستور: ${dl.fileName} (${errors > 0 ? errors + " تحذيرات" : "بدون أخطاء"})`,
+      true,
+      false,
+      { file: dl.fileName, target },
+    );
   } catch (err) {
     console.error("restore error:", err);
-    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+    if (tmpFile) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
     send(0, `فشل الريستور: ${err.message}`, false, true);
   }
 });

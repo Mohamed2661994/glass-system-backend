@@ -35,6 +35,7 @@ neonPool.on("connect", (client) => {
 
 /* ── Hybrid wrapper ────────────────────────────────────── */
 let usingNeon = false;
+let manualOverride = false; // true = user switched manually, don't auto-failback
 let lastFailoverTime = null;
 let lastFailbackTime = null;
 const FAILBACK_CHECK_INTERVAL = 60_000; // try local again every 60s
@@ -54,6 +55,7 @@ async function getClient() {
         err.message,
       );
       usingNeon = true;
+      manualOverride = false; // auto-failover, allow auto-failback
       lastFailoverTime = Date.now();
     }
   }
@@ -93,16 +95,22 @@ const pool = {
   },
 
   /** Manually switch active DB */
-  switchTo(target) {
+  switchTo(target, manual = true) {
     if (target === "neon") {
       usingNeon = true;
+      if (manual) manualOverride = true;
       lastFailoverTime = Date.now();
-      console.log("🔄 Manually switched to Neon");
+      console.log(`🔄 ${manual ? 'Manually' : 'Auto'} switched to Neon`);
     } else {
       usingNeon = false;
+      manualOverride = false;
       lastFailbackTime = Date.now();
-      console.log("🔄 Manually switched to Local");
+      console.log(`🔄 ${manual ? 'Manually' : 'Auto'} switched to Local`);
     }
+  },
+
+  get isManualOverride() {
+    return manualOverride;
   },
 
   /** Test connectivity to a specific pool */
@@ -118,6 +126,7 @@ const pool = {
 /* ── Periodic fail-back check ──────────────────────────── */
 setInterval(async () => {
   if (!usingNeon) return;
+  if (manualOverride) return; // user switched manually, don't auto-failback
   try {
     const client = await localPool.connect();
     await client.query("SELECT 1");
