@@ -89,14 +89,14 @@ app.get("/health", (req, res) => {
   // Find latest backup file
   let lastBackup = null;
   try {
-    const backupDir = "D:\\glass-backups";
-    if (fs.existsSync(backupDir)) {
+    const bDir = process.platform === "win32" ? "D:\\glass-backups" : path.join(__dirname, "backups");
+    if (fs.existsSync(bDir)) {
       const files = fs
-        .readdirSync(backupDir)
+        .readdirSync(bDir)
         .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
         .map((f) => ({
           name: f,
-          mtime: fs.statSync(path.join(backupDir, f)).mtime,
+          mtime: fs.statSync(path.join(bDir, f)).mtime,
         }))
         .sort((a, b) => b.mtime - a.mtime);
       if (files.length > 0) {
@@ -135,58 +135,92 @@ app.post("/admin/switch-db", async (req, res) => {
         .status(400)
         .json({ error: "target must be 'local' or 'neon'" });
     }
+    if (pool.activeDb === target) {
+      return res.json({ success: true, activeDb: target, msg: "Already active" });
+    }
     // Test connection first
     await pool.testConnection(target);
     pool.switchTo(target);
     res.json({ success: true, activeDb: pool.activeDb });
   } catch (err) {
+    console.error("switch-db error:", err);
     res
       .status(500)
       .json({ error: `Cannot connect to ${req.body.target}: ${err.message}` });
   }
 });
 
+/* ── Cross-platform helpers ── */
+const isWindows = process.platform === "win32";
+const BACKUP_DIR = isWindows
+  ? "D:\\glass-backups"
+  : path.join(__dirname, "backups");
+const PG_DUMP = isWindows
+  ? '"C:\\Program Files\\PostgreSQL\\18\\bin\\pg_dump.exe"'
+  : "pg_dump";
+const PSQL = isWindows
+  ? '"C:\\Program Files\\PostgreSQL\\18\\bin\\psql.exe"'
+  : "psql";
+
+function getDbEnv(target) {
+  const isNeon = target === "neon";
+  return {
+    host: isNeon ? process.env.DB_HOST_NEON : process.env.DB_HOST_LOCAL,
+    port: isNeon ? process.env.DB_PORT_NEON || "5432" : process.env.DB_PORT_LOCAL || "5432",
+    user: isNeon ? process.env.DB_USER_NEON : process.env.DB_USER_LOCAL,
+    pass: isNeon ? process.env.DB_PASSWORD_NEON : process.env.DB_PASSWORD_LOCAL,
+    name: isNeon ? process.env.DB_NAME_NEON : process.env.DB_NAME_LOCAL,
+    isNeon,
+  };
+}
+
+function buildPgCmd(tool, dbEnv, extraArgs) {
+  const { host, port, user, pass, name, isNeon } = dbEnv;
+  const sslEnv = isNeon
+    ? isWindows ? "set PGSSLMODE=require&&" : "PGSSLMODE=require "
+    : "";
+  const passEnv = isWindows
+    ? `set PGPASSWORD=${pass}&&`
+    : `PGPASSWORD='${pass}' `;
+  return `${passEnv}${sslEnv}${tool} -U ${user} -h ${host} -p ${port} -d ${name} ${extraArgs}`;
+}
+
 /* ── Admin: Manual Backup ── */
 app.post("/admin/backup", (req, res) => {
-  const backupDir = "D:\\glass-backups";
-  const pgDump = '"C:\\Program Files\\PostgreSQL\\18\\bin\\pg_dump.exe"';
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[T:]/g, "_")
-    .replace(/\..+/, "")
-    .replace(/-/g, "-");
+  // Ensure backup directory exists
+  if (!fs.existsSync(BACKUP_DIR)) {
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  }
+
   const ts = (() => {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}_${String(d.getHours()).padStart(2, "0")}-${String(d.getMinutes()).padStart(2, "0")}`;
   })();
-  const backupFile = path.join(backupDir, `glass_system_${ts}.sql`);
+  const backupFile = path.join(BACKUP_DIR, `glass_system_${ts}.sql`);
 
-  // Always backup from the currently active DB
-  const isNeon = pool.activeDb === "neon";
-  const dbHost = isNeon ? process.env.DB_HOST_NEON : process.env.DB_HOST_LOCAL;
-  const dbPort = isNeon
-    ? process.env.DB_PORT_NEON || "5432"
-    : process.env.DB_PORT_LOCAL || "5432";
-  const dbUser = isNeon ? process.env.DB_USER_NEON : process.env.DB_USER_LOCAL;
-  const dbPass = isNeon
-    ? process.env.DB_PASSWORD_NEON
-    : process.env.DB_PASSWORD_LOCAL;
-  const dbName = isNeon ? process.env.DB_NAME_NEON : process.env.DB_NAME_LOCAL;
-  const sslFlag = isNeon ? "require" : "prefer";
+  const dbEnv = getDbEnv(pool.activeDb);
+  const cmd = buildPgCmd(
+    PG_DUMP,
+    dbEnv,
+    `--clean --if-exists --no-owner --no-privileges --encoding=UTF8 -f "${backupFile}"`,
+  );
 
-  const cmd = `set PGPASSWORD=${dbPass}&& ${pgDump} -U ${dbUser} -h ${dbHost} -p ${dbPort} -d ${dbName} --clean --if-exists --no-owner --no-privileges --encoding=UTF8 -f "${backupFile}"`;
+  const shell = isWindows ? "cmd" : "/bin/sh";
+  const shellFlag = isWindows ? "/c" : "-c";
 
-  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+  exec(cmd, { timeout: 120000, shell: `${shell}` }, (err, stdout, stderr) => {
     if (err) {
+      console.error("backup error:", err.message, stderr);
       return res.status(500).json({ error: `Backup failed: ${err.message}` });
     }
     try {
       const size = fs.statSync(backupFile).size;
       const sizeMB = (size / 1024 / 1024).toFixed(2);
 
-      // Upload to Google Drive in background
+      // Upload to Google Drive in background (only if credentials exist)
       const gdrive = path.join(__dirname, "scripts", "gdrive-helper.js");
-      if (fs.existsSync(gdrive)) {
+      const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
+      if (fs.existsSync(gdrive) && fs.existsSync(tokenFile)) {
         exec(
           `node "${gdrive}" upload "${backupFile}"`,
           { timeout: 120000 },
@@ -213,44 +247,35 @@ app.post("/admin/restore", (req, res) => {
     return res.status(400).json({ error: "target must be 'local' or 'neon'" });
   }
 
-  const backupDir = "D:\\glass-backups";
-  const psql = '"C:\\Program Files\\PostgreSQL\\18\\bin\\psql.exe"';
-
   // Find latest backup
+  if (!fs.existsSync(BACKUP_DIR)) {
+    return res.status(404).json({ error: "No backup directory found" });
+  }
+
   let latestFile;
   try {
     const files = fs
-      .readdirSync(backupDir)
+      .readdirSync(BACKUP_DIR)
       .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
       .map((f) => ({
         name: f,
-        mtime: fs.statSync(path.join(backupDir, f)).mtime,
+        mtime: fs.statSync(path.join(BACKUP_DIR, f)).mtime,
       }))
       .sort((a, b) => b.mtime - a.mtime);
     if (files.length === 0) {
       return res.status(404).json({ error: "No backup files found" });
     }
-    latestFile = path.join(backupDir, files[0].name);
+    latestFile = path.join(BACKUP_DIR, files[0].name);
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 
-  const isNeon = target === "neon";
-  const dbHost = isNeon ? process.env.DB_HOST_NEON : process.env.DB_HOST_LOCAL;
-  const dbPort = isNeon
-    ? process.env.DB_PORT_NEON || "5432"
-    : process.env.DB_PORT_LOCAL || "5432";
-  const dbUser = isNeon ? process.env.DB_USER_NEON : process.env.DB_USER_LOCAL;
-  const dbPass = isNeon
-    ? process.env.DB_PASSWORD_NEON
-    : process.env.DB_PASSWORD_LOCAL;
-  const dbName = isNeon ? process.env.DB_NAME_NEON : process.env.DB_NAME_LOCAL;
-  const sslMode = isNeon ? "set PGSSLMODE=require&&" : "";
-
-  const cmd = `set PGPASSWORD=${dbPass}&&${sslMode} ${psql} -U ${dbUser} -h ${dbHost} -p ${dbPort} -d ${dbName} -f "${latestFile}"`;
+  const dbEnv = getDbEnv(target);
+  const cmd = buildPgCmd(PSQL, dbEnv, `-f "${latestFile}"`);
 
   exec(cmd, { timeout: 120000 }, (err) => {
     if (err) {
+      console.error("restore error:", err.message);
       return res.status(500).json({ error: `Restore failed: ${err.message}` });
     }
     res.json({
