@@ -40,7 +40,7 @@ try {
     $pgDump = Join-Path $PSQL_BIN "pg_dump.exe"
     & $pgDump -U $DB_USER -h $DB_HOST -p $DB_PORT -d $DB_NAME `
         --clean --if-exists --no-owner --no-privileges `
-        --encoding=UTF8 -f $backupFile 2>&1
+        --inserts --encoding=UTF8 -f $backupFile 2>&1
 
     if ($LASTEXITCODE -ne 0) {
         Write-Log "ERROR: pg_dump failed with exit code $LASTEXITCODE"

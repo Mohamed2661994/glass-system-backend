@@ -170,9 +170,6 @@ const BACKUP_DIR = isWindows
 const PG_DUMP = isWindows
   ? '"C:\\Program Files\\PostgreSQL\\18\\bin\\pg_dump.exe"'
   : "pg_dump";
-const PSQL = isWindows
-  ? '"C:\\Program Files\\PostgreSQL\\18\\bin\\psql.exe"'
-  : "psql";
 
 function getDbEnv(target) {
   const isNeon = target === "neon";
@@ -201,6 +198,74 @@ function buildPgCmd(tool, dbEnv, extraArgs) {
   return `${passEnv}${sslEnv}${tool} -U ${user} -h ${host} -p ${port} -d ${name} ${extraArgs}`;
 }
 
+/* ── Google Drive: download latest backup ── */
+async function downloadLatestFromDrive() {
+  const { google } = require("googleapis");
+
+  let clientId, clientSecret, refreshToken;
+  const credFile = path.join(__dirname, "credentials", "oauth-client.json");
+  const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
+
+  if (fs.existsSync(credFile) && fs.existsSync(tokenFile)) {
+    // Local dev: read from files
+    const creds = JSON.parse(fs.readFileSync(credFile, "utf8"));
+    const key = Object.keys(creds)[0];
+    clientId = creds[key].client_id;
+    clientSecret = creds[key].client_secret;
+    const tokens = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
+    refreshToken = tokens.refresh_token;
+  } else {
+    // Render: read from env vars
+    clientId = process.env.GDRIVE_CLIENT_ID;
+    clientSecret = process.env.GDRIVE_CLIENT_SECRET;
+    refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
+  }
+
+  const folderId =
+    process.env.GDRIVE_FOLDER_ID || "1sOVQgZ2A_Vfr2KfZ5I1yjjwSIMH3R3Iw";
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error("Google Drive credentials not configured");
+  }
+
+  const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
+  oauth2.setCredentials({ refresh_token: refreshToken });
+  const drive = google.drive({ version: "v3", auth: oauth2 });
+
+  // Get newest backup file
+  const list = await drive.files.list({
+    q: `'${folderId}' in parents and trashed = false and name contains 'glass_system'`,
+    orderBy: "createdTime desc",
+    pageSize: 1,
+    fields: "files(id, name, size)",
+  });
+
+  if (!list.data.files?.length) {
+    throw new Error("No backup files found on Google Drive");
+  }
+
+  const file = list.data.files[0];
+  const tmpDir = require("os").tmpdir();
+  const tmpFile = path.join(tmpDir, file.name);
+
+  console.log(`Downloading ${file.name} from Google Drive...`);
+  const response = await drive.files.get(
+    { fileId: file.id, alt: "media" },
+    { responseType: "stream" },
+  );
+
+  await new Promise((resolve, reject) => {
+    const ws = fs.createWriteStream(tmpFile);
+    response.data.pipe(ws);
+    ws.on("finish", resolve);
+    ws.on("error", reject);
+  });
+
+  const sizeMB = (fs.statSync(tmpFile).size / 1024 / 1024).toFixed(2);
+  console.log(`Downloaded ${file.name} (${sizeMB} MB)`);
+  return { filePath: tmpFile, fileName: file.name };
+}
+
 /* ── Admin: Manual Backup ── */
 app.post("/admin/backup", (req, res) => {
   // Ensure backup directory exists
@@ -218,13 +283,10 @@ app.post("/admin/backup", (req, res) => {
   const cmd = buildPgCmd(
     PG_DUMP,
     dbEnv,
-    `--clean --if-exists --no-owner --no-privileges --encoding=UTF8 -f "${backupFile}"`,
+    `--clean --if-exists --no-owner --no-privileges --inserts --encoding=UTF8 -f "${backupFile}"`,
   );
 
-  const shell = isWindows ? "cmd" : "/bin/sh";
-  const shellFlag = isWindows ? "/c" : "-c";
-
-  exec(cmd, { timeout: 120000, shell: `${shell}` }, (err, stdout, stderr) => {
+  exec(cmd, { timeout: 120000 }, (err, stdout, stderr) => {
     if (err) {
       console.error("backup error:", err.message, stderr);
       return res.status(500).json({ error: `Backup failed: ${err.message}` });
@@ -233,7 +295,7 @@ app.post("/admin/backup", (req, res) => {
       const size = fs.statSync(backupFile).size;
       const sizeMB = (size / 1024 / 1024).toFixed(2);
 
-      // Upload to Google Drive in background (only if credentials exist)
+      // Upload to Google Drive in background
       const gdrive = path.join(__dirname, "scripts", "gdrive-helper.js");
       const tokenFile = path.join(
         __dirname,
@@ -260,66 +322,65 @@ app.post("/admin/backup", (req, res) => {
   });
 });
 
-/* ── Admin: Restore Backup ── */
-app.post("/admin/restore", (req, res) => {
-  const { target } = req.body; // "local" or "neon"
+/* ── Admin: Restore from Google Drive → target DB via node-pg ── */
+app.post("/admin/restore", async (req, res) => {
+  const { target } = req.body;
   if (!["local", "neon"].includes(target)) {
     return res.status(400).json({ error: "target must be 'local' or 'neon'" });
   }
 
-  // Find latest backup
-  if (!fs.existsSync(BACKUP_DIR)) {
-    return res.status(404).json({ error: "No backup directory found" });
-  }
-
-  let latestFile;
+  let tmpFile = null;
   try {
-    const files = fs
-      .readdirSync(BACKUP_DIR)
-      .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
-      .map((f) => ({
-        name: f,
-        mtime: fs.statSync(path.join(BACKUP_DIR, f)).mtime,
-      }))
-      .sort((a, b) => b.mtime - a.mtime);
-    if (files.length === 0) {
-      return res.status(404).json({ error: "No backup files found" });
-    }
-    latestFile = path.join(BACKUP_DIR, files[0].name);
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
+    // 1. Download latest backup from Google Drive
+    const dl = await downloadLatestFromDrive();
+    tmpFile = dl.filePath;
 
-  const dbEnv = getDbEnv(target);
-  // Use ON_ERROR_STOP=0 so psql continues past permission/drop errors
-  // Use --single-transaction so either all data loads or none
-  const cmd = buildPgCmd(
-    PSQL,
-    dbEnv,
-    `-v ON_ERROR_STOP=0 --single-transaction -f "${latestFile}"`,
-  );
+    // 2. Read SQL
+    let sql = fs.readFileSync(dl.filePath, "utf8");
 
-  exec(cmd, { timeout: 300000 }, (err, stdout, stderr) => {
-    // psql with ON_ERROR_STOP=0 returns exit code 0 even with errors
-    // So we only fail on real exec errors (binary not found, timeout, etc.)
-    if (err && !stderr) {
-      console.error("restore exec error:", err.message);
-      return res.status(500).json({ error: `Restore failed: ${err.message}` });
-    }
-    const warnings = stderr
-      ? stderr.split("\n").filter((l) => l.includes("ERROR")).length
-      : 0;
-    console.log(
-      `Restore to ${target} done. Warnings: ${warnings}`,
-      stderr ? stderr.slice(0, 500) : "",
+    // 3. Remove COPY blocks (if any from old-format backups) — they're incompatible with node-pg
+    //    COPY blocks look like: COPY table (...) FROM stdin;\ndata...\n\.
+    sql = sql.replace(
+      /^COPY\s+.*?FROM\s+stdin;[\s\S]*?^\\\./gm,
+      "-- [COPY block removed - use --inserts format]",
     );
+
+    // 4. Connect to target DB directly via node-pg
+    const dbEnv = getDbEnv(target);
+    const { Pool: PgPool } = require("pg");
+    const restorePool = new PgPool({
+      host: dbEnv.host,
+      port: Number(dbEnv.port),
+      user: dbEnv.user,
+      password: dbEnv.pass,
+      database: dbEnv.name,
+      ssl: dbEnv.isNeon ? { rejectUnauthorized: false } : false,
+      statement_timeout: 600000, // 10 min
+    });
+
+    const client = await restorePool.connect();
+    try {
+      await client.query(sql);
+    } finally {
+      client.release();
+      await restorePool.end();
+    }
+
+    // Cleanup
+    try { fs.unlinkSync(tmpFile); } catch {}
+
+    console.log(`Restore to ${target} done: ${dl.fileName}`);
     res.json({
       success: true,
-      file: path.basename(latestFile),
+      file: dl.fileName,
       target,
-      warnings,
+      source: "google-drive",
     });
-  });
+  } catch (err) {
+    console.error("restore error:", err);
+    if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
+    res.status(500).json({ error: `Restore failed: ${err.message}` });
+  }
 });
 
 // Chat uploads

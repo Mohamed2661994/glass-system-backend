@@ -45,7 +45,7 @@ try {
     $pgDump = Join-Path $PSQL_BIN "pg_dump.exe"
     & $pgDump -U $LOCAL_USER -h $LOCAL_HOST -p $LOCAL_PORT -d $LOCAL_DB `
         --clean --if-exists --no-owner --no-privileges `
-        --encoding=UTF8 -f $dumpFile 2>&1
+        --inserts --encoding=UTF8 -f $dumpFile 2>&1
 
     if ($LASTEXITCODE -ne 0) {
         Write-Log "ERROR: pg_dump from Local failed"

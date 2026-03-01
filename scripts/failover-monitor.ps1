@@ -64,7 +64,7 @@ if ($localIsUp -and $currentState -eq "local_down") {
 
     & $pgDump -U $NEON_USER -h $NEON_HOST -p $NEON_PORT -d $NEON_DB `
         --clean --if-exists --no-owner --no-privileges `
-        --encoding=UTF8 -f $failbackFile 2>&1
+        --inserts --encoding=UTF8 -f $failbackFile 2>&1
 
     if ($LASTEXITCODE -ne 0) {
         Write-Log "ERROR: pg_dump from Neon failed. Staying on Neon."
