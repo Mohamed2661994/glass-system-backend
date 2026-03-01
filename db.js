@@ -91,6 +91,28 @@ const pool = {
   get lastFailbackTime() {
     return lastFailbackTime;
   },
+
+  /** Manually switch active DB */
+  switchTo(target) {
+    if (target === "neon") {
+      usingNeon = true;
+      lastFailoverTime = Date.now();
+      console.log("🔄 Manually switched to Neon");
+    } else {
+      usingNeon = false;
+      lastFailbackTime = Date.now();
+      console.log("🔄 Manually switched to Local");
+    }
+  },
+
+  /** Test connectivity to a specific pool */
+  async testConnection(target) {
+    const p = target === "neon" ? neonPool : localPool;
+    const client = await p.connect();
+    await client.query("SELECT 1");
+    client.release();
+    return true;
+  },
 };
 
 /* ── Periodic fail-back check ──────────────────────────── */

@@ -91,9 +91,13 @@ app.get("/health", (req, res) => {
   try {
     const backupDir = "D:\\glass-backups";
     if (fs.existsSync(backupDir)) {
-      const files = fs.readdirSync(backupDir)
-        .filter(f => f.startsWith("glass_system_") && f.endsWith(".sql"))
-        .map(f => ({ name: f, mtime: fs.statSync(path.join(backupDir, f)).mtime }))
+      const files = fs
+        .readdirSync(backupDir)
+        .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
+        .map((f) => ({
+          name: f,
+          mtime: fs.statSync(path.join(backupDir, f)).mtime,
+        }))
         .sort((a, b) => b.mtime - a.mtime);
       if (files.length > 0) {
         lastBackup = {
@@ -103,7 +107,9 @@ app.get("/health", (req, res) => {
         };
       }
     }
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 
   res.json({
     status: "ok",
@@ -117,6 +123,141 @@ app.get("/health", (req, res) => {
     lastBackup,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
+  });
+});
+
+/* ── Admin: Switch DB ── */
+app.post("/admin/switch-db", async (req, res) => {
+  try {
+    const { target } = req.body; // "local" or "neon"
+    if (!["local", "neon"].includes(target)) {
+      return res
+        .status(400)
+        .json({ error: "target must be 'local' or 'neon'" });
+    }
+    // Test connection first
+    await pool.testConnection(target);
+    pool.switchTo(target);
+    res.json({ success: true, activeDb: pool.activeDb });
+  } catch (err) {
+    res
+      .status(500)
+      .json({ error: `Cannot connect to ${req.body.target}: ${err.message}` });
+  }
+});
+
+/* ── Admin: Manual Backup ── */
+app.post("/admin/backup", (req, res) => {
+  const backupDir = "D:\\glass-backups";
+  const pgDump = '"C:\\Program Files\\PostgreSQL\\18\\bin\\pg_dump.exe"';
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[T:]/g, "_")
+    .replace(/\..+/, "")
+    .replace(/-/g, "-");
+  const ts = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}_${String(d.getHours()).padStart(2, "0")}-${String(d.getMinutes()).padStart(2, "0")}`;
+  })();
+  const backupFile = path.join(backupDir, `glass_system_${ts}.sql`);
+
+  // Always backup from the currently active DB
+  const isNeon = pool.activeDb === "neon";
+  const dbHost = isNeon ? process.env.DB_HOST_NEON : process.env.DB_HOST_LOCAL;
+  const dbPort = isNeon
+    ? process.env.DB_PORT_NEON || "5432"
+    : process.env.DB_PORT_LOCAL || "5432";
+  const dbUser = isNeon ? process.env.DB_USER_NEON : process.env.DB_USER_LOCAL;
+  const dbPass = isNeon
+    ? process.env.DB_PASSWORD_NEON
+    : process.env.DB_PASSWORD_LOCAL;
+  const dbName = isNeon ? process.env.DB_NAME_NEON : process.env.DB_NAME_LOCAL;
+  const sslFlag = isNeon ? "require" : "prefer";
+
+  const cmd = `set PGPASSWORD=${dbPass}&& ${pgDump} -U ${dbUser} -h ${dbHost} -p ${dbPort} -d ${dbName} --clean --if-exists --no-owner --no-privileges --encoding=UTF8 -f "${backupFile}"`;
+
+  exec(cmd, { timeout: 60000 }, (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({ error: `Backup failed: ${err.message}` });
+    }
+    try {
+      const size = fs.statSync(backupFile).size;
+      const sizeMB = (size / 1024 / 1024).toFixed(2);
+
+      // Upload to Google Drive in background
+      const gdrive = path.join(__dirname, "scripts", "gdrive-helper.js");
+      if (fs.existsSync(gdrive)) {
+        exec(
+          `node "${gdrive}" upload "${backupFile}"`,
+          { timeout: 120000 },
+          () => {},
+        );
+      }
+
+      res.json({
+        success: true,
+        file: path.basename(backupFile),
+        sizeMB: parseFloat(sizeMB),
+        source: pool.activeDb,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+});
+
+/* ── Admin: Restore Backup ── */
+app.post("/admin/restore", (req, res) => {
+  const { target } = req.body; // "local" or "neon"
+  if (!["local", "neon"].includes(target)) {
+    return res.status(400).json({ error: "target must be 'local' or 'neon'" });
+  }
+
+  const backupDir = "D:\\glass-backups";
+  const psql = '"C:\\Program Files\\PostgreSQL\\18\\bin\\psql.exe"';
+
+  // Find latest backup
+  let latestFile;
+  try {
+    const files = fs
+      .readdirSync(backupDir)
+      .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
+      .map((f) => ({
+        name: f,
+        mtime: fs.statSync(path.join(backupDir, f)).mtime,
+      }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (files.length === 0) {
+      return res.status(404).json({ error: "No backup files found" });
+    }
+    latestFile = path.join(backupDir, files[0].name);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+
+  const isNeon = target === "neon";
+  const dbHost = isNeon ? process.env.DB_HOST_NEON : process.env.DB_HOST_LOCAL;
+  const dbPort = isNeon
+    ? process.env.DB_PORT_NEON || "5432"
+    : process.env.DB_PORT_LOCAL || "5432";
+  const dbUser = isNeon ? process.env.DB_USER_NEON : process.env.DB_USER_LOCAL;
+  const dbPass = isNeon
+    ? process.env.DB_PASSWORD_NEON
+    : process.env.DB_PASSWORD_LOCAL;
+  const dbName = isNeon ? process.env.DB_NAME_NEON : process.env.DB_NAME_LOCAL;
+  const sslMode = isNeon ? "set PGSSLMODE=require&&" : "";
+
+  const cmd = `set PGPASSWORD=${dbPass}&&${sslMode} ${psql} -U ${dbUser} -h ${dbHost} -p ${dbPort} -d ${dbName} -f "${latestFile}"`;
+
+  exec(cmd, { timeout: 120000 }, (err) => {
+    if (err) {
+      return res.status(500).json({ error: `Restore failed: ${err.message}` });
+    }
+    res.json({
+      success: true,
+      file: path.basename(latestFile),
+      target,
+    });
   });
 });
 
