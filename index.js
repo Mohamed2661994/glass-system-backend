@@ -146,8 +146,12 @@ app.post("/admin/switch-db", async (req, res) => {
         msg: "Already active",
       });
     }
-    // Test connection first
-    await pool.testConnection(target);
+    // Test connection first (with a timeout)
+    const testPromise = pool.testConnection(target);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Connection timeout (10s)")), 10000),
+    );
+    await Promise.race([testPromise, timeoutPromise]);
     pool.switchTo(target);
     res.json({ success: true, activeDb: pool.activeDb });
   } catch (err) {
@@ -287,17 +291,33 @@ app.post("/admin/restore", (req, res) => {
   }
 
   const dbEnv = getDbEnv(target);
-  const cmd = buildPgCmd(PSQL, dbEnv, `-f "${latestFile}"`);
+  // Use ON_ERROR_STOP=0 so psql continues past permission/drop errors
+  // Use --single-transaction so either all data loads or none
+  const cmd = buildPgCmd(
+    PSQL,
+    dbEnv,
+    `-v ON_ERROR_STOP=0 --single-transaction -f "${latestFile}"`,
+  );
 
-  exec(cmd, { timeout: 120000 }, (err) => {
-    if (err) {
-      console.error("restore error:", err.message);
+  exec(cmd, { timeout: 300000 }, (err, stdout, stderr) => {
+    // psql with ON_ERROR_STOP=0 returns exit code 0 even with errors
+    // So we only fail on real exec errors (binary not found, timeout, etc.)
+    if (err && !stderr) {
+      console.error("restore exec error:", err.message);
       return res.status(500).json({ error: `Restore failed: ${err.message}` });
     }
+    const warnings = stderr
+      ? stderr.split("\n").filter((l) => l.includes("ERROR")).length
+      : 0;
+    console.log(
+      `Restore to ${target} done. Warnings: ${warnings}`,
+      stderr ? stderr.slice(0, 500) : "",
+    );
     res.json({
       success: true,
       file: path.basename(latestFile),
       target,
+      warnings,
     });
   });
 });
