@@ -86,6 +86,25 @@ app.use((req, res, next) => {
 
 // Health check endpoint (for Render / monitoring)
 app.get("/health", (req, res) => {
+  // Find latest backup file
+  let lastBackup = null;
+  try {
+    const backupDir = "D:\\glass-backups";
+    if (fs.existsSync(backupDir)) {
+      const files = fs.readdirSync(backupDir)
+        .filter(f => f.startsWith("glass_system_") && f.endsWith(".sql"))
+        .map(f => ({ name: f, mtime: fs.statSync(path.join(backupDir, f)).mtime }))
+        .sort((a, b) => b.mtime - a.mtime);
+      if (files.length > 0) {
+        lastBackup = {
+          file: files[0].name,
+          time: files[0].mtime.toISOString(),
+          count: files.length,
+        };
+      }
+    }
+  } catch { /* ignore */ }
+
   res.json({
     status: "ok",
     activeDb: pool.activeDb,
@@ -95,6 +114,7 @@ app.get("/health", (req, res) => {
     lastFailbackTime: pool.lastFailbackTime
       ? new Date(pool.lastFailbackTime).toISOString()
       : null,
+    lastBackup,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
