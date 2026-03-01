@@ -36,6 +36,7 @@ neonPool.on("connect", (client) => {
 /* ── Hybrid wrapper ────────────────────────────────────── */
 let usingNeon = false;
 let lastFailoverTime = null;
+let lastFailbackTime = null;
 const FAILBACK_CHECK_INTERVAL = 60_000; // try local again every 60s
 
 /**
@@ -82,6 +83,14 @@ const pool = {
   get activeDb() {
     return usingNeon ? "neon" : "local";
   },
+
+  get lastFailoverTime() {
+    return lastFailoverTime;
+  },
+
+  get lastFailbackTime() {
+    return lastFailbackTime;
+  },
 };
 
 /* ── Periodic fail-back check ──────────────────────────── */
@@ -93,7 +102,7 @@ setInterval(async () => {
     client.release();
     console.log("✅ Local DB is back online — switching back from Neon");
     usingNeon = false;
-    lastFailoverTime = null;
+    lastFailbackTime = Date.now();
   } catch {
     // still down, stay on Neon
   }

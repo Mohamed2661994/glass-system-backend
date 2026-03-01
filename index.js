@@ -89,6 +89,13 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     activeDb: pool.activeDb,
+    lastFailoverTime: pool.lastFailoverTime
+      ? new Date(pool.lastFailoverTime).toISOString()
+      : null,
+    lastFailbackTime: pool.lastFailbackTime
+      ? new Date(pool.lastFailbackTime).toISOString()
+      : null,
+    uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
 });
