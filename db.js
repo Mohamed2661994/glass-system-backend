@@ -100,12 +100,12 @@ const pool = {
       usingNeon = true;
       if (manual) manualOverride = true;
       lastFailoverTime = Date.now();
-      console.log(`🔄 ${manual ? 'Manually' : 'Auto'} switched to Neon`);
+      console.log(`🔄 ${manual ? "Manually" : "Auto"} switched to Neon`);
     } else {
       usingNeon = false;
       manualOverride = false;
       lastFailbackTime = Date.now();
-      console.log(`🔄 ${manual ? 'Manually' : 'Auto'} switched to Local`);
+      console.log(`🔄 ${manual ? "Manually" : "Auto"} switched to Local`);
     }
   },
 
@@ -152,44 +152,47 @@ async function syncBetweenPools(sourcePool, targetPool, label) {
     srcClient = await sourcePool.connect();
     await srcClient.query("SELECT 1");
 
-    // 2. Get all user tables sorted by FK dependency (parents first)
+    // 2. Get all user tables
     const tablesRes = await srcClient.query(`
-      WITH RECURSIVE deps AS (
-        SELECT c.relname AS tablename, 0 AS depth
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind = 'r'
-          AND NOT EXISTS (
-            SELECT 1 FROM pg_constraint con
-            WHERE con.conrelid = c.oid AND con.contype = 'f'
-          )
-        UNION ALL
-        SELECT c2.relname, d.depth + 1
-        FROM deps d
-        JOIN pg_constraint con ON con.confrelid = (
-          SELECT oid FROM pg_class WHERE relname = d.tablename
-        )
-        JOIN pg_class c2 ON c2.oid = con.conrelid
-        JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-        WHERE n2.nspname = 'public'
-      )
-      SELECT DISTINCT tablename, MAX(depth) AS depth 
-      FROM deps GROUP BY tablename ORDER BY depth
+      SELECT tablename FROM pg_tables
+      WHERE schemaname = 'public' ORDER BY tablename
+    `);
+    const allTables = tablesRes.rows.map((r) => r.tablename);
+    if (allTables.length === 0)
+      throw new Error(`No tables found in source (${label})`);
+
+    // 3. Build FK dependency graph (exclude self-references)
+    const fkRes = await srcClient.query(`
+      SELECT c1.relname AS child, c2.relname AS parent
+      FROM pg_constraint con
+      JOIN pg_class c1 ON c1.oid = con.conrelid
+      JOIN pg_class c2 ON c2.oid = con.confrelid
+      JOIN pg_namespace n1 ON n1.oid = c1.relnamespace
+      WHERE con.contype = 'f' AND n1.nspname = 'public'
+        AND c1.relname != c2.relname
     `);
 
-    let tables = tablesRes.rows.map((r) => r.tablename);
+    // Topological sort: parents first
+    const deps = {};
+    allTables.forEach((t) => (deps[t] = new Set()));
+    fkRes.rows.forEach((r) => {
+      if (deps[r.child]) deps[r.child].add(r.parent);
+    });
 
-    // Fallback: if recursive query returns nothing, get all tables
-    if (tables.length === 0) {
-      const fallback = await srcClient.query(`
-        SELECT tablename FROM pg_tables
-        WHERE schemaname = 'public' ORDER BY tablename
-      `);
-      tables = fallback.rows.map((r) => r.tablename);
+    const sorted = [];
+    const visited = new Set();
+    function visit(table) {
+      if (visited.has(table)) return;
+      visited.add(table);
+      for (const parent of deps[table] || []) {
+        visit(parent);
+      }
+      sorted.push(table);
     }
-    if (tables.length === 0) throw new Error(`No tables found in source (${label})`);
+    allTables.forEach(visit);
+    const tables = sorted;
 
-    // 3. Read all data from source
+    // 4. Read all data from source
     const tableData = {};
     for (const table of tables) {
       const res = await srcClient.query(`SELECT * FROM "${table}"`);
@@ -198,11 +201,11 @@ async function syncBetweenPools(sourcePool, targetPool, label) {
     srcClient.release();
     srcClient = null;
 
-    // 4. Write to target
+    // 5. Write to target
     dstClient = await targetPool.connect();
     await dstClient.query("BEGIN");
 
-    // Truncate all tables first (reverse order to respect FKs)
+    // Truncate all tables (reverse order to respect FKs)
     for (let i = tables.length - 1; i >= 0; i--) {
       await dstClient.query(`TRUNCATE "${tables[i]}" CASCADE`);
     }
@@ -262,11 +265,17 @@ async function syncBetweenPools(sourcePool, targetPool, label) {
     return { success: true, tables: tables.length, rows: totalRows };
   } catch (err) {
     if (dstClient) {
-      try { await dstClient.query("ROLLBACK"); } catch {}
-      try { dstClient.release(); } catch {}
+      try {
+        await dstClient.query("ROLLBACK");
+      } catch {}
+      try {
+        dstClient.release();
+      } catch {}
     }
     if (srcClient) {
-      try { srcClient.release(); } catch {}
+      try {
+        srcClient.release();
+      } catch {}
     }
     return { success: false, error: err.message };
   }
@@ -284,7 +293,9 @@ setInterval(async () => {
     client.release();
 
     // Local is back! Sync Neon → Local BEFORE switching
-    console.log("✅ Local DB is back online — syncing Neon → Local before failback...");
+    console.log(
+      "✅ Local DB is back online — syncing Neon → Local before failback...",
+    );
     failbackInProgress = true;
     const result = await pool.syncFromNeon();
     failbackInProgress = false;
@@ -296,7 +307,11 @@ setInterval(async () => {
       usingNeon = false;
       lastFailbackTime = Date.now();
     } else {
-      console.error("❌ Failback sync failed:", result.error, "— staying on Neon");
+      console.error(
+        "❌ Failback sync failed:",
+        result.error,
+        "— staying on Neon",
+      );
     }
   } catch {
     failbackInProgress = false;
