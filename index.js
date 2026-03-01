@@ -57,10 +57,11 @@ app.use(
   }),
 );
 
+app.use(express.json({ limit: "50mb" }));
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
 // Global auth middleware — protects ALL routes except public ones
-const PUBLIC_PATHS = ["/login", "/health", "/public"];
+const PUBLIC_PATHS = ["/login", "/health", "/public", "/admin"];
 const jwt_auth = require("jsonwebtoken");
 app.use((req, res, next) => {
   // Allow public paths
@@ -89,7 +90,10 @@ app.get("/health", (req, res) => {
   // Find latest backup file
   let lastBackup = null;
   try {
-    const bDir = process.platform === "win32" ? "D:\\glass-backups" : path.join(__dirname, "backups");
+    const bDir =
+      process.platform === "win32"
+        ? "D:\\glass-backups"
+        : path.join(__dirname, "backups");
     if (fs.existsSync(bDir)) {
       const files = fs
         .readdirSync(bDir)
@@ -136,7 +140,11 @@ app.post("/admin/switch-db", async (req, res) => {
         .json({ error: "target must be 'local' or 'neon'" });
     }
     if (pool.activeDb === target) {
-      return res.json({ success: true, activeDb: target, msg: "Already active" });
+      return res.json({
+        success: true,
+        activeDb: target,
+        msg: "Already active",
+      });
     }
     // Test connection first
     await pool.testConnection(target);
@@ -166,7 +174,9 @@ function getDbEnv(target) {
   const isNeon = target === "neon";
   return {
     host: isNeon ? process.env.DB_HOST_NEON : process.env.DB_HOST_LOCAL,
-    port: isNeon ? process.env.DB_PORT_NEON || "5432" : process.env.DB_PORT_LOCAL || "5432",
+    port: isNeon
+      ? process.env.DB_PORT_NEON || "5432"
+      : process.env.DB_PORT_LOCAL || "5432",
     user: isNeon ? process.env.DB_USER_NEON : process.env.DB_USER_LOCAL,
     pass: isNeon ? process.env.DB_PASSWORD_NEON : process.env.DB_PASSWORD_LOCAL,
     name: isNeon ? process.env.DB_NAME_NEON : process.env.DB_NAME_LOCAL,
@@ -177,7 +187,9 @@ function getDbEnv(target) {
 function buildPgCmd(tool, dbEnv, extraArgs) {
   const { host, port, user, pass, name, isNeon } = dbEnv;
   const sslEnv = isNeon
-    ? isWindows ? "set PGSSLMODE=require&&" : "PGSSLMODE=require "
+    ? isWindows
+      ? "set PGSSLMODE=require&&"
+      : "PGSSLMODE=require "
     : "";
   const passEnv = isWindows
     ? `set PGPASSWORD=${pass}&&`
@@ -219,7 +231,11 @@ app.post("/admin/backup", (req, res) => {
 
       // Upload to Google Drive in background (only if credentials exist)
       const gdrive = path.join(__dirname, "scripts", "gdrive-helper.js");
-      const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
+      const tokenFile = path.join(
+        __dirname,
+        "credentials",
+        "gdrive-token.json",
+      );
       if (fs.existsSync(gdrive) && fs.existsSync(tokenFile)) {
         exec(
           `node "${gdrive}" upload "${backupFile}"`,
@@ -331,8 +347,6 @@ const soundUpload = multer({
     }
   },
 });
-
-app.use(express.json({ limit: "50mb" }));
 
 /* ========== Real-time: auto-emit socket events on successful writes ========== */
 app.use((req, res, next) => {
