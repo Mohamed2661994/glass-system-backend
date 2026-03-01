@@ -198,8 +198,8 @@ function buildPgCmd(tool, dbEnv, extraArgs) {
   return `${passEnv}${sslEnv}${tool} -U ${user} -h ${host} -p ${port} -d ${name} ${extraArgs}`;
 }
 
-/* ── Google Drive: download latest backup ── */
-async function downloadLatestFromDrive() {
+/* ── Google Drive: download latest backup (with progress callback) ── */
+async function downloadLatestFromDrive(onProgress) {
   const { google } = require("googleapis");
 
   let clientId, clientSecret, refreshToken;
@@ -207,7 +207,6 @@ async function downloadLatestFromDrive() {
   const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
 
   if (fs.existsSync(credFile) && fs.existsSync(tokenFile)) {
-    // Local dev: read from files
     const creds = JSON.parse(fs.readFileSync(credFile, "utf8"));
     const key = Object.keys(creds)[0];
     clientId = creds[key].client_id;
@@ -215,7 +214,6 @@ async function downloadLatestFromDrive() {
     const tokens = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
     refreshToken = tokens.refresh_token;
   } else {
-    // Render: read from env vars
     clientId = process.env.GDRIVE_CLIENT_ID;
     clientSecret = process.env.GDRIVE_CLIENT_SECRET;
     refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
@@ -232,7 +230,6 @@ async function downloadLatestFromDrive() {
   oauth2.setCredentials({ refresh_token: refreshToken });
   const drive = google.drive({ version: "v3", auth: oauth2 });
 
-  // Get newest backup file
   const list = await drive.files.list({
     q: `'${folderId}' in parents and trashed = false and name contains 'glass_system'`,
     orderBy: "createdTime desc",
@@ -245,10 +242,10 @@ async function downloadLatestFromDrive() {
   }
 
   const file = list.data.files[0];
+  const totalSize = parseInt(file.size || "0");
   const tmpDir = require("os").tmpdir();
   const tmpFile = path.join(tmpDir, file.name);
 
-  console.log(`Downloading ${file.name} from Google Drive...`);
   const response = await drive.files.get(
     { fileId: file.id, alt: "media" },
     { responseType: "stream" },
@@ -256,19 +253,45 @@ async function downloadLatestFromDrive() {
 
   await new Promise((resolve, reject) => {
     const ws = fs.createWriteStream(tmpFile);
+    let downloaded = 0;
+    response.data.on("data", (chunk) => {
+      downloaded += chunk.length;
+      if (totalSize > 0 && onProgress) {
+        const pct = Math.round((downloaded / totalSize) * 100);
+        onProgress(pct);
+      }
+    });
     response.data.pipe(ws);
     ws.on("finish", resolve);
     ws.on("error", reject);
   });
 
   const sizeMB = (fs.statSync(tmpFile).size / 1024 / 1024).toFixed(2);
-  console.log(`Downloaded ${file.name} (${sizeMB} MB)`);
-  return { filePath: tmpFile, fileName: file.name };
+  return { filePath: tmpFile, fileName: file.name, sizeMB };
 }
 
-/* ── Admin: Manual Backup ── */
+/* ── SSE helper ── */
+function setupSSE(res) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+  const send = (pct, msg, done, error, extra) => {
+    const payload = { progress: pct, message: msg };
+    if (done) payload.done = true;
+    if (error) payload.error = true;
+    if (extra) Object.assign(payload, extra);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    if (done || error) setTimeout(() => res.end(), 100);
+  };
+  return send;
+}
+
+/* ── Admin: Manual Backup (SSE progress) ── */
 app.post("/admin/backup", (req, res) => {
-  // Ensure backup directory exists
+  const send = setupSSE(res);
+  send(5, "جاري تجهيز الباك أب...");
+
   if (!fs.existsSync(BACKUP_DIR)) {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
   }
@@ -286,16 +309,20 @@ app.post("/admin/backup", (req, res) => {
     `--clean --if-exists --no-owner --no-privileges --inserts --encoding=UTF8 -f "${backupFile}"`,
   );
 
-  exec(cmd, { timeout: 120000 }, (err, stdout, stderr) => {
+  send(15, "جاري تصدير قاعدة البيانات...");
+
+  exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
     if (err) {
       console.error("backup error:", err.message, stderr);
-      return res.status(500).json({ error: `Backup failed: ${err.message}` });
+      return send(0, `فشل الباك أب: ${err.message}`, false, true);
     }
     try {
       const size = fs.statSync(backupFile).size;
       const sizeMB = (size / 1024 / 1024).toFixed(2);
 
-      // Upload to Google Drive in background
+      send(65, `تم التصدير (${sizeMB} MB) — جاري الرفع على Google Drive...`);
+
+      // Upload to Google Drive
       const gdrive = path.join(__dirname, "scripts", "gdrive-helper.js");
       const tokenFile = path.join(
         __dirname,
@@ -306,46 +333,58 @@ app.post("/admin/backup", (req, res) => {
         exec(
           `node "${gdrive}" upload "${backupFile}"`,
           { timeout: 120000 },
-          () => {},
+          (uploadErr) => {
+            if (uploadErr) {
+              send(100, `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB) — فشل الرفع على Drive`, true, false, { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) });
+            } else {
+              send(100, `تم الباك أب + الرفع على Drive: ${path.basename(backupFile)} (${sizeMB} MB)`, true, false, { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) });
+            }
+          },
         );
+      } else {
+        // No Drive credentials — try env-based upload
+        send(100, `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB)`, true, false, { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) });
       }
-
-      res.json({
-        success: true,
-        file: path.basename(backupFile),
-        sizeMB: parseFloat(sizeMB),
-        source: pool.activeDb,
-      });
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      send(0, e.message, false, true);
     }
   });
 });
 
-/* ── Admin: Restore from Google Drive → target DB via node-pg ── */
+/* ── Admin: Restore from Google Drive → target DB (SSE progress) ── */
 app.post("/admin/restore", async (req, res) => {
   const { target } = req.body;
   if (!["local", "neon"].includes(target)) {
     return res.status(400).json({ error: "target must be 'local' or 'neon'" });
   }
 
+  const send = setupSSE(res);
   let tmpFile = null;
+
   try {
-    // 1. Download latest backup from Google Drive
-    const dl = await downloadLatestFromDrive();
+    // Phase 1: Download from Google Drive (0-50%)
+    send(5, "جاري الاتصال بـ Google Drive...");
+    let lastPct = 5;
+    const dl = await downloadLatestFromDrive((dlPct) => {
+      // Map download progress 0-100 to SSE progress 5-50
+      const mapped = Math.round(5 + (dlPct * 45) / 100);
+      if (mapped > lastPct) {
+        lastPct = mapped;
+        send(mapped, `جاري التنزيل: ${dlPct}%`);
+      }
+    });
     tmpFile = dl.filePath;
+    send(52, `تم التنزيل (${dl.sizeMB} MB) — جاري القراءة...`);
 
-    // 2. Read SQL
+    // Phase 2: Read & clean SQL (50-60%)
     let sql = fs.readFileSync(dl.filePath, "utf8");
-
-    // 3. Remove COPY blocks (if any from old-format backups) — they're incompatible with node-pg
-    //    COPY blocks look like: COPY table (...) FROM stdin;\ndata...\n\.
     sql = sql.replace(
       /^COPY\s+.*?FROM\s+stdin;[\s\S]*?^\\\./gm,
-      "-- [COPY block removed - use --inserts format]",
+      "-- [COPY block removed]",
     );
+    send(60, "جاري تجهيز الاتصال بقاعدة البيانات...");
 
-    // 4. Connect to target DB directly via node-pg
+    // Phase 3: Execute SQL (60-95%)
     const dbEnv = getDbEnv(target);
     const { Pool: PgPool } = require("pg");
     const restorePool = new PgPool({
@@ -355,12 +394,43 @@ app.post("/admin/restore", async (req, res) => {
       password: dbEnv.pass,
       database: dbEnv.name,
       ssl: dbEnv.isNeon ? { rejectUnauthorized: false } : false,
-      statement_timeout: 600000, // 10 min
+      statement_timeout: 600000,
     });
 
+    send(65, "جاري تنفيذ الريستور...");
+
+    // Split SQL into chunks and execute with progress
+    const statements = sql.split(/;\s*\n/).filter((s) => s.trim());
+    const total = statements.length;
     const client = await restorePool.connect();
+    let executed = 0;
+    let errors = 0;
+
     try {
-      await client.query(sql);
+      await client.query("BEGIN");
+      for (const stmt of statements) {
+        const trimmed = stmt.trim();
+        if (!trimmed || trimmed.startsWith("--")) {
+          executed++;
+          continue;
+        }
+        try {
+          await client.query(trimmed);
+        } catch {
+          errors++;
+        }
+        executed++;
+        // Report every 5%
+        const pct = Math.round(65 + (executed / total) * 30);
+        if (pct > lastPct + 4) {
+          lastPct = pct;
+          send(pct, `جاري التنفيذ: ${Math.round((executed / total) * 100)}%`);
+        }
+      }
+      await client.query("COMMIT");
+    } catch (txErr) {
+      try { await client.query("ROLLBACK"); } catch {}
+      throw txErr;
     } finally {
       client.release();
       await restorePool.end();
@@ -369,17 +439,11 @@ app.post("/admin/restore", async (req, res) => {
     // Cleanup
     try { fs.unlinkSync(tmpFile); } catch {}
 
-    console.log(`Restore to ${target} done: ${dl.fileName}`);
-    res.json({
-      success: true,
-      file: dl.fileName,
-      target,
-      source: "google-drive",
-    });
+    send(100, `تم الريستور: ${dl.fileName} (${errors > 0 ? errors + " تحذيرات" : "بدون أخطاء"})`, true, false, { file: dl.fileName, target });
   } catch (err) {
     console.error("restore error:", err);
     if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch {} }
-    res.status(500).json({ error: `Restore failed: ${err.message}` });
+    send(0, `فشل الريستور: ${err.message}`, false, true);
   }
 });
 
