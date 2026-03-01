@@ -84,7 +84,11 @@ app.use((req, res, next) => {
 
 // Health check endpoint (for Render / monitoring)
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    activeDb: pool.activeDb,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // Chat uploads
@@ -1855,8 +1859,13 @@ app.put("/invoices/retail/:id", async (req, res) => {
       apply_items_discount = false,
     } = req.body;
 
-    const { updated_by, updated_by_name, supplier_name, supplier_phone, invoice_date } =
-      req.body;
+    const {
+      updated_by,
+      updated_by_name,
+      supplier_name,
+      supplier_phone,
+      invoice_date,
+    } = req.body;
 
     if (!items || !items.length || final_total === undefined) {
       throw new Error("بيانات غير مكتملة");
@@ -2070,7 +2079,13 @@ WHERE id = $14
       WHERE invoice_id = $4
         AND source_type = 'invoice'
       `,
-          [Number(paid_amount), remaining_amount, customer_name, invoiceId, invoice_date || null],
+          [
+            Number(paid_amount),
+            remaining_amount,
+            customer_name,
+            invoiceId,
+            invoice_date || null,
+          ],
         );
       } else {
         // 🟢 إنشاء قيد جديد
@@ -2350,8 +2365,14 @@ app.put("/invoices/:id", async (req, res) => {
       manual_discount = 0,
     } = req.body;
 
-    const { updated_by, updated_by_name, supplier_name, supplier_phone, invoice_date } =
-      req.body;    if (!items || !items.length) {
+    const {
+      updated_by,
+      updated_by_name,
+      supplier_name,
+      supplier_phone,
+      invoice_date,
+    } = req.body;
+    if (!items || !items.length) {
       throw new Error("لا يوجد أصناف في الفاتورة");
     }
 
@@ -2635,7 +2656,13 @@ WHERE id = $14
       WHERE invoice_id = $4
         AND source_type = 'invoice'
       `,
-          [Number(paid_amount), remaining, customer_name, invoiceId, invoice_date || null],
+          [
+            Number(paid_amount),
+            remaining,
+            customer_name,
+            invoiceId,
+            invoice_date || null,
+          ],
         );
       } else {
         // 🟢 إنشاء قيد جديد
