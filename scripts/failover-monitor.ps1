@@ -112,34 +112,35 @@ if ((-not $localIsUp) -and $currentState -eq "local_down") {
 if ((-not $localIsUp) -and $currentState -eq "local_up") {
     Write-Log "FAILOVER TRIGGERED - LOCAL DB IS DOWN"
 
-    $latestBackup = Get-ChildItem $BACKUP_DIR -Filter "glass_system_*.sql" |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if (-not $latestBackup) {
-        # No local backup — try downloading from Google Drive
-        Write-Log "No local backup found. Trying Google Drive..."
-        $driveBackupFile = Join-Path $BACKUP_DIR "gdrive_latest.sql"
-        try {
-            $driveResult = & node "$PSScriptRoot\gdrive-helper.js" download $driveBackupFile 2>&1
-            $driveResult | ForEach-Object { Write-Log "  [Drive] $_" }
-            if ((Test-Path $driveBackupFile) -and (Get-Item $driveBackupFile).Length -gt 0) {
-                Write-Log "Downloaded backup from Google Drive"
-                $latestBackup = Get-Item $driveBackupFile
-            }
-        } catch {
-            Write-Log "ERROR: Google Drive download failed: $($_.Exception.Message)"
+    # Download latest backup from Google Drive
+    Write-Log "Downloading latest backup from Google Drive..."
+    $driveBackupFile = Join-Path $BACKUP_DIR "gdrive_latest.sql"
+    $latestBackup = $null
+    try {
+        $driveResult = & node "$PSScriptRoot\gdrive-helper.js" download $driveBackupFile 2>&1
+        $driveResult | ForEach-Object { Write-Log "  [Drive] $_" }
+        if ((Test-Path $driveBackupFile) -and (Get-Item $driveBackupFile).Length -gt 0) {
+            Write-Log "Downloaded backup from Google Drive"
+            $latestBackup = Get-Item $driveBackupFile
         }
+    } catch {
+        Write-Log "ERROR: Google Drive download failed: $($_.Exception.Message)"
+    }
+
+    # Fallback: check for any local backup files
+    if (-not $latestBackup) {
+        $latestBackup = Get-ChildItem $BACKUP_DIR -Filter "glass_system_*.sql" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
     }
 
     if (-not $latestBackup) {
-        Write-Log "ERROR: No backup files found (local or Drive). Cannot sync to Neon."
+        Write-Log "ERROR: No backup files found (Drive or local). Cannot sync to Neon."
         Set-FailoverState "local_down"
         exit 1
     }
 
-    $age = [math]::Round(((Get-Date) - $latestBackup.LastWriteTime).TotalMinutes)
-    Write-Log "Restoring to Neon: $($latestBackup.Name) (age: $age minutes)"
+    Write-Log "Restoring to Neon: $($latestBackup.Name)"
 
     $env:PGPASSWORD = $NEON_PASS
     $env:PGSSLMODE = "require"
@@ -152,6 +153,9 @@ if ((-not $localIsUp) -and $currentState -eq "local_up") {
     $count = & $psql -U $NEON_USER -h $NEON_HOST -p $NEON_PORT -d $NEON_DB -t -c "SELECT count(*) FROM products;" 2>&1
     Write-Log "Neon restore done - products: $($count.Trim())"
     Write-Log "Neon is now PRIMARY until Local returns"
+
+    # Cleanup downloaded file
+    Remove-Item $latestBackup.FullName -Force -ErrorAction SilentlyContinue
 
     Set-FailoverState "local_down"
     $env:PGPASSWORD = ""

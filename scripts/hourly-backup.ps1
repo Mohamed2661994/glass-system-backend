@@ -1,5 +1,5 @@
 # ============================================================
-#  Hourly Backup — pg_dump from Local, keep last 5 copies
+#  Hourly Backup — pg_dump from Local → Google Drive (no local copies)
 #  Scheduled: Every hour via Windows Task Scheduler
 # ============================================================
 
@@ -8,7 +8,6 @@ $ErrorActionPreference = "Stop"
 # ── Config ──
 $PSQL_BIN   = "C:\Program Files\PostgreSQL\18\bin"
 $BACKUP_DIR = "D:\glass-backups"
-$MAX_BACKUPS = 5
 
 $DB_HOST = "db.hg-alshour.online"
 $DB_PORT = "5432"
@@ -50,28 +49,24 @@ try {
     $size = (Get-Item $backupFile).Length / 1MB
     Write-Log "Backup completed: $([math]::Round($size, 2)) MB"
 
-    # Cleanup: keep only last N backups
-    $allBackups = Get-ChildItem $BACKUP_DIR -Filter "glass_system_*.sql" |
-        Sort-Object LastWriteTime -Descending
-
-    if ($allBackups.Count -gt $MAX_BACKUPS) {
-        $toDelete = $allBackups | Select-Object -Skip $MAX_BACKUPS
-        foreach ($f in $toDelete) {
-            Remove-Item $f.FullName -Force
-            Write-Log "Deleted old backup: $($f.Name)"
-        }
-    }
-
-    Write-Log "Backups on disk: $([math]::Min($allBackups.Count, $MAX_BACKUPS))"
-
     # Upload to Google Drive
     Write-Log "Uploading backup to Google Drive..."
+    $uploadOk = $false
     try {
         $driveResult = & node "$PSScriptRoot\gdrive-helper.js" upload $backupFile 2>&1
         $driveResult | ForEach-Object { Write-Log "  [Drive] $_" }
         Write-Log "Google Drive upload completed"
+        $uploadOk = $true
     } catch {
         Write-Log "WARNING: Google Drive upload failed: $($_.Exception.Message)"
+    }
+
+    # Delete local file after successful upload (no local copies needed)
+    if ($uploadOk) {
+        Remove-Item $backupFile -Force -ErrorAction SilentlyContinue
+        Write-Log "Local backup deleted (stored on Drive only)"
+    } else {
+        Write-Log "Keeping local backup since Drive upload failed"
     }
 
 } catch {
