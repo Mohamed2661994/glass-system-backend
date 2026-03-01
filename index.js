@@ -48,6 +48,8 @@ app.use(
       "http://localhost:3000",
       "http://localhost:8000",
       "http://192.168.1.63:3000",
+      "http://hg-alshour.online",
+      "http://www.hg-alshour.online",
     ],
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
