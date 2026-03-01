@@ -128,120 +128,178 @@ const pool = {
    * Returns { success, tables, rows, error }
    */
   async syncToNeon() {
-    let localClient, neonClient;
-    try {
-      // 1. Connect to local
-      localClient = await localPool.connect();
-      await localClient.query("SELECT 1"); // quick test
+    return syncBetweenPools(localPool, neonPool, "Local → Neon");
+  },
 
-      // 2. Get all user tables
-      const tablesRes = await localClient.query(`
-        SELECT tablename FROM pg_tables
-        WHERE schemaname = 'public'
-        ORDER BY tablename
-      `);
-      const tables = tablesRes.rows.map((r) => r.tablename);
-      if (tables.length === 0) throw new Error("No tables found in local DB");
-
-      // 3. Read all data from local
-      const tableData = {};
-      for (const table of tables) {
-        const res = await localClient.query(`SELECT * FROM "${table}"`);
-        tableData[table] = res;
-      }
-      localClient.release();
-      localClient = null;
-
-      // 4. Write to Neon
-      neonClient = await neonPool.connect();
-      await neonClient.query("BEGIN");
-
-      // Disable FK checks during sync
-      await neonClient.query("SET session_replication_role = replica");
-
-      let totalRows = 0;
-      for (const table of tables) {
-        // Truncate target table
-        await neonClient.query(`TRUNCATE "${table}" CASCADE`);
-
-        const data = tableData[table];
-        if (data.rows.length === 0) continue;
-
-        // Batch insert using multi-row VALUES for speed
-        const cols = data.fields.map((f) => f.name);
-        const colList = cols.map((c) => `"${c}"`).join(",");
-
-        // Insert in chunks of 100 rows
-        const CHUNK = 100;
-        for (let i = 0; i < data.rows.length; i += CHUNK) {
-          const chunk = data.rows.slice(i, i + CHUNK);
-          const values = [];
-          const params = [];
-          let paramIdx = 1;
-
-          for (const row of chunk) {
-            const placeholders = cols.map(() => `$${paramIdx++}`);
-            values.push(`(${placeholders.join(",")})`);
-            for (const col of cols) {
-              params.push(row[col]);
-            }
-          }
-
-          await neonClient.query(
-            `INSERT INTO "${table}" (${colList}) VALUES ${values.join(",")}`,
-            params,
-          );
-        }
-        totalRows += data.rows.length;
-      }
-
-      // Reset sequences to max(id)
-      for (const table of tables) {
-        try {
-          await neonClient.query(`
-            SELECT setval(
-              pg_get_serial_sequence('"${table}"', 'id'),
-              COALESCE((SELECT MAX(id) FROM "${table}"), 1),
-              (SELECT MAX(id) FROM "${table}") IS NOT NULL
-            )
-          `);
-        } catch {
-          // no serial column — skip
-        }
-      }
-
-      // Re-enable FK checks
-      await neonClient.query("SET session_replication_role = DEFAULT");
-      await neonClient.query("COMMIT");
-      neonClient.release();
-      neonClient = null;
-
-      return { success: true, tables: tables.length, rows: totalRows };
-    } catch (err) {
-      if (neonClient) {
-        try { await neonClient.query("ROLLBACK"); } catch {}
-        try { neonClient.release(); } catch {}
-      }
-      if (localClient) {
-        try { localClient.release(); } catch {}
-      }
-      return { success: false, error: err.message };
-    }
+  /**
+   * Sync all data from Neon → Local using node-pg.
+   * Used during failback to restore data written to Neon while local was down.
+   * Returns { success, tables, rows, error }
+   */
+  async syncFromNeon() {
+    return syncBetweenPools(neonPool, localPool, "Neon → Local");
   },
 };
 
+/**
+ * Generic sync: read all tables from sourcePool → write to targetPool.
+ * Uses TRUNCATE CASCADE + INSERT in dependency-aware order.
+ */
+async function syncBetweenPools(sourcePool, targetPool, label) {
+  let srcClient, dstClient;
+  try {
+    // 1. Connect to source
+    srcClient = await sourcePool.connect();
+    await srcClient.query("SELECT 1");
+
+    // 2. Get all user tables sorted by FK dependency (parents first)
+    const tablesRes = await srcClient.query(`
+      WITH RECURSIVE deps AS (
+        SELECT c.relname AS tablename, 0 AS depth
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r'
+          AND NOT EXISTS (
+            SELECT 1 FROM pg_constraint con
+            WHERE con.conrelid = c.oid AND con.contype = 'f'
+          )
+        UNION ALL
+        SELECT c2.relname, d.depth + 1
+        FROM deps d
+        JOIN pg_constraint con ON con.confrelid = (
+          SELECT oid FROM pg_class WHERE relname = d.tablename
+        )
+        JOIN pg_class c2 ON c2.oid = con.conrelid
+        JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+        WHERE n2.nspname = 'public'
+      )
+      SELECT DISTINCT tablename, MAX(depth) AS depth 
+      FROM deps GROUP BY tablename ORDER BY depth
+    `);
+
+    let tables = tablesRes.rows.map((r) => r.tablename);
+
+    // Fallback: if recursive query returns nothing, get all tables
+    if (tables.length === 0) {
+      const fallback = await srcClient.query(`
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = 'public' ORDER BY tablename
+      `);
+      tables = fallback.rows.map((r) => r.tablename);
+    }
+    if (tables.length === 0) throw new Error(`No tables found in source (${label})`);
+
+    // 3. Read all data from source
+    const tableData = {};
+    for (const table of tables) {
+      const res = await srcClient.query(`SELECT * FROM "${table}"`);
+      tableData[table] = res;
+    }
+    srcClient.release();
+    srcClient = null;
+
+    // 4. Write to target
+    dstClient = await targetPool.connect();
+    await dstClient.query("BEGIN");
+
+    // Truncate all tables first (reverse order to respect FKs)
+    for (let i = tables.length - 1; i >= 0; i--) {
+      await dstClient.query(`TRUNCATE "${tables[i]}" CASCADE`);
+    }
+
+    // Insert in dependency order (parents first, children after)
+    let totalRows = 0;
+    for (const table of tables) {
+      const data = tableData[table];
+      if (data.rows.length === 0) continue;
+
+      const cols = data.fields.map((f) => f.name);
+      const colList = cols.map((c) => `"${c}"`).join(",");
+
+      // Insert in chunks of 100 rows
+      const CHUNK = 100;
+      for (let i = 0; i < data.rows.length; i += CHUNK) {
+        const chunk = data.rows.slice(i, i + CHUNK);
+        const values = [];
+        const params = [];
+        let paramIdx = 1;
+
+        for (const row of chunk) {
+          const placeholders = cols.map(() => `$${paramIdx++}`);
+          values.push(`(${placeholders.join(",")})`);
+          for (const col of cols) {
+            params.push(row[col]);
+          }
+        }
+
+        await dstClient.query(
+          `INSERT INTO "${table}" (${colList}) VALUES ${values.join(",")}`,
+          params,
+        );
+      }
+      totalRows += data.rows.length;
+    }
+
+    // Reset sequences to max(id)
+    for (const table of tables) {
+      try {
+        await dstClient.query(`
+          SELECT setval(
+            pg_get_serial_sequence('"${table}"', 'id'),
+            COALESCE((SELECT MAX(id) FROM "${table}"), 1),
+            (SELECT MAX(id) FROM "${table}") IS NOT NULL
+          )
+        `);
+      } catch {
+        // no serial column — skip
+      }
+    }
+
+    await dstClient.query("COMMIT");
+    dstClient.release();
+    dstClient = null;
+
+    return { success: true, tables: tables.length, rows: totalRows };
+  } catch (err) {
+    if (dstClient) {
+      try { await dstClient.query("ROLLBACK"); } catch {}
+      try { dstClient.release(); } catch {}
+    }
+    if (srcClient) {
+      try { srcClient.release(); } catch {}
+    }
+    return { success: false, error: err.message };
+  }
+}
+
 /* ── Periodic fail-back check ──────────────────────────── */
+let failbackInProgress = false;
 setInterval(async () => {
   if (!usingNeon) return;
   if (manualOverride) return; // user switched manually, don't auto-failback
+  if (failbackInProgress) return; // already syncing
   try {
     const client = await localPool.connect();
     await client.query("SELECT 1");
     client.release();
-    console.log("✅ Local DB is back online — switching back from Neon");
-    usingNeon = false;
-    lastFailbackTime = Date.now();
+
+    // Local is back! Sync Neon → Local BEFORE switching
+    console.log("✅ Local DB is back online — syncing Neon → Local before failback...");
+    failbackInProgress = true;
+    const result = await pool.syncFromNeon();
+    failbackInProgress = false;
+
+    if (result.success) {
+      console.log(
+        `✅ Failback sync done: ${result.tables} tables, ${result.rows} rows — switching to Local`,
+      );
+      usingNeon = false;
+      lastFailbackTime = Date.now();
+    } else {
+      console.error("❌ Failback sync failed:", result.error, "— staying on Neon");
+    }
   } catch {
+    failbackInProgress = false;
     // still down, stay on Neon
   }
 }, FAILBACK_CHECK_INTERVAL);
