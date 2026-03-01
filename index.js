@@ -126,6 +126,15 @@ app.get("/health", (req, res) => {
       ? new Date(pool.lastFailbackTime).toISOString()
       : null,
     lastBackup,
+    lastSync: pool.lastSyncTime
+      ? {
+          time: new Date(pool.lastSyncTime).toISOString(),
+          success: pool.lastSyncResult?.success || false,
+          tables: pool.lastSyncResult?.tables || 0,
+          rows: pool.lastSyncResult?.rows || 0,
+          error: pool.lastSyncResult?.error || null,
+        }
+      : null,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });

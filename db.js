@@ -121,6 +121,113 @@ const pool = {
     client.release();
     return true;
   },
+
+  /**
+   * Sync all data from Local → Neon using node-pg (no pg_dump needed).
+   * Works from anywhere (Render, etc.) as long as local DB is reachable.
+   * Returns { success, tables, rows, error }
+   */
+  async syncToNeon() {
+    let localClient, neonClient;
+    try {
+      // 1. Connect to local
+      localClient = await localPool.connect();
+      await localClient.query("SELECT 1"); // quick test
+
+      // 2. Get all user tables
+      const tablesRes = await localClient.query(`
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = 'public'
+        ORDER BY tablename
+      `);
+      const tables = tablesRes.rows.map((r) => r.tablename);
+      if (tables.length === 0) throw new Error("No tables found in local DB");
+
+      // 3. Read all data from local
+      const tableData = {};
+      for (const table of tables) {
+        const res = await localClient.query(`SELECT * FROM "${table}"`);
+        tableData[table] = res;
+      }
+      localClient.release();
+      localClient = null;
+
+      // 4. Write to Neon
+      neonClient = await neonPool.connect();
+      await neonClient.query("BEGIN");
+
+      // Disable FK checks during sync
+      await neonClient.query("SET session_replication_role = replica");
+
+      let totalRows = 0;
+      for (const table of tables) {
+        // Truncate target table
+        await neonClient.query(`TRUNCATE "${table}" CASCADE`);
+
+        const data = tableData[table];
+        if (data.rows.length === 0) continue;
+
+        // Batch insert using multi-row VALUES for speed
+        const cols = data.fields.map((f) => f.name);
+        const colList = cols.map((c) => `"${c}"`).join(",");
+
+        // Insert in chunks of 100 rows
+        const CHUNK = 100;
+        for (let i = 0; i < data.rows.length; i += CHUNK) {
+          const chunk = data.rows.slice(i, i + CHUNK);
+          const values = [];
+          const params = [];
+          let paramIdx = 1;
+
+          for (const row of chunk) {
+            const placeholders = cols.map(() => `$${paramIdx++}`);
+            values.push(`(${placeholders.join(",")})`);
+            for (const col of cols) {
+              params.push(row[col]);
+            }
+          }
+
+          await neonClient.query(
+            `INSERT INTO "${table}" (${colList}) VALUES ${values.join(",")}`,
+            params,
+          );
+        }
+        totalRows += data.rows.length;
+      }
+
+      // Reset sequences to max(id)
+      for (const table of tables) {
+        try {
+          await neonClient.query(`
+            SELECT setval(
+              pg_get_serial_sequence('"${table}"', 'id'),
+              COALESCE((SELECT MAX(id) FROM "${table}"), 1),
+              (SELECT MAX(id) FROM "${table}") IS NOT NULL
+            )
+          `);
+        } catch {
+          // no serial column — skip
+        }
+      }
+
+      // Re-enable FK checks
+      await neonClient.query("SET session_replication_role = DEFAULT");
+      await neonClient.query("COMMIT");
+      neonClient.release();
+      neonClient = null;
+
+      return { success: true, tables: tables.length, rows: totalRows };
+    } catch (err) {
+      if (neonClient) {
+        try { await neonClient.query("ROLLBACK"); } catch {}
+        try { neonClient.release(); } catch {}
+      }
+      if (localClient) {
+        try { localClient.release(); } catch {}
+      }
+      return { success: false, error: err.message };
+    }
+  },
 };
 
 /* ── Periodic fail-back check ──────────────────────────── */
@@ -138,5 +245,39 @@ setInterval(async () => {
     // still down, stay on Neon
   }
 }, FAILBACK_CHECK_INTERVAL);
+
+/* ── Periodic auto-sync: Local → Neon (runs on Render 24/7) ── */
+let lastSyncTime = null;
+let lastSyncResult = null;
+const SYNC_INTERVAL = 60 * 60 * 1000; // every 1 hour
+
+// Expose sync status on the pool object
+Object.defineProperty(pool, "lastSyncTime", { get: () => lastSyncTime });
+Object.defineProperty(pool, "lastSyncResult", { get: () => lastSyncResult });
+
+async function runAutoSync() {
+  // Only sync if local is reachable (no point syncing if already on Neon)
+  if (usingNeon) {
+    console.log("⏭️  Auto-sync skipped — currently on Neon");
+    return;
+  }
+  console.log("🔄 Auto-sync started: Local → Neon...");
+  const result = await pool.syncToNeon();
+  lastSyncTime = Date.now();
+  lastSyncResult = result;
+  if (result.success) {
+    console.log(
+      `✅ Auto-sync completed: ${result.tables} tables, ${result.rows} rows`,
+    );
+  } else {
+    console.error("❌ Auto-sync failed:", result.error);
+  }
+}
+
+// Run first sync 30 seconds after startup, then every hour
+setTimeout(() => {
+  runAutoSync();
+  setInterval(runAutoSync, SYNC_INTERVAL);
+}, 30_000);
 
 module.exports = pool;
