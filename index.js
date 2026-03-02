@@ -424,104 +424,338 @@ app.post("/admin/restore", async (req, res) => {
   }
 
   const send = setupSSE(res);
-  let tmpFile = null;
 
   try {
-    // Phase 1: Download from Google Drive (0-50%)
-    send(5, "جاري الاتصال بـ Google Drive...");
-    let lastPct = 5;
-    const dl = await downloadLatestFromDrive((dlPct) => {
-      // Map download progress 0-100 to SSE progress 5-50
-      const mapped = Math.round(5 + (dlPct * 45) / 100);
-      if (mapped > lastPct) {
-        lastPct = mapped;
-        send(mapped, `جاري التنزيل: ${dlPct}%`);
-      }
-    });
-    tmpFile = dl.filePath;
-    send(52, `تم التنزيل (${dl.sizeMB} MB) — جاري القراءة...`);
+    if (target === "neon") {
+      // ── Smart sync: Local → Neon (UPSERT, no TRUNCATE) ──
+      // Try direct sync from local first (fastest), fallback to Drive
 
-    // Phase 2: Read & clean SQL (50-60%)
-    let sql = fs.readFileSync(dl.filePath, "utf8");
-    sql = sql.replace(
-      /^COPY\s+.*?FROM\s+stdin;[\s\S]*?^\\\./gm,
-      "-- [COPY block removed]",
-    );
-    send(60, "جاري تجهيز الاتصال بقاعدة البيانات...");
-
-    // Phase 3: Execute SQL (60-95%)
-    const dbEnv = getDbEnv(target);
-    const { Pool: PgPool } = require("pg");
-    const restorePool = new PgPool({
-      host: dbEnv.host,
-      port: Number(dbEnv.port),
-      user: dbEnv.user,
-      password: dbEnv.pass,
-      database: dbEnv.name,
-      ssl: dbEnv.isNeon ? { rejectUnauthorized: false } : false,
-      statement_timeout: 600000,
-    });
-
-    send(65, "جاري تنفيذ الريستور...");
-
-    // Split SQL into chunks and execute with progress
-    const statements = sql.split(/;\s*\n/).filter((s) => s.trim());
-    const total = statements.length;
-    const client = await restorePool.connect();
-    let executed = 0;
-    let errors = 0;
-
-    try {
-      await client.query("BEGIN");
-      for (const stmt of statements) {
-        const trimmed = stmt.trim();
-        if (!trimmed || trimmed.startsWith("--")) {
-          executed++;
-          continue;
-        }
-        try {
-          await client.query(trimmed);
-        } catch {
-          errors++;
-        }
-        executed++;
-        // Report every 5%
-        const pct = Math.round(65 + (executed / total) * 30);
-        if (pct > lastPct + 4) {
-          lastPct = pct;
-          send(pct, `جاري التنفيذ: ${Math.round((executed / total) * 100)}%`);
-        }
-      }
-      await client.query("COMMIT");
-    } catch (txErr) {
+      let localAvailable = false;
       try {
-        await client.query("ROLLBACK");
+        const testClient = await pool.testConnection("local");
+        localAvailable = true;
       } catch {}
-      throw txErr;
-    } finally {
-      client.release();
-      await restorePool.end();
+
+      if (localAvailable) {
+        // ── Direct sync from Local → Neon ──
+        send(5, "السيرفر المحلي متاح — جاري المزامنة المباشرة...");
+
+        const { Pool: PgPool } = require("pg");
+        const localDbEnv = getDbEnv("local");
+        const neonDbEnv = getDbEnv("neon");
+
+        const srcPool = new PgPool({
+          host: localDbEnv.host,
+          port: Number(localDbEnv.port),
+          user: localDbEnv.user,
+          password: localDbEnv.pass,
+          database: localDbEnv.name,
+          ssl: localDbEnv.isNeon ? { rejectUnauthorized: false } : false,
+          connectionTimeoutMillis: 10000,
+        });
+        const dstPool = new PgPool({
+          host: neonDbEnv.host,
+          port: Number(neonDbEnv.port),
+          user: neonDbEnv.user,
+          password: neonDbEnv.pass,
+          database: neonDbEnv.name,
+          ssl: neonDbEnv.isNeon ? { rejectUnauthorized: false } : false,
+          connectionTimeoutMillis: 10000,
+        });
+
+        let srcClient, dstClient;
+        try {
+          srcClient = await srcPool.connect();
+          dstClient = await dstPool.connect();
+
+          send(10, "جاري قراءة الجداول...");
+
+          // Get ordered tables
+          const tablesRes = await srcClient.query(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+          );
+          const allTables = tablesRes.rows.map((r) => r.tablename);
+
+          const fkRes = await srcClient.query(`
+            SELECT c1.relname AS child, c2.relname AS parent
+            FROM pg_constraint con
+            JOIN pg_class c1 ON c1.oid = con.conrelid
+            JOIN pg_class c2 ON c2.oid = con.confrelid
+            JOIN pg_namespace n1 ON n1.oid = c1.relnamespace
+            WHERE con.contype = 'f' AND n1.nspname = 'public'
+              AND c1.relname != c2.relname
+          `);
+
+          const deps = {};
+          allTables.forEach((t) => (deps[t] = new Set()));
+          fkRes.rows.forEach((r) => {
+            if (deps[r.child]) deps[r.child].add(r.parent);
+          });
+
+          const sorted = [];
+          const visited = new Set();
+          function visit(table) {
+            if (visited.has(table)) return;
+            visited.add(table);
+            for (const parent of deps[table] || []) visit(parent);
+            sorted.push(table);
+          }
+          allTables.forEach(visit);
+          const tables = sorted;
+
+          // Get primary keys
+          const tablePKs = {};
+          for (const table of tables) {
+            const pkRes = await srcClient.query(`
+              SELECT a.attname
+              FROM pg_index i
+              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+              WHERE i.indrelid = '"${table}"'::regclass AND i.indisprimary
+              ORDER BY array_position(i.indkey, a.attnum)
+            `);
+            tablePKs[table] = pkRes.rows.map((r) => r.attname);
+          }
+
+          send(15, `تم تحميل ${tables.length} جدول — جاري المزامنة...`);
+
+          await dstClient.query("BEGIN");
+
+          let totalUpserted = 0;
+          let totalSkipped = 0;
+          let tablesProcessed = 0;
+
+          for (const table of tables) {
+            const pks = tablePKs[table];
+            if (pks.length === 0) {
+              tablesProcessed++;
+              continue;
+            }
+
+            // Read all data from source
+            const data = await srcClient.query(`SELECT * FROM "${table}"`);
+            if (data.rows.length === 0) {
+              tablesProcessed++;
+              continue;
+            }
+
+            const cols = data.fields.map((f) => f.name);
+            const colList = cols.map((c) => `"${c}"`).join(",");
+            const pkCondition = pks.map((pk) => `"${pk}"`).join(",");
+            const updateCols = cols.filter((c) => !pks.includes(c));
+            const updateSet =
+              updateCols.length > 0
+                ? updateCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(",")
+                : null;
+
+            // UPSERT in chunks
+            const CHUNK = 100;
+            let tableUpserted = 0;
+            for (let i = 0; i < data.rows.length; i += CHUNK) {
+              const chunk = data.rows.slice(i, i + CHUNK);
+              const values = [];
+              const params = [];
+              let paramIdx = 1;
+
+              for (const row of chunk) {
+                const placeholders = cols.map(() => `$${paramIdx++}`);
+                values.push(`(${placeholders.join(",")})`);
+                for (const col of cols) params.push(row[col]);
+              }
+
+              const sql = updateSet
+                ? `INSERT INTO "${table}" (${colList}) VALUES ${values.join(",")} ON CONFLICT (${pkCondition}) DO UPDATE SET ${updateSet}`
+                : `INSERT INTO "${table}" (${colList}) VALUES ${values.join(",")} ON CONFLICT (${pkCondition}) DO NOTHING`;
+
+              await dstClient.query(sql, params);
+              tableUpserted += chunk.length;
+            }
+
+            totalUpserted += tableUpserted;
+            tablesProcessed++;
+
+            // Progress update
+            const pct = Math.round(15 + (tablesProcessed / tables.length) * 75);
+            send(pct, `${tablesProcessed}/${tables.length} جدول — ${table} (${data.rows.length} سجل)`);
+          }
+
+          // Reset sequences
+          for (const table of tables) {
+            try {
+              await dstClient.query(`
+                SELECT setval(
+                  pg_get_serial_sequence('"${table}"', 'id'),
+                  COALESCE((SELECT MAX(id) FROM "${table}"), 1),
+                  (SELECT MAX(id) FROM "${table}") IS NOT NULL
+                )
+              `);
+            } catch {}
+          }
+
+          await dstClient.query("COMMIT");
+
+          send(
+            100,
+            `تم مزامنة ${tablesProcessed} جدول (${totalUpserted} سجل) من المحلي إلى Neon`,
+            true,
+            false,
+            { tables: tablesProcessed, rows: totalUpserted, target, mode: "direct-upsert" }
+          );
+        } catch (syncErr) {
+          if (dstClient) {
+            try { await dstClient.query("ROLLBACK"); } catch {}
+          }
+          throw syncErr;
+        } finally {
+          if (srcClient) try { srcClient.release(); } catch {}
+          if (dstClient) try { dstClient.release(); } catch {}
+          await srcPool.end().catch(() => {});
+          await dstPool.end().catch(() => {});
+        }
+
+      } else {
+        // ── Local is down — download from Drive and UPSERT to Neon ──
+        send(5, "المحلي غير متاح — جاري التنزيل من Google Drive...");
+
+        let lastPct = 5;
+        const dl = await downloadLatestFromDrive((dlPct) => {
+          const mapped = Math.round(5 + (dlPct * 30) / 100);
+          if (mapped > lastPct) {
+            lastPct = mapped;
+            send(mapped, `جاري التنزيل: ${dlPct}%`);
+          }
+        });
+
+        send(38, `تم التنزيل (${dl.sizeMB} MB) — جاري الريستور...`);
+
+        // Restore SQL to Neon
+        let sql = fs.readFileSync(dl.filePath, "utf8");
+        sql = sql.replace(/^COPY\s+.*?FROM\s+stdin;[\s\S]*?^\\\./gm, "-- [COPY block removed]");
+
+        const dbEnv = getDbEnv("neon");
+        const { Pool: PgPool } = require("pg");
+        const restorePool = new PgPool({
+          host: dbEnv.host,
+          port: Number(dbEnv.port),
+          user: dbEnv.user,
+          password: dbEnv.pass,
+          database: dbEnv.name,
+          ssl: dbEnv.isNeon ? { rejectUnauthorized: false } : false,
+          statement_timeout: 600000,
+        });
+
+        const statements = sql.split(/;\s*\n/).filter((s) => s.trim());
+        const total = statements.length;
+        const client = await restorePool.connect();
+        let executed = 0;
+        let errors = 0;
+
+        try {
+          await client.query("BEGIN");
+          for (const stmt of statements) {
+            const trimmed = stmt.trim();
+            if (!trimmed || trimmed.startsWith("--")) { executed++; continue; }
+            try { await client.query(trimmed); } catch { errors++; }
+            executed++;
+            const pct = Math.round(40 + (executed / total) * 55);
+            if (pct > lastPct + 4) {
+              lastPct = pct;
+              send(pct, `جاري التنفيذ: ${Math.round((executed / total) * 100)}%`);
+            }
+          }
+          await client.query("COMMIT");
+        } catch (txErr) {
+          try { await client.query("ROLLBACK"); } catch {}
+          throw txErr;
+        } finally {
+          client.release();
+          await restorePool.end();
+        }
+
+        try { fs.unlinkSync(dl.filePath); } catch {}
+
+        send(
+          100,
+          `تم الريستور من Drive: ${dl.fileName} (${errors > 0 ? errors + " تحذيرات" : "بدون أخطاء"})`,
+          true,
+          false,
+          { file: dl.fileName, target, mode: "drive-restore" }
+        );
+      }
+
+    } else {
+      // ── target === "local" — download from Drive and restore to local ──
+      send(5, "جاري الاتصال بـ Google Drive...");
+      let tmpFile = null;
+      let lastPct = 5;
+
+      const dl = await downloadLatestFromDrive((dlPct) => {
+        const mapped = Math.round(5 + (dlPct * 45) / 100);
+        if (mapped > lastPct) {
+          lastPct = mapped;
+          send(mapped, `جاري التنزيل: ${dlPct}%`);
+        }
+      });
+      tmpFile = dl.filePath;
+      send(52, `تم التنزيل (${dl.sizeMB} MB) — جاري القراءة...`);
+
+      let sql = fs.readFileSync(dl.filePath, "utf8");
+      sql = sql.replace(/^COPY\s+.*?FROM\s+stdin;[\s\S]*?^\\\./gm, "-- [COPY block removed]");
+      send(60, "جاري تجهيز الاتصال بقاعدة البيانات...");
+
+      const dbEnv = getDbEnv("local");
+      const { Pool: PgPool } = require("pg");
+      const restorePool = new PgPool({
+        host: dbEnv.host,
+        port: Number(dbEnv.port),
+        user: dbEnv.user,
+        password: dbEnv.pass,
+        database: dbEnv.name,
+        ssl: dbEnv.isNeon ? { rejectUnauthorized: false } : false,
+        statement_timeout: 600000,
+      });
+
+      send(65, "جاري تنفيذ الريستور...");
+
+      const statements = sql.split(/;\s*\n/).filter((s) => s.trim());
+      const total = statements.length;
+      const client = await restorePool.connect();
+      let executed = 0;
+      let errors = 0;
+
+      try {
+        await client.query("BEGIN");
+        for (const stmt of statements) {
+          const trimmed = stmt.trim();
+          if (!trimmed || trimmed.startsWith("--")) { executed++; continue; }
+          try { await client.query(trimmed); } catch { errors++; }
+          executed++;
+          const pct = Math.round(65 + (executed / total) * 30);
+          if (pct > lastPct + 4) {
+            lastPct = pct;
+            send(pct, `جاري التنفيذ: ${Math.round((executed / total) * 100)}%`);
+          }
+        }
+        await client.query("COMMIT");
+      } catch (txErr) {
+        try { await client.query("ROLLBACK"); } catch {}
+        throw txErr;
+      } finally {
+        client.release();
+        await restorePool.end();
+      }
+
+      try { fs.unlinkSync(tmpFile); } catch {}
+
+      send(
+        100,
+        `تم الريستور: ${dl.fileName} (${errors > 0 ? errors + " تحذيرات" : "بدون أخطاء"})`,
+        true,
+        false,
+        { file: dl.fileName, target }
+      );
     }
-
-    // Cleanup
-    try {
-      fs.unlinkSync(tmpFile);
-    } catch {}
-
-    send(
-      100,
-      `تم الريستور: ${dl.fileName} (${errors > 0 ? errors + " تحذيرات" : "بدون أخطاء"})`,
-      true,
-      false,
-      { file: dl.fileName, target },
-    );
   } catch (err) {
     console.error("restore error:", err);
-    if (tmpFile) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-    }
     send(0, `فشل الريستور: ${err.message}`, false, true);
   }
 });
