@@ -343,9 +343,9 @@ async function getOrderedTables(client) {
 }
 
 /**
- * Incremental sync: only sync rows changed since `since` timestamp.
- * Uses UPSERT for changed/new rows + DELETE for removed rows.
- * Much faster than full sync for hourly updates.
+ * Fast incremental sync: only sync rows changed since `since` timestamp.
+ * Uses UPSERT only (no delete detection) — optimized for speed.
+ * Chunk size 500 for fewer round-trips.
  */
 async function incrementalSyncBetweenPools(
   sourcePool,
@@ -354,6 +354,7 @@ async function incrementalSyncBetweenPools(
   since,
 ) {
   let srcClient, dstClient;
+  const startTime = Date.now();
   try {
     srcClient = await sourcePool.connect();
     dstClient = await targetPool.connect();
@@ -363,21 +364,23 @@ async function incrementalSyncBetweenPools(
     const tables = await getOrderedTables(srcClient);
     if (tables.length === 0) throw new Error(`No tables found (${label})`);
 
-    // Get primary key columns for each table
+    // Get primary key columns for each table (batch query)
+    const allPKsRes = await srcClient.query(`
+      SELECT c.relname AS tablename, a.attname
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indrelid
+      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE i.indisprimary AND n.nspname = 'public'
+      ORDER BY c.relname, array_position(i.indkey, a.attnum)
+    `);
     const tablePKs = {};
-    for (const table of tables) {
-      const pkRes = await srcClient.query(`
-        SELECT a.attname
-        FROM pg_index i
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        WHERE i.indrelid = '${table}'::regclass
-          AND i.indisprimary
-        ORDER BY array_position(i.indkey, a.attnum)
-      `);
-      tablePKs[table] = pkRes.rows.map((r) => r.attname);
+    for (const row of allPKsRes.rows) {
+      if (!tablePKs[row.tablename]) tablePKs[row.tablename] = [];
+      tablePKs[row.tablename].push(row.attname);
     }
 
-    // Check which tables have updated_at
+    // Check which tables have updated_at (one query)
     const tsRes = await srcClient.query(
       "SELECT table_name FROM information_schema.columns WHERE table_schema = 'public' AND column_name = 'updated_at'",
     );
@@ -386,53 +389,21 @@ async function incrementalSyncBetweenPools(
     await dstClient.query("BEGIN");
 
     let totalUpserted = 0;
-    let totalDeleted = 0;
     let tablesChanged = 0;
+    const CHUNK = 500;
 
-    // Phase 1: Delete removed rows (reverse order — children first)
-    for (let i = tables.length - 1; i >= 0; i--) {
-      const table = tables[i];
-      const pks = tablePKs[table];
-      if (pks.length !== 1) continue; // skip composite PKs for delete detection
-      const pk = pks[0];
-
-      const srcIds = await srcClient.query(`SELECT "${pk}" FROM "${table}"`);
-      const tgtIds = await dstClient.query(`SELECT "${pk}" FROM "${table}"`);
-
-      const srcSet = new Set(srcIds.rows.map((r) => String(r[pk])));
-      const toDelete = tgtIds.rows
-        .filter((r) => !srcSet.has(String(r[pk])))
-        .map((r) => r[pk]);
-
-      if (toDelete.length > 0) {
-        const CHUNK = 100;
-        for (let j = 0; j < toDelete.length; j += CHUNK) {
-          const chunk = toDelete.slice(j, j + CHUNK);
-          const ph = chunk.map((_, k) => `$${k + 1}`).join(",");
-          await dstClient.query(
-            `DELETE FROM "${table}" WHERE "${pk}" IN (${ph})`,
-            chunk,
-          );
-        }
-        totalDeleted += toDelete.length;
-        tablesChanged++;
-      }
-    }
-
-    // Phase 2: Upsert changed/new rows (dependency order — parents first)
+    // UPSERT changed/new rows (dependency order — parents first)
     for (const table of tables) {
       const pks = tablePKs[table];
-      if (pks.length === 0) continue;
+      if (!pks || pks.length === 0) continue;
 
       let data;
       if (hasTimestamp.has(table) && since) {
-        // Incremental: only changed rows
         data = await srcClient.query(
           `SELECT * FROM "${table}" WHERE updated_at >= $1`,
           [since],
         );
       } else {
-        // No timestamp column → sync full table
         data = await srcClient.query(`SELECT * FROM "${table}"`);
       }
 
@@ -447,7 +418,6 @@ async function incrementalSyncBetweenPools(
           ? updateCols.map((c) => `"${c}" = EXCLUDED."${c}"`).join(",")
           : null;
 
-      const CHUNK = 100;
       for (let i = 0; i < data.rows.length; i += CHUNK) {
         const chunk = data.rows.slice(i, i + CHUNK);
         const values = [];
@@ -468,6 +438,7 @@ async function incrementalSyncBetweenPools(
       }
       totalUpserted += data.rows.length;
       tablesChanged++;
+      console.log(`  [${label}] ${table}: ${data.rows.length} rows upserted`);
     }
 
     // Reset sequences
@@ -491,28 +462,28 @@ async function incrementalSyncBetweenPools(
     dstClient.release();
     dstClient = null;
 
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`  [${label}] Done in ${elapsed}s: ${totalUpserted} rows, ${tablesChanged} tables`);
+
     return {
       success: true,
       mode: "incremental",
       tables: tablesChanged,
       upserted: totalUpserted,
-      deleted: totalDeleted,
-      rows: totalUpserted + totalDeleted,
+      deleted: 0,
+      rows: totalUpserted,
+      elapsed: parseFloat(elapsed),
     };
   } catch (err) {
     if (dstClient) {
-      try {
-        await dstClient.query("ROLLBACK");
-      } catch {}
-      try {
-        dstClient.release();
-      } catch {}
+      try { await dstClient.query("ROLLBACK"); } catch {}
+      try { dstClient.release(); } catch {}
     }
     if (srcClient) {
-      try {
-        srcClient.release();
-      } catch {}
+      try { srcClient.release(); } catch {}
     }
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.error(`  [${label}] Failed after ${elapsed}s: ${err.message}`);
     return { success: false, error: err.message };
   }
 }
@@ -556,31 +527,39 @@ setInterval(async () => {
       failbackFailCount = 0;
       failbackInProgress = false;
       failbackStartTime = null;
-      console.log("🔄 Switched to Local. Will sync Neon → Local in background...");
+      console.log(
+        "🔄 Switched to Local. Will sync Neon → Local in background...",
+      );
       // Fire-and-forget background sync (non-blocking)
-      pool.syncFromNeon().then((r) => {
-        if (r.success) {
-          console.log(`✅ Background Neon → Local sync done: ${r.tables} tables, ${r.rows} rows`);
-        } else {
-          console.error("❌ Background Neon → Local sync failed:", r.error);
-        }
-      }).catch((e) => {
-        console.error("❌ Background Neon → Local sync error:", e.message);
-      });
+      pool
+        .syncFromNeon()
+        .then((r) => {
+          if (r.success) {
+            console.log(
+              `✅ Background Neon → Local sync done: ${r.tables} tables, ${r.rows} rows`,
+            );
+          } else {
+            console.error("❌ Background Neon → Local sync failed:", r.error);
+          }
+        })
+        .catch((e) => {
+          console.error("❌ Background Neon → Local sync error:", e.message);
+        });
       return;
     }
 
     // Normal path: sync Neon → Local before switching
-    console.log(
-      "🔄 Syncing Neon → Local before failback...",
-    );
+    console.log("🔄 Syncing Neon → Local before failback...");
     failbackInProgress = true;
     failbackStartTime = Date.now();
 
     // Wrap sync with a timeout
     const syncPromise = pool.syncFromNeon();
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Failback sync timed out")), FAILBACK_SYNC_TIMEOUT)
+      setTimeout(
+        () => reject(new Error("Failback sync timed out")),
+        FAILBACK_SYNC_TIMEOUT,
+      ),
     );
 
     const result = await Promise.race([syncPromise, timeoutPromise]);
@@ -620,7 +599,7 @@ setInterval(async () => {
 /* ── Periodic auto-sync: Local → Neon (runs on Render 24/7) ── */
 let lastSyncTime = null;
 let lastSyncResult = null;
-const SYNC_INTERVAL = 60 * 60 * 1000; // every 1 hour
+const SYNC_INTERVAL = 10 * 60 * 1000; // every 10 minutes
 
 // Expose sync status on the pool object
 Object.defineProperty(pool, "lastSyncTime", { get: () => lastSyncTime });
