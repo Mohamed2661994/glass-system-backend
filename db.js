@@ -33,12 +33,23 @@ neonPool.on("connect", (client) => {
   client.query("SET timezone = 'Africa/Cairo'");
 });
 
+// Prevent unhandled error events from crashing the process
+localPool.on("error", (err) => {
+  console.error("⚠️  Local pool idle client error:", err.message);
+});
+neonPool.on("error", (err) => {
+  console.error("⚠️  Neon pool idle client error:", err.message);
+});
+
 /* ── Hybrid wrapper ────────────────────────────────────── */
 let usingNeon = false;
 let manualOverride = false; // true = user switched manually, don't auto-failback
 let lastFailoverTime = null;
 let lastFailbackTime = null;
 const FAILBACK_CHECK_INTERVAL = 60_000; // try local again every 60s
+const FAILBACK_SYNC_TIMEOUT = 5 * 60 * 1000; // 5 min max for failback sync
+let failbackFailCount = 0; // track consecutive failback failures
+const MAX_FAILBACK_FAILS_BEFORE_FORCE = 3; // after 3 failed syncs, switch without sync
 
 /**
  * Returns a client from the local pool.
@@ -508,22 +519,73 @@ async function incrementalSyncBetweenPools(
 
 /* ── Periodic fail-back check ──────────────────────────── */
 let failbackInProgress = false;
+let failbackStartTime = null;
+
 setInterval(async () => {
   if (!usingNeon) return;
   if (manualOverride) return; // user switched manually, don't auto-failback
-  if (failbackInProgress) return; // already syncing
+
+  // Safety: if failback has been "in progress" for too long, force-reset the flag
+  if (failbackInProgress) {
+    const elapsed = Date.now() - (failbackStartTime || 0);
+    if (elapsed > FAILBACK_SYNC_TIMEOUT) {
+      console.error(
+        `⚠️  Failback sync stuck for ${Math.round(elapsed / 1000)}s — force-resetting flag`,
+      );
+      failbackInProgress = false;
+      failbackStartTime = null;
+    } else {
+      return; // still within timeout, wait
+    }
+  }
+
   try {
     const client = await localPool.connect();
     await client.query("SELECT 1");
     client.release();
 
-    // Local is back! Sync Neon → Local BEFORE switching
+    console.log("✅ Local DB is back online!");
+
+    // If sync has failed too many times, switch directly without sync
+    if (failbackFailCount >= MAX_FAILBACK_FAILS_BEFORE_FORCE) {
+      console.log(
+        `⚠️  Sync failed ${failbackFailCount} times — switching to Local WITHOUT sync`,
+      );
+      usingNeon = false;
+      lastFailbackTime = Date.now();
+      failbackFailCount = 0;
+      failbackInProgress = false;
+      failbackStartTime = null;
+      console.log("🔄 Switched to Local. Will sync Neon → Local in background...");
+      // Fire-and-forget background sync (non-blocking)
+      pool.syncFromNeon().then((r) => {
+        if (r.success) {
+          console.log(`✅ Background Neon → Local sync done: ${r.tables} tables, ${r.rows} rows`);
+        } else {
+          console.error("❌ Background Neon → Local sync failed:", r.error);
+        }
+      }).catch((e) => {
+        console.error("❌ Background Neon → Local sync error:", e.message);
+      });
+      return;
+    }
+
+    // Normal path: sync Neon → Local before switching
     console.log(
-      "✅ Local DB is back online — syncing Neon → Local before failback...",
+      "🔄 Syncing Neon → Local before failback...",
     );
     failbackInProgress = true;
-    const result = await pool.syncFromNeon();
+    failbackStartTime = Date.now();
+
+    // Wrap sync with a timeout
+    const syncPromise = pool.syncFromNeon();
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Failback sync timed out")), FAILBACK_SYNC_TIMEOUT)
+    );
+
+    const result = await Promise.race([syncPromise, timeoutPromise]);
     failbackInProgress = false;
+    failbackStartTime = null;
 
     if (result.success) {
       console.log(
@@ -531,16 +593,27 @@ setInterval(async () => {
       );
       usingNeon = false;
       lastFailbackTime = Date.now();
+      failbackFailCount = 0;
     } else {
+      failbackFailCount++;
       console.error(
-        "❌ Failback sync failed:",
+        `❌ Failback sync failed (attempt ${failbackFailCount}/${MAX_FAILBACK_FAILS_BEFORE_FORCE}):`,
         result.error,
         "— staying on Neon",
       );
     }
-  } catch {
+  } catch (err) {
     failbackInProgress = false;
-    // still down, stay on Neon
+    failbackStartTime = null;
+    if (err.message === "Failback sync timed out") {
+      failbackFailCount++;
+      console.error(
+        `❌ Failback sync timed out (attempt ${failbackFailCount}/${MAX_FAILBACK_FAILS_BEFORE_FORCE}) — staying on Neon`,
+      );
+    } else {
+      // Local still down
+      console.log("⏳ Local still down:", err.message);
+    }
   }
 }, FAILBACK_CHECK_INTERVAL);
 
