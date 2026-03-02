@@ -297,6 +297,65 @@ function setupSSE(res) {
   return send;
 }
 
+/* ── Google Drive: upload file (works with files OR env vars) ── */
+async function uploadToDrive(filePath) {
+  const { google } = require("googleapis");
+
+  let clientId, clientSecret, refreshToken;
+  const credFile = path.join(__dirname, "credentials", "oauth-client.json");
+  const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
+
+  if (fs.existsSync(credFile) && fs.existsSync(tokenFile)) {
+    const creds = JSON.parse(fs.readFileSync(credFile, "utf8"));
+    const key = Object.keys(creds)[0];
+    clientId = creds[key].client_id;
+    clientSecret = creds[key].client_secret;
+    const tokens = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
+    refreshToken = tokens.refresh_token;
+  } else {
+    clientId = process.env.GDRIVE_CLIENT_ID;
+    clientSecret = process.env.GDRIVE_CLIENT_SECRET;
+    refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
+  }
+
+  const folderId =
+    process.env.GDRIVE_FOLDER_ID || "1sOVQgZ2A_Vfr2KfZ5I1yjjwSIMH3R3Iw";
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error("Google Drive credentials not configured");
+  }
+
+  const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
+  oauth2.setCredentials({ refresh_token: refreshToken });
+  const drive = google.drive({ version: "v3", auth: oauth2 });
+
+  const fileName = path.basename(filePath);
+  const res = await drive.files.create({
+    requestBody: { name: fileName, parents: [folderId] },
+    media: {
+      mimeType: "application/sql",
+      body: fs.createReadStream(filePath),
+    },
+    fields: "id,name",
+  });
+
+  // Cleanup old files (keep last 5)
+  const list = await drive.files.list({
+    q: `'${folderId}' in parents and trashed=false`,
+    orderBy: "createdTime desc",
+    pageSize: 100,
+    fields: "files(id,name)",
+  });
+  const files = list.data.files || [];
+  if (files.length > 5) {
+    for (const f of files.slice(5)) {
+      await drive.files.delete({ fileId: f.id }).catch(() => {});
+    }
+  }
+
+  return res.data;
+}
+
 /* ── Admin: Manual Backup (SSE progress) ── */
 app.post("/admin/backup", (req, res) => {
   const send = setupSSE(res);
@@ -321,7 +380,7 @@ app.post("/admin/backup", (req, res) => {
 
   send(15, "جاري تصدير قاعدة البيانات...");
 
-  exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
+  exec(cmd, { timeout: 180000 }, async (err, stdout, stderr) => {
     if (err) {
       console.error("backup error:", err.message, stderr);
       return send(0, `فشل الباك أب: ${err.message}`, false, true);
@@ -332,42 +391,20 @@ app.post("/admin/backup", (req, res) => {
 
       send(65, `تم التصدير (${sizeMB} MB) — جاري الرفع على Google Drive...`);
 
-      // Upload to Google Drive
-      const gdrive = path.join(__dirname, "scripts", "gdrive-helper.js");
-      const tokenFile = path.join(
-        __dirname,
-        "credentials",
-        "gdrive-token.json",
-      );
-      if (fs.existsSync(gdrive) && fs.existsSync(tokenFile)) {
-        exec(
-          `node "${gdrive}" upload "${backupFile}"`,
-          { timeout: 120000 },
-          (uploadErr) => {
-            if (uploadErr) {
-              send(
-                100,
-                `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB) — فشل الرفع على Drive`,
-                true,
-                false,
-                { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
-              );
-            } else {
-              send(
-                100,
-                `تم الباك أب + الرفع على Drive: ${path.basename(backupFile)} (${sizeMB} MB)`,
-                true,
-                false,
-                { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
-              );
-            }
-          },
-        );
-      } else {
-        // No Drive credentials — try env-based upload
+      try {
+        await uploadToDrive(backupFile);
         send(
           100,
-          `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB)`,
+          `تم الباك أب + الرفع على Drive: ${path.basename(backupFile)} (${sizeMB} MB)`,
+          true,
+          false,
+          { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
+        );
+      } catch (uploadErr) {
+        console.error("Drive upload error:", uploadErr.message);
+        send(
+          100,
+          `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB) — فشل الرفع على Drive: ${uploadErr.message}`,
           true,
           false,
           { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
