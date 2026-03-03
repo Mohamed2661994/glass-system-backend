@@ -120,30 +120,30 @@ function getActivePool() {
 
 // Tables to sync and their primary keys
 const SYNC_TABLES = [
-  { table: "warehouses",       pk: ["id"] },
-  { table: "manufacturers",    pk: ["id"] },
-  { table: "products",         pk: ["id"] },
+  { table: "warehouses", pk: ["id"] },
+  { table: "manufacturers", pk: ["id"] },
+  { table: "products", pk: ["id"] },
   { table: "product_variants", pk: ["id"] },
-  { table: "stock",            pk: ["warehouse_id", "product_id", "variant_id"] },
-  { table: "customers",        pk: ["id"] },
-  { table: "customer_phones",  pk: ["id"] },
-  { table: "suppliers",        pk: ["id"] },
-  { table: "supplier_phones",  pk: ["id"] },
-  { table: "users",            pk: ["id"] },
-  { table: "invoices",         pk: ["id"] },
-  { table: "invoice_items",    pk: ["id"] },
-  { table: "stock_transfers",  pk: ["id"] },
+  { table: "stock", pk: ["warehouse_id", "product_id", "variant_id"] },
+  { table: "customers", pk: ["id"] },
+  { table: "customer_phones", pk: ["id"] },
+  { table: "suppliers", pk: ["id"] },
+  { table: "supplier_phones", pk: ["id"] },
+  { table: "users", pk: ["id"] },
+  { table: "invoices", pk: ["id"] },
+  { table: "invoice_items", pk: ["id"] },
+  { table: "stock_transfers", pk: ["id"] },
   { table: "stock_transfer_items", pk: ["id"] },
-  { table: "stock_movements",  pk: ["id"] },
-  { table: "cash_in",          pk: ["id"] },
-  { table: "cash_out",         pk: ["id"] },
-  { table: "daily_cash",       pk: ["id"] },
-  { table: "branches",         pk: ["id"] },
-  { table: "notifications",    pk: ["id"] },
-  { table: "conversations",    pk: ["id"] },
+  { table: "stock_movements", pk: ["id"] },
+  { table: "cash_in", pk: ["id"] },
+  { table: "cash_out", pk: ["id"] },
+  { table: "daily_cash", pk: ["id"] },
+  { table: "branches", pk: ["id"] },
+  { table: "notifications", pk: ["id"] },
+  { table: "conversations", pk: ["id"] },
   { table: "conversation_participants", pk: ["conversation_id", "user_id"] },
-  { table: "messages",         pk: ["id"] },
-  { table: "user_activity",    pk: ["id"] },
+  { table: "messages", pk: ["id"] },
+  { table: "user_activity", pk: ["id"] },
 ];
 
 async function syncBetweenPools() {
@@ -233,19 +233,19 @@ async function syncTable(table, pk) {
   localRows.rows.forEach((r) => localMap.set(pkKey(r), r));
   cloudRows.rows.forEach((r) => cloudMap.set(pkKey(r), r));
 
+  // Collect upsert operations, then execute with retry for self-referencing FKs
+  const pendingOps = [];
+
   // ── Local → Cloud: rows in local but not in cloud, or newer in local ──
   for (const [key, localRow] of localMap) {
     const cloudRow = cloudMap.get(key);
     if (!cloudRow) {
-      // Missing in cloud — insert
-      await upsertRow(cloudPool, table, columns, pk, localRow);
-      synced++;
+      pendingOps.push({ pool: cloudPool, row: localRow });
     } else if (hasUpdatedAt && localRow.updated_at && cloudRow.updated_at) {
       const localTime = new Date(localRow.updated_at).getTime();
       const cloudTime = new Date(cloudRow.updated_at).getTime();
       if (localTime > cloudTime) {
-        await upsertRow(cloudPool, table, columns, pk, localRow);
-        synced++;
+        pendingOps.push({ pool: cloudPool, row: localRow });
       }
     }
   }
@@ -254,17 +254,45 @@ async function syncTable(table, pk) {
   for (const [key, cloudRow] of cloudMap) {
     const localRow = localMap.get(key);
     if (!localRow) {
-      // Missing in local — insert
-      await upsertRow(localPool, table, columns, pk, cloudRow);
-      synced++;
+      pendingOps.push({ pool: localPool, row: cloudRow });
     } else if (hasUpdatedAt && cloudRow.updated_at && localRow.updated_at) {
       const cloudTime = new Date(cloudRow.updated_at).getTime();
       const localTime = new Date(localRow.updated_at).getTime();
       if (cloudTime > localTime) {
-        await upsertRow(localPool, table, columns, pk, cloudRow);
-        synced++;
+        pendingOps.push({ pool: localPool, row: cloudRow });
       }
     }
+  }
+
+  // Execute with retry — handles self-referencing FK constraints
+  // (e.g. messages.reply_to_id → messages.id)
+  let remaining = pendingOps;
+  const MAX_PASSES = 3;
+
+  for (let pass = 0; pass < MAX_PASSES && remaining.length > 0; pass++) {
+    const failed = [];
+    for (const op of remaining) {
+      try {
+        await upsertRow(op.pool, table, columns, pk, op.row);
+        synced++;
+      } catch (err) {
+        // Only retry FK violations, re-throw others
+        if (err.code === "23503") {
+          failed.push(op);
+        } else {
+          throw err;
+        }
+      }
+    }
+    if (failed.length === remaining.length) {
+      // No progress — stop retrying and throw
+      throw new Error(`FK constraint: ${failed.length} rows stuck after ${pass + 1} passes`);
+    }
+    remaining = failed;
+  }
+
+  if (remaining.length > 0) {
+    throw new Error(`FK constraint: ${remaining.length} rows could not be synced after ${MAX_PASSES} passes`);
   }
 
   if (synced > 0) console.log(`  📋 ${table}: ${synced} rows synced`);
