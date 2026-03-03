@@ -90,13 +90,18 @@ setInterval(async () => {
 
   // Auto-failback: local recovered → sync first, then switch back
   if (state.activeDb === "cloud" && state.localAlive) {
-    console.log("🔄 Local DB recovered — syncing cloud → local before failback...");
+    console.log(
+      "🔄 Local DB recovered — syncing cloud → local before failback...",
+    );
     // Sync cloud data to local BEFORE switching back
     try {
       await syncBetweenPools();
       console.log("✅ Pre-failback sync complete");
     } catch (err) {
-      console.error("⚠️  Pre-failback sync error (switching anyway):", err.message);
+      console.error(
+        "⚠️  Pre-failback sync error (switching anyway):",
+        err.message,
+      );
     }
     state.activeDb = "local";
     const record = {
@@ -182,6 +187,14 @@ async function syncBetweenPools() {
         errorDetails.push(`${table}: ${err.message}`);
         console.error(`❌ Sync error for ${table}:`, err.message);
       }
+    }
+
+    // ── Sync sequences: ensure both DBs have sequences >= max(id) ──
+    try {
+      await syncSequences();
+    } catch (err) {
+      console.error("⚠️  Sequence sync error:", err.message);
+      errorDetails.push(`sequences: ${err.message}`);
     }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -294,17 +307,57 @@ async function syncTable(table, pk) {
     }
     if (failed.length === remaining.length) {
       // No progress — stop retrying and throw
-      throw new Error(`FK constraint: ${failed.length} rows stuck after ${pass + 1} passes`);
+      throw new Error(
+        `FK constraint: ${failed.length} rows stuck after ${pass + 1} passes`,
+      );
     }
     remaining = failed;
   }
 
   if (remaining.length > 0) {
-    throw new Error(`FK constraint: ${remaining.length} rows could not be synced after ${MAX_PASSES} passes`);
+    throw new Error(
+      `FK constraint: ${remaining.length} rows could not be synced after ${MAX_PASSES} passes`,
+    );
   }
 
   if (synced > 0) console.log(`  📋 ${table}: ${synced} rows synced`);
   return synced;
+}
+
+/* ── Sync sequences: ensure both DBs have nextval >= max(id) + 1 ── */
+async function syncSequences() {
+  const seqQuery = `
+    SELECT s.relname as seq_name, t.relname as table_name, a.attname as column_name
+    FROM pg_class s
+    JOIN pg_depend d ON d.objid = s.oid
+    JOIN pg_class t ON t.oid = d.refobjid
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+    WHERE s.relkind = 'S'
+    ORDER BY t.relname
+  `;
+
+  // Fix sequences on both pools
+  for (const [pool, label] of [[localPool, "Local"], [cloudPool, "Cloud"]]) {
+    try {
+      const seqs = await pool.query(seqQuery);
+      let fixed = 0;
+      for (const row of seqs.rows) {
+        const maxRes = await pool.query(
+          `SELECT COALESCE(MAX("${row.column_name}"), 0) as mx FROM "${row.table_name}"`
+        );
+        const maxVal = parseInt(maxRes.rows[0].mx);
+        const currRes = await pool.query(`SELECT last_value FROM "${row.seq_name}"`);
+        const seqVal = parseInt(currRes.rows[0].last_value);
+        if (maxVal >= seqVal) {
+          await pool.query(`SELECT setval('"${row.seq_name}"', ${maxVal + 1}, false)`);
+          fixed++;
+        }
+      }
+      if (fixed > 0) console.log(`  🔢 ${label}: ${fixed} sequences updated`);
+    } catch (err) {
+      console.error(`  ⚠️  ${label} sequence sync error:`, err.message);
+    }
+  }
 }
 
 async function upsertRow(targetPool, table, columns, pk, row) {
