@@ -6962,7 +6962,10 @@ app.get("/stock-transfers/by-date", async (req, res) => {
         sti.total_price,
         fw.name           AS from_warehouse,
         tw.name           AS to_warehouse,
-        sti.status,
+        CASE
+          WHEN st.status = 'cancelled' THEN 'cancelled'
+          ELSE sti.status
+        END              AS status,
         st.status         AS transfer_status,
         st.created_at
         
@@ -7188,6 +7191,15 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
       UPDATE stock_transfers
       SET status = 'cancelled'
       WHERE id = $1
+      `,
+      [transferId],
+    );
+
+    await client.query(
+      `
+      UPDATE stock_transfer_items
+      SET status = 'cancelled'
+      WHERE transfer_id = $1
       `,
       [transferId],
     );
