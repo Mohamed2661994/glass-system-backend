@@ -127,6 +127,7 @@ app.get("/health", async (req, res) => {
     activeDb: dbState.activeDb,
     localAlive: dbState.localAlive,
     cloudAlive: dbState.cloudAlive,
+    syncInProgress: dbState.syncInProgress,
     lastSync: dbState.lastSyncResult,
     failoverHistory: dbState.failoverHistory.slice(-5),
     lastBackup,
