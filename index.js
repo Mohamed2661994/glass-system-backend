@@ -21,6 +21,7 @@ webPush.setVapidDetails(
   VAPID_PRIVATE_KEY,
 );
 const pool = require("./db");
+const { localPool, cloudPool, dbState, syncBetweenPools, checkPool } = require("./db");
 const {
   convertWholesaleToRetail,
 } = require("./services/wholesaleToRetailConverter");
@@ -86,7 +87,7 @@ app.use((req, res, next) => {
 });
 
 // Health check endpoint (for Render / monitoring)
-app.get("/health", (req, res) => {
+app.get("/health", async (req, res) => {
   // Find latest backup file
   let lastBackup = null;
   try {
@@ -117,14 +118,53 @@ app.get("/health", (req, res) => {
 
   res.json({
     status: "ok",
-    activeDb: "local",
+    activeDb: dbState.activeDb,
+    localAlive: dbState.localAlive,
+    cloudAlive: dbState.cloudAlive,
+    lastSync: dbState.lastSyncResult,
+    failoverHistory: dbState.failoverHistory.slice(-5),
     lastBackup,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
 });
 
-/* ── Admin: Switch DB — removed (Neon removed) ── */
+/* ── Admin: Switch Active DB ── */
+app.post("/admin/switch-db", async (req, res) => {
+  try {
+    const target = req.body.target; // "local" | "cloud"
+    if (!target || !['local', 'cloud'].includes(target)) {
+      return res.status(400).json({ error: 'target must be "local" or "cloud"' });
+    }
+    const pool = target === 'local' ? localPool : cloudPool;
+    const alive = await checkPool(pool, target);
+    if (!alive) {
+      return res.status(503).json({ error: `${target} DB is unreachable` });
+    }
+    const prev = dbState.activeDb;
+    dbState.activeDb = target;
+    dbState.failoverHistory.push({
+      from: prev,
+      to: target,
+      time: new Date().toISOString(),
+      reason: 'Manual switch',
+    });
+    console.log(`🔄 Manual switch: ${prev} → ${target}`);
+    res.json({ ok: true, activeDb: target, previous: prev });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Admin: Trigger Sync ── */
+app.post("/admin/sync", async (req, res) => {
+  try {
+    const result = await syncBetweenPools();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ── Cross-platform helpers ── */
 const isWindows = process.platform === "win32";
@@ -135,7 +175,16 @@ const PG_DUMP = isWindows
   ? '"C:\\Program Files\\PostgreSQL\\18\\bin\\pg_dump.exe"'
   : "pg_dump";
 
-function getDbEnv() {
+function getDbEnv(target) {
+  if (target === 'cloud') {
+    return {
+      host: process.env.DB_HOST_CLOUD,
+      port: process.env.DB_PORT_CLOUD || "5432",
+      user: process.env.DB_USER_CLOUD,
+      pass: process.env.DB_PASSWORD_CLOUD,
+      name: process.env.DB_NAME_CLOUD,
+    };
+  }
   return {
     host: process.env.DB_HOST_LOCAL,
     port: process.env.DB_PORT_LOCAL || "5432",
@@ -427,10 +476,7 @@ app.post("/admin/restore", async (req, res) => {
         const pct = Math.round(65 + (executed / total) * 30);
         if (pct > lastPct + 4) {
           lastPct = pct;
-          send(
-            pct,
-            `جاري التنفيذ: ${Math.round((executed / total) * 100)}%`,
-          );
+          send(pct, `جاري التنفيذ: ${Math.round((executed / total) * 100)}%`);
         }
       }
       await client.query("COMMIT");
