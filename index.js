@@ -27,6 +27,7 @@ const {
   dbState,
   syncBetweenPools,
   checkPool,
+  getSyncLogs,
 } = require("./db");
 const {
   convertWholesaleToRetail,
@@ -172,10 +173,21 @@ app.post("/admin/switch-db", async (req, res) => {
 /* ── Admin: Trigger Sync ── */
 app.post("/admin/sync", async (req, res) => {
   try {
-    const result = await syncBetweenPools();
+    const result = await syncBetweenPools({ trigger: "manual" });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Admin: Read recent sync logs ── */
+app.get("/admin/sync-logs", (req, res) => {
+  try {
+    const limit = Number(req.query.limit) || 100;
+    const logs = getSyncLogs(limit);
+    res.json({ ok: true, logs });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 

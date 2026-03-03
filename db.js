@@ -55,11 +55,194 @@ const state = {
   manualLock: false, // true = manual switch, prevents auto-failback
   periodicSyncIntervalMs: 15 * 60 * 1000,
   nextPeriodicSyncAt: null, // ISO string
+  syncLogs: [], // recent sync attempts
 };
+
+const MAX_SYNC_LOGS = 200;
+
+function pushSyncLog(entry) {
+  state.syncLogs.unshift(entry);
+  if (state.syncLogs.length > MAX_SYNC_LOGS) {
+    state.syncLogs = state.syncLogs.slice(0, MAX_SYNC_LOGS);
+  }
+}
+
+function getSyncLogs(limit = 100) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 100, MAX_SYNC_LOGS));
+  return state.syncLogs.slice(0, safeLimit);
+}
 
 /* ── Realtime sync scheduler (debounced) ── */
 let realtimeSyncTimer = null;
 let realtimeSyncRequested = false;
+let pendingRealtimeOps = [];
+
+function mapTableLabel(table) {
+  const labels = {
+    invoices: "فاتورة",
+    invoice_items: "بند فاتورة",
+    customers: "عميل",
+    suppliers: "مورد",
+    products: "صنف",
+    product_variants: "متغير صنف",
+    stock: "مخزون",
+    stock_movements: "حركة مخزون",
+    stock_transfers: "تحويل",
+    stock_transfer_items: "بند تحويل",
+    cash_in: "وارد",
+    cash_out: "منصرف",
+    daily_cash: "خزنة يومية",
+    users: "مستخدم",
+    notifications: "إشعار",
+    messages: "رسالة",
+    conversations: "محادثة",
+  };
+  return labels[table] || table;
+}
+
+function normalizeSqlIdentifier(raw) {
+  return String(raw || "").replace(/"/g, "").trim().toLowerCase();
+}
+
+function parseInsertColumns(sql) {
+  const match = sql.match(/^insert\s+into\s+"?[a-z0-9_]+"?\s*\(([^)]+)\)/i);
+  if (!match) return [];
+  return match[1]
+    .split(",")
+    .map((c) => normalizeSqlIdentifier(c))
+    .filter(Boolean);
+}
+
+function pickIdFromResultRow(row) {
+  if (!row || typeof row !== "object") return null;
+  if (row.id != null) return row.id;
+
+  const preferredKeys = [
+    "invoice_id",
+    "stock_transfer_id",
+    "transfer_id",
+    "cash_in_id",
+    "cash_out_id",
+    "movement_id",
+    "customer_id",
+    "supplier_id",
+    "product_id",
+  ];
+
+  for (const key of preferredKeys) {
+    if (row[key] != null) return row[key];
+  }
+
+  return null;
+}
+
+function parseOperationInfo(sql, params = [], result = null) {
+  const cleaned = stripLeadingSqlComments(sql);
+  const lower = cleaned.toLowerCase();
+
+  let operation = null;
+  let table = null;
+
+  let m = lower.match(/^insert\s+into\s+"?([a-z0-9_]+)"?/i);
+  if (m) {
+    operation = "insert";
+    table = m[1];
+  }
+
+  if (!operation) {
+    m = lower.match(/^update\s+"?([a-z0-9_]+)"?/i);
+    if (m) {
+      operation = "update";
+      table = m[1];
+    }
+  }
+
+  if (!operation) {
+    m = lower.match(/^delete\s+from\s+"?([a-z0-9_]+)"?/i);
+    if (m) {
+      operation = "delete";
+      table = m[1];
+    }
+  }
+
+  if (!operation || !table) return null;
+
+  const detail = {
+    operation,
+    table,
+    tableLabel: mapTableLabel(table),
+    id: null,
+    rowCount: Number(result?.rowCount) || 0,
+  };
+
+  if (result?.rows?.[0]) {
+    detail.id = pickIdFromResultRow(result.rows[0]);
+  }
+
+  if (detail.id == null && Array.isArray(params) && params.length > 0) {
+    if (operation === "insert") {
+      const columns = parseInsertColumns(cleaned);
+      const idIndex = columns.findIndex((c) => c === "id");
+      if (idIndex >= 0 && params[idIndex] != null) {
+        detail.id = params[idIndex];
+      }
+    } else {
+      const idMatch = lower.match(/\bid\s*=\s*\$(\d+)/i);
+      if (idMatch) {
+        const paramIndex = Number(idMatch[1]) - 1;
+        if (paramIndex >= 0 && paramIndex < params.length) {
+          detail.id = params[paramIndex];
+        }
+      }
+    }
+  }
+
+  if (
+    detail.id == null &&
+    Array.isArray(params) &&
+    params.length > 0 &&
+    (operation === "update" || operation === "delete")
+  ) {
+    const lastParam = params[params.length - 1];
+    if (typeof lastParam === "number" || typeof lastParam === "string") {
+      detail.id = lastParam;
+    }
+  }
+
+  return detail;
+}
+
+function pushRealtimeOperation(op) {
+  if (!op) return;
+  pendingRealtimeOps.push({ ...op, time: new Date().toISOString() });
+  if (pendingRealtimeOps.length > 60) {
+    pendingRealtimeOps = pendingRealtimeOps.slice(-60);
+  }
+}
+
+function consumeRealtimeOperations() {
+  const ops = pendingRealtimeOps;
+  pendingRealtimeOps = [];
+  return ops;
+}
+
+function buildSyncMessage(ok, details, fallbackMessage) {
+  if (!Array.isArray(details) || details.length === 0) {
+    return fallbackMessage;
+  }
+
+  const first = details[0];
+  const opMap = {
+    insert: ok ? "تمت مزامنة" : "فشلت مزامنة",
+    update: ok ? "تمت مزامنة تعديل" : "فشلت مزامنة تعديل",
+    delete: ok ? "تمت مزامنة حذف" : "فشلت مزامنة حذف",
+  };
+  const action = opMap[first.operation] || (ok ? "تمت مزامنة" : "فشلت مزامنة");
+  const idPart = first.id != null ? ` رقم ${first.id}` : "";
+  const extra = details.length > 1 ? ` + ${details.length - 1} عملية أخرى` : "";
+
+  return `${action} ${first.tableLabel}${idPart}${extra}`;
+}
 
 function extractSqlText(args) {
   const first = args?.[0];
@@ -117,7 +300,8 @@ function scheduleRealtimeSync(reason = "write") {
     }
 
     try {
-      await syncBetweenPools();
+      const details = consumeRealtimeOperations();
+      await syncBetweenPools({ trigger: "realtime", reason, details });
     } catch (err) {
       console.error(`⚠️  Realtime sync error (${reason}):`, err.message);
     }
@@ -171,7 +355,10 @@ setInterval(async () => {
     );
     // Sync cloud data to local BEFORE switching back
     try {
-      const syncResult = await syncBetweenPools();
+      const syncResult = await syncBetweenPools({
+        trigger: "failback",
+        reason: "pre-failback",
+      });
       if (!syncResult?.ok) {
         console.log(
           "⏳ Failback skipped: pre-failback sync not successful (staying on cloud)",
@@ -242,7 +429,11 @@ const SYNC_TABLES = [
   { table: "user_activity", pk: ["id"] },
 ];
 
-async function syncBetweenPools() {
+async function syncBetweenPools(options = {}) {
+  const trigger = options.trigger || "manual";
+  const reason = options.reason || null;
+  const details = Array.isArray(options.details) ? options.details : [];
+
   if (state.syncInProgress) {
     console.log("⏳ Sync already in progress, waiting...");
     // Wait for current sync to finish and return its result
@@ -267,7 +458,19 @@ async function syncBetweenPools() {
   }
   if (!state.localAlive || !state.cloudAlive) {
     console.log("⚠️  Cannot sync — one or both DBs unreachable");
-    return { ok: false, message: "أحد قواعد البيانات غير متصل" };
+    const result = { ok: false, message: "أحد قواعد البيانات غير متصل" };
+    pushSyncLog({
+      time: new Date().toISOString(),
+      trigger,
+      reason,
+      ok: false,
+      synced: 0,
+      errors: 1,
+      duration: "0.0s",
+      message: buildSyncMessage(false, details, result.message),
+      details,
+    });
+    return result;
   }
 
   state.syncInProgress = true;
@@ -321,6 +524,22 @@ async function syncBetweenPools() {
       time: state.lastSyncTime,
     };
 
+    pushSyncLog({
+      time: state.lastSyncTime,
+      trigger,
+      reason,
+      ok: state.lastSyncResult.ok,
+      synced: totalSynced,
+      errors: totalErrors,
+      duration: `${duration}s`,
+      message: buildSyncMessage(
+        totalErrors === 0,
+        details,
+        totalErrors > 0 ? "انتهت مع أخطاء" : "تمت المزامنة بنجاح",
+      ),
+      details,
+    });
+
     console.log(
       `✅ Sync complete: ${totalSynced} rows synced, ${totalErrors} errors, ${duration}s`,
     );
@@ -332,6 +551,19 @@ async function syncBetweenPools() {
       message: err.message,
       time: new Date().toISOString(),
     };
+
+    pushSyncLog({
+      time: state.lastSyncResult.time,
+      trigger,
+      reason,
+      ok: false,
+      synced: 0,
+      errors: 1,
+      duration: "0.0s",
+      message: buildSyncMessage(false, details, err.message),
+      details,
+    });
+
     return state.lastSyncResult;
   } finally {
     state.syncInProgress = false;
@@ -577,7 +809,7 @@ async function runPeriodicSyncTick() {
     Date.now() + PERIODIC_SYNC_INTERVAL_MS,
   ).toISOString();
   try {
-    await syncBetweenPools();
+    await syncBetweenPools({ trigger: "periodic" });
   } catch (err) {
     console.error("⚠️  Periodic sync error:", err.message);
   }
@@ -603,6 +835,9 @@ const pool = new Proxy(localPool, {
         const sql = extractSqlText(args);
         const result = await activePool.query(...args);
         if (isMutatingQuery(sql)) {
+          const params = Array.isArray(args?.[1]) ? args[1] : args?.[0]?.values;
+          const op = parseOperationInfo(sql, params, result);
+          pushRealtimeOperation(op);
           scheduleRealtimeSync("pool.query");
         }
         return result;
@@ -618,6 +853,11 @@ const pool = new Proxy(localPool, {
                 const sql = extractSqlText(qArgs);
                 const result = await cTarget.query(...qArgs);
                 if (isMutatingQuery(sql)) {
+                  const params = Array.isArray(qArgs?.[1])
+                    ? qArgs[1]
+                    : qArgs?.[0]?.values;
+                  const op = parseOperationInfo(sql, params, result);
+                  pushRealtimeOperation(op);
                   scheduleRealtimeSync("client.query");
                 }
                 return result;
@@ -641,3 +881,4 @@ module.exports.dbState = state;
 module.exports.syncBetweenPools = syncBetweenPools;
 module.exports.checkPool = checkPool;
 module.exports.getActivePool = getActivePool;
+module.exports.getSyncLogs = getSyncLogs;
