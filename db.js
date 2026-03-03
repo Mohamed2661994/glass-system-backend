@@ -55,6 +55,77 @@ const state = {
   manualLock: false, // true = manual switch, prevents auto-failback
 };
 
+/* ── Realtime sync scheduler (debounced) ── */
+let realtimeSyncTimer = null;
+let realtimeSyncRequested = false;
+
+function extractSqlText(args) {
+  const first = args?.[0];
+  if (typeof first === "string") return first;
+  if (first && typeof first === "object" && typeof first.text === "string") {
+    return first.text;
+  }
+  return "";
+}
+
+function stripLeadingSqlComments(sql) {
+  let s = String(sql || "").trimStart();
+  // Remove leading line comments
+  while (s.startsWith("--")) {
+    const nl = s.indexOf("\n");
+    if (nl === -1) return "";
+    s = s.slice(nl + 1).trimStart();
+  }
+  // Remove leading block comments
+  while (s.startsWith("/*")) {
+    const end = s.indexOf("*/");
+    if (end === -1) return "";
+    s = s.slice(end + 2).trimStart();
+  }
+  return s;
+}
+
+function isMutatingQuery(sql) {
+  const cleaned = stripLeadingSqlComments(sql).toLowerCase();
+  if (!cleaned) return false;
+  if (
+    cleaned.startsWith("insert") ||
+    cleaned.startsWith("update") ||
+    cleaned.startsWith("delete")
+  ) {
+    return true;
+  }
+  if (cleaned.startsWith("with")) {
+    return /\b(insert|update|delete)\b/.test(cleaned);
+  }
+  return false;
+}
+
+function scheduleRealtimeSync(reason = "write") {
+  realtimeSyncRequested = true;
+  if (realtimeSyncTimer) return;
+
+  realtimeSyncTimer = setTimeout(async () => {
+    realtimeSyncTimer = null;
+    if (!realtimeSyncRequested) return;
+    realtimeSyncRequested = false;
+
+    if (!state.localAlive || !state.cloudAlive) {
+      return;
+    }
+
+    try {
+      await syncBetweenPools();
+    } catch (err) {
+      console.error(`⚠️  Realtime sync error (${reason}):`, err.message);
+    }
+
+    if (realtimeSyncRequested) {
+      scheduleRealtimeSync("queued");
+    }
+  }, 1200);
+}
+
 /* ── Health check helpers ── */
 async function checkPool(pool, label) {
   try {
@@ -98,23 +169,27 @@ setInterval(async () => {
     );
     // Sync cloud data to local BEFORE switching back
     try {
-      await syncBetweenPools();
-      console.log("✅ Pre-failback sync complete");
+      const syncResult = await syncBetweenPools();
+      if (!syncResult?.ok) {
+        console.log(
+          "⏳ Failback skipped: pre-failback sync not successful (staying on cloud)",
+          syncResult,
+        );
+      } else {
+        console.log("✅ Pre-failback sync complete");
+        state.activeDb = "local";
+        const record = {
+          from: "cloud",
+          to: "local",
+          time: new Date().toISOString(),
+          reason: "Local DB recovered (synced before switch)",
+        };
+        state.failoverHistory.push(record);
+        console.log("🔄 FAILBACK: cloud → local", record);
+      }
     } catch (err) {
-      console.error(
-        "⚠️  Pre-failback sync error (switching anyway):",
-        err.message,
-      );
+      console.error("⚠️  Pre-failback sync error (staying on cloud):", err.message);
     }
-    state.activeDb = "local";
-    const record = {
-      from: "cloud",
-      to: "local",
-      time: new Date().toISOString(),
-      reason: "Local DB recovered (synced before switch)",
-    };
-    state.failoverHistory.push(record);
-    console.log("🔄 FAILBACK: cloud → local", record);
   }
 
   // Log state changes
@@ -170,11 +245,19 @@ async function syncBetweenPools() {
       const check = setInterval(() => {
         if (!state.syncInProgress) {
           clearInterval(check);
-          resolve(state.lastSyncResult || { ok: true, message: "المزامنة السابقة انتهت" });
+          resolve(
+            state.lastSyncResult || {
+              ok: true,
+              message: "المزامنة السابقة انتهت",
+            },
+          );
         }
       }, 1000);
       // Timeout after 2 minutes
-      setTimeout(() => { clearInterval(check); resolve({ ok: false, message: "انتهت مهلة الانتظار" }); }, 120000);
+      setTimeout(() => {
+        clearInterval(check);
+        resolve({ ok: false, message: "انتهت مهلة الانتظار" });
+      }, 120000);
     });
   }
   if (!state.localAlive || !state.cloudAlive) {
@@ -361,7 +444,7 @@ async function syncDeletions() {
 
   // Process deletions from LOCAL → delete on CLOUD
   const localDels = await localPool.query(
-    `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`
+    `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`,
   );
   for (const del of localDels.rows) {
     const pk = tablePkMap[del.table_name];
@@ -369,10 +452,16 @@ async function syncDeletions() {
     try {
       const pkParts = del.pk_value.split("|");
       const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
-      await cloudPool.query(`DELETE FROM "${del.table_name}" WHERE ${where}`, pkParts);
+      await cloudPool.query(
+        `DELETE FROM "${del.table_name}" WHERE ${where}`,
+        pkParts,
+      );
       totalDeleted++;
     } catch (err) {
-      console.error(`  ⚠️  Delete ${del.table_name}(${del.pk_value}) on cloud failed:`, err.message);
+      console.error(
+        `  ⚠️  Delete ${del.table_name}(${del.pk_value}) on cloud failed:`,
+        err.message,
+      );
     }
   }
   // Clear processed deletions from local
@@ -383,7 +472,7 @@ async function syncDeletions() {
 
   // Process deletions from CLOUD → delete on LOCAL
   const cloudDels = await cloudPool.query(
-    `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`
+    `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`,
   );
   for (const del of cloudDels.rows) {
     const pk = tablePkMap[del.table_name];
@@ -391,10 +480,16 @@ async function syncDeletions() {
     try {
       const pkParts = del.pk_value.split("|");
       const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
-      await localPool.query(`DELETE FROM "${del.table_name}" WHERE ${where}`, pkParts);
+      await localPool.query(
+        `DELETE FROM "${del.table_name}" WHERE ${where}`,
+        pkParts,
+      );
       totalDeleted++;
     } catch (err) {
-      console.error(`  ⚠️  Delete ${del.table_name}(${del.pk_value}) on local failed:`, err.message);
+      console.error(
+        `  ⚠️  Delete ${del.table_name}(${del.pk_value}) on local failed:`,
+        err.message,
+      );
     }
   }
   // Clear processed deletions from cloud
@@ -473,8 +568,8 @@ let syncInterval = null;
 function startPeriodicSync() {
   // Do an initial sync 30s after startup
   setTimeout(() => syncBetweenPools(), 30000);
-  // Then every 5 minutes
-  syncInterval = setInterval(() => syncBetweenPools(), 5 * 60 * 1000);
+  // Then every 15 minutes (fallback safety net)
+  syncInterval = setInterval(() => syncBetweenPools(), 15 * 60 * 1000);
 }
 startPeriodicSync();
 
@@ -483,6 +578,37 @@ startPeriodicSync();
 const pool = new Proxy(localPool, {
   get(target, prop) {
     const activePool = getActivePool();
+    if (prop === "query") {
+      return async (...args) => {
+        const sql = extractSqlText(args);
+        const result = await activePool.query(...args);
+        if (isMutatingQuery(sql)) {
+          scheduleRealtimeSync("pool.query");
+        }
+        return result;
+      };
+    }
+    if (prop === "connect") {
+      return async (...args) => {
+        const client = await activePool.connect(...args);
+        return new Proxy(client, {
+          get(cTarget, cProp) {
+            if (cProp === "query") {
+              return async (...qArgs) => {
+                const sql = extractSqlText(qArgs);
+                const result = await cTarget.query(...qArgs);
+                if (isMutatingQuery(sql)) {
+                  scheduleRealtimeSync("client.query");
+                }
+                return result;
+              };
+            }
+            const cVal = cTarget[cProp];
+            return typeof cVal === "function" ? cVal.bind(cTarget) : cVal;
+          },
+        });
+      };
+    }
     const val = activePool[prop];
     return typeof val === "function" ? val.bind(activePool) : val;
   },
