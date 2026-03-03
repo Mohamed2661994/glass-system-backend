@@ -164,12 +164,22 @@ const SYNC_TABLES = [
 
 async function syncBetweenPools() {
   if (state.syncInProgress) {
-    console.log("⏳ Sync already in progress, skipping");
-    return { ok: false, message: "Sync already running" };
+    console.log("⏳ Sync already in progress, waiting...");
+    // Wait for current sync to finish and return its result
+    return new Promise((resolve) => {
+      const check = setInterval(() => {
+        if (!state.syncInProgress) {
+          clearInterval(check);
+          resolve(state.lastSyncResult || { ok: true, message: "المزامنة السابقة انتهت" });
+        }
+      }, 1000);
+      // Timeout after 2 minutes
+      setTimeout(() => { clearInterval(check); resolve({ ok: false, message: "انتهت مهلة الانتظار" }); }, 120000);
+    });
   }
   if (!state.localAlive || !state.cloudAlive) {
     console.log("⚠️  Cannot sync — one or both DBs unreachable");
-    return { ok: false, message: "One or both DBs unreachable" };
+    return { ok: false, message: "أحد قواعد البيانات غير متصل" };
   }
 
   state.syncInProgress = true;
