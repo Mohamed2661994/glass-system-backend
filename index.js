@@ -130,6 +130,7 @@ app.get("/health", async (req, res) => {
     lastSync: dbState.lastSyncResult,
     failoverHistory: dbState.failoverHistory.slice(-5),
     lastBackup,
+    lastAutoBackup: lastAutoBackup || null,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
@@ -417,6 +418,57 @@ app.post("/admin/backup", (req, res) => {
     }
   });
 });
+
+/* ── Automatic Hourly Backup to Google Drive ── */
+let lastAutoBackup = null;
+
+async function autoBackupToDrive() {
+  console.log("⏰ Auto-backup: starting hourly backup...");
+  try {
+    if (!fs.existsSync(BACKUP_DIR)) {
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    }
+
+    const ts = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}_${String(d.getHours()).padStart(2, "0")}-00`;
+    })();
+    const backupFile = path.join(BACKUP_DIR, `glass_system_${ts}.sql`);
+
+    const dbEnv = getDbEnv();
+    const cmd = buildPgCmd(
+      PG_DUMP,
+      dbEnv,
+      `--clean --if-exists --no-owner --no-privileges --inserts --encoding=UTF8 -f "${backupFile}"`,
+    );
+
+    await new Promise((resolve, reject) => {
+      exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve();
+      });
+    });
+
+    const size = fs.statSync(backupFile).size;
+    const sizeMB = (size / 1024 / 1024).toFixed(2);
+    console.log(`⏰ Auto-backup: exported ${sizeMB} MB, uploading to Drive...`);
+
+    await uploadToDrive(backupFile);
+
+    lastAutoBackup = {
+      file: path.basename(backupFile),
+      sizeMB: parseFloat(sizeMB),
+      time: new Date().toISOString(),
+    };
+    console.log(`✅ Auto-backup complete: ${lastAutoBackup.file} (${sizeMB} MB)`);
+  } catch (err) {
+    console.error("❌ Auto-backup failed:", err.message);
+  }
+}
+
+// Run auto-backup every hour (first one after 2 minutes of startup)
+setTimeout(() => autoBackupToDrive(), 2 * 60 * 1000);
+setInterval(() => autoBackupToDrive(), 60 * 60 * 1000);
 
 /* ── Admin: Restore from Google Drive → local DB (SSE progress) ── */
 app.post("/admin/restore", async (req, res) => {

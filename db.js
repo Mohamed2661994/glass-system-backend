@@ -337,19 +337,26 @@ async function syncSequences() {
   `;
 
   // Fix sequences on both pools
-  for (const [pool, label] of [[localPool, "Local"], [cloudPool, "Cloud"]]) {
+  for (const [pool, label] of [
+    [localPool, "Local"],
+    [cloudPool, "Cloud"],
+  ]) {
     try {
       const seqs = await pool.query(seqQuery);
       let fixed = 0;
       for (const row of seqs.rows) {
         const maxRes = await pool.query(
-          `SELECT COALESCE(MAX("${row.column_name}"), 0) as mx FROM "${row.table_name}"`
+          `SELECT COALESCE(MAX("${row.column_name}"), 0) as mx FROM "${row.table_name}"`,
         );
         const maxVal = parseInt(maxRes.rows[0].mx);
-        const currRes = await pool.query(`SELECT last_value FROM "${row.seq_name}"`);
+        const currRes = await pool.query(
+          `SELECT last_value FROM "${row.seq_name}"`,
+        );
         const seqVal = parseInt(currRes.rows[0].last_value);
         if (maxVal >= seqVal) {
-          await pool.query(`SELECT setval('"${row.seq_name}"', ${maxVal + 1}, false)`);
+          await pool.query(
+            `SELECT setval('"${row.seq_name}"', ${maxVal + 1}, false)`,
+          );
           fixed++;
         }
       }
