@@ -6454,8 +6454,7 @@ app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
     }
 
     // ✅ مخزن الجملة (المصدر)
-    const wholesaleWarehouseId =
-      await getWholesaleWarehouseByBranch(from_branch_id);
+    const wholesaleWarehouseId = getWarehouseIdByInvoiceType("wholesale");
 
     const previewResults = [];
 
@@ -6602,17 +6601,9 @@ app.post(
 
       await client.query("BEGIN");
 
-      // ✅ مخزن الجملة (المصدر)
-      const wholesaleWarehouseId = await getWholesaleWarehouseByBranch(
-        from_branch_id,
-        client,
-      );
-
-      // ✅ مخزن القطاعي (الوجهة)
-      const retailWarehouseId = await getWholesaleWarehouseByBranch(
-        to_branch_id,
-        client,
-      );
+      // ✅ مخزن الجملة (المصدر) + ✅ مخزن القطاعي (الوجهة)
+      const wholesaleWarehouseId = getWarehouseIdByInvoiceType("wholesale");
+      const retailWarehouseId = getWarehouseIdByInvoiceType("retail");
 
       // 1️⃣ إنشاء رأس التحويل
       const transferRes = await client.query(
