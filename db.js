@@ -181,6 +181,18 @@ async function syncBetweenPools() {
   console.log("🔄 Starting bi-directional sync...");
 
   try {
+    // ── Step 1: Process deletions FIRST (before row sync re-inserts them) ──
+    try {
+      const deleted = await syncDeletions();
+      totalSynced += deleted;
+      if (deleted > 0) console.log(`  🗑️  ${deleted} deletions propagated`);
+    } catch (err) {
+      totalErrors++;
+      errorDetails.push(`deletions: ${err.message}`);
+      console.error("❌ Deletion sync error:", err.message);
+    }
+
+    // ── Step 2: Sync rows (bi-directional) ──
     for (const { table, pk } of SYNC_TABLES) {
       try {
         const synced = await syncTable(table, pk);
@@ -325,6 +337,63 @@ async function syncTable(table, pk) {
 
   if (synced > 0) console.log(`  📋 ${table}: ${synced} rows synced`);
   return synced;
+}
+
+/* ── Sync deletions: propagate deletes from one DB to the other ── */
+async function syncDeletions() {
+  let totalDeleted = 0;
+
+  // Build a lookup of table → pk columns
+  const tablePkMap = {};
+  for (const { table, pk } of SYNC_TABLES) {
+    tablePkMap[table] = pk;
+  }
+
+  // Process deletions from LOCAL → delete on CLOUD
+  const localDels = await localPool.query(
+    `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`
+  );
+  for (const del of localDels.rows) {
+    const pk = tablePkMap[del.table_name];
+    if (!pk) continue; // table not in sync list
+    try {
+      const pkParts = del.pk_value.split("|");
+      const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
+      await cloudPool.query(`DELETE FROM "${del.table_name}" WHERE ${where}`, pkParts);
+      totalDeleted++;
+    } catch (err) {
+      console.error(`  ⚠️  Delete ${del.table_name}(${del.pk_value}) on cloud failed:`, err.message);
+    }
+  }
+  // Clear processed deletions from local
+  if (localDels.rows.length > 0) {
+    const maxId = localDels.rows[localDels.rows.length - 1].id;
+    await localPool.query(`DELETE FROM sync_deletions WHERE id <= $1`, [maxId]);
+  }
+
+  // Process deletions from CLOUD → delete on LOCAL
+  const cloudDels = await cloudPool.query(
+    `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`
+  );
+  for (const del of cloudDels.rows) {
+    const pk = tablePkMap[del.table_name];
+    if (!pk) continue;
+    try {
+      const pkParts = del.pk_value.split("|");
+      const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
+      await localPool.query(`DELETE FROM "${del.table_name}" WHERE ${where}`, pkParts);
+      totalDeleted++;
+    } catch (err) {
+      console.error(`  ⚠️  Delete ${del.table_name}(${del.pk_value}) on local failed:`, err.message);
+    }
+  }
+  // Clear processed deletions from cloud
+  if (cloudDels.rows.length > 0) {
+    const maxId = cloudDels.rows[cloudDels.rows.length - 1].id;
+    await cloudPool.query(`DELETE FROM sync_deletions WHERE id <= $1`, [maxId]);
+  }
+
+  return totalDeleted;
 }
 
 /* ── Sync sequences: ensure both DBs have nextval >= max(id) + 1 ── */
