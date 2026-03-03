@@ -53,6 +53,8 @@ const state = {
   lastSyncResult: null, // { ok, synced, errors, duration, time }
   failoverHistory: [], // [{ from, to, time, reason }]
   manualLock: false, // true = manual switch, prevents auto-failback
+  periodicSyncIntervalMs: 15 * 60 * 1000,
+  nextPeriodicSyncAt: null, // ISO string
 };
 
 /* ── Realtime sync scheduler (debounced) ── */
@@ -188,7 +190,10 @@ setInterval(async () => {
         console.log("🔄 FAILBACK: cloud → local", record);
       }
     } catch (err) {
-      console.error("⚠️  Pre-failback sync error (staying on cloud):", err.message);
+      console.error(
+        "⚠️  Pre-failback sync error (staying on cloud):",
+        err.message,
+      );
     }
   }
 
@@ -563,13 +568,28 @@ async function upsertRow(targetPool, table, columns, pk, row) {
   await targetPool.query(sql, vals);
 }
 
-/* ── Periodic sync (every 5 minutes) ── */
+/* ── Periodic sync (every 15 minutes fallback) ── */
 let syncInterval = null;
+const PERIODIC_SYNC_INTERVAL_MS = 15 * 60 * 1000;
+
+async function runPeriodicSyncTick() {
+  state.nextPeriodicSyncAt = new Date(
+    Date.now() + PERIODIC_SYNC_INTERVAL_MS,
+  ).toISOString();
+  try {
+    await syncBetweenPools();
+  } catch (err) {
+    console.error("⚠️  Periodic sync error:", err.message);
+  }
+}
+
 function startPeriodicSync() {
-  // Do an initial sync 30s after startup
-  setTimeout(() => syncBetweenPools(), 30000);
-  // Then every 15 minutes (fallback safety net)
-  syncInterval = setInterval(() => syncBetweenPools(), 15 * 60 * 1000);
+  state.periodicSyncIntervalMs = PERIODIC_SYNC_INTERVAL_MS;
+  state.nextPeriodicSyncAt = new Date(
+    Date.now() + PERIODIC_SYNC_INTERVAL_MS,
+  ).toISOString();
+
+  syncInterval = setInterval(runPeriodicSyncTick, PERIODIC_SYNC_INTERVAL_MS);
 }
 startPeriodicSync();
 
