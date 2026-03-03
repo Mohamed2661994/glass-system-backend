@@ -152,13 +152,14 @@ app.post("/admin/switch-db", async (req, res) => {
     }
     const prev = dbState.activeDb;
     dbState.activeDb = target;
+    dbState.manualLock = true; // Lock to prevent auto-failback
     dbState.failoverHistory.push({
       from: prev,
       to: target,
       time: new Date().toISOString(),
-      reason: "Manual switch",
+      reason: "Manual switch (locked)",
     });
-    console.log(`🔄 Manual switch: ${prev} → ${target}`);
+    console.log(`🔄 Manual switch: ${prev} → ${target} (auto-failback locked)`);
     res.json({ ok: true, activeDb: target, previous: prev });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -460,7 +461,9 @@ async function autoBackupToDrive() {
       sizeMB: parseFloat(sizeMB),
       time: new Date().toISOString(),
     };
-    console.log(`✅ Auto-backup complete: ${lastAutoBackup.file} (${sizeMB} MB)`);
+    console.log(
+      `✅ Auto-backup complete: ${lastAutoBackup.file} (${sizeMB} MB)`,
+    );
   } catch (err) {
     console.error("❌ Auto-backup failed:", err.message);
   }

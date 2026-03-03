@@ -52,6 +52,7 @@ const state = {
   syncInProgress: false,
   lastSyncResult: null, // { ok, synced, errors, duration, time }
   failoverHistory: [], // [{ from, to, time, reason }]
+  manualLock: false, // true = manual switch, prevents auto-failback
 };
 
 /* ── Health check helpers ── */
@@ -75,9 +76,10 @@ setInterval(async () => {
   state.localAlive = await checkPool(localPool, "Local");
   state.cloudAlive = await checkPool(cloudPool, "Cloud");
 
-  // Auto-failover: local dies → switch to cloud
+  // Auto-failover: local dies → switch to cloud (even if manualLock)
   if (state.activeDb === "local" && !state.localAlive && state.cloudAlive) {
     state.activeDb = "cloud";
+    state.manualLock = false; // auto-failover clears manual lock
     const record = {
       from: "local",
       to: "cloud",
@@ -89,7 +91,8 @@ setInterval(async () => {
   }
 
   // Auto-failback: local recovered → sync first, then switch back
-  if (state.activeDb === "cloud" && state.localAlive) {
+  // Skip if manualLock is active (user manually switched)
+  if (state.activeDb === "cloud" && state.localAlive && !state.manualLock) {
     console.log(
       "🔄 Local DB recovered — syncing cloud → local before failback...",
     );
