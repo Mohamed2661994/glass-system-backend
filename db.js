@@ -88,14 +88,22 @@ setInterval(async () => {
     console.log("🔄 FAILOVER: local → cloud", record);
   }
 
-  // Auto-failback: local recovered → switch back
+  // Auto-failback: local recovered → sync first, then switch back
   if (state.activeDb === "cloud" && state.localAlive) {
+    console.log("🔄 Local DB recovered — syncing cloud → local before failback...");
+    // Sync cloud data to local BEFORE switching back
+    try {
+      await syncBetweenPools();
+      console.log("✅ Pre-failback sync complete");
+    } catch (err) {
+      console.error("⚠️  Pre-failback sync error (switching anyway):", err.message);
+    }
     state.activeDb = "local";
     const record = {
       from: "cloud",
       to: "local",
       time: new Date().toISOString(),
-      reason: "Local DB recovered",
+      reason: "Local DB recovered (synced before switch)",
     };
     state.failoverHistory.push(record);
     console.log("🔄 FAILBACK: cloud → local", record);
