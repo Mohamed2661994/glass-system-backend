@@ -21,7 +21,13 @@ webPush.setVapidDetails(
   VAPID_PRIVATE_KEY,
 );
 const pool = require("./db");
-const { localPool, cloudPool, dbState, syncBetweenPools, checkPool } = require("./db");
+const {
+  localPool,
+  cloudPool,
+  dbState,
+  syncBetweenPools,
+  checkPool,
+} = require("./db");
 const {
   convertWholesaleToRetail,
 } = require("./services/wholesaleToRetailConverter");
@@ -133,10 +139,12 @@ app.get("/health", async (req, res) => {
 app.post("/admin/switch-db", async (req, res) => {
   try {
     const target = req.body.target; // "local" | "cloud"
-    if (!target || !['local', 'cloud'].includes(target)) {
-      return res.status(400).json({ error: 'target must be "local" or "cloud"' });
+    if (!target || !["local", "cloud"].includes(target)) {
+      return res
+        .status(400)
+        .json({ error: 'target must be "local" or "cloud"' });
     }
-    const pool = target === 'local' ? localPool : cloudPool;
+    const pool = target === "local" ? localPool : cloudPool;
     const alive = await checkPool(pool, target);
     if (!alive) {
       return res.status(503).json({ error: `${target} DB is unreachable` });
@@ -147,7 +155,7 @@ app.post("/admin/switch-db", async (req, res) => {
       from: prev,
       to: target,
       time: new Date().toISOString(),
-      reason: 'Manual switch',
+      reason: "Manual switch",
     });
     console.log(`🔄 Manual switch: ${prev} → ${target}`);
     res.json({ ok: true, activeDb: target, previous: prev });
@@ -176,7 +184,7 @@ const PG_DUMP = isWindows
   : "pg_dump";
 
 function getDbEnv(target) {
-  if (target === 'cloud') {
+  if (target === "cloud") {
     return {
       host: process.env.DB_HOST_CLOUD,
       port: process.env.DB_PORT_CLOUD || "5432",
