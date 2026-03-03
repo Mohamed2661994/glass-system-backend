@@ -81,10 +81,10 @@ async function migrate(pool, label) {
     // 2. Add columns to tables needing both
     for (const table of NEED_BOTH) {
       await client.query(
-        `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`
+        `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`,
       );
       await client.query(
-        `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`
+        `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`,
       );
       console.log(`  [${label}] ✓ ${table}: added created_at + updated_at`);
     }
@@ -92,7 +92,7 @@ async function migrate(pool, label) {
     // 3. Add updated_at to tables that only have created_at
     for (const table of NEED_UPDATED_AT) {
       await client.query(
-        `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`
+        `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()`,
       );
       console.log(`  [${label}] ✓ ${table}: added updated_at`);
     }
@@ -100,9 +100,7 @@ async function migrate(pool, label) {
     // 4. Add trigger to ALL tables (including conversations)
     const allTables = [...NEED_BOTH, ...NEED_UPDATED_AT, "conversations"];
     for (const table of allTables) {
-      await client.query(
-        `DROP TRIGGER IF EXISTS trg_updated_at ON "${table}"`
-      );
+      await client.query(`DROP TRIGGER IF EXISTS trg_updated_at ON "${table}"`);
       await client.query(`
         CREATE TRIGGER trg_updated_at
         BEFORE UPDATE ON "${table}"
