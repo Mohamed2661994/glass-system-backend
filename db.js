@@ -55,6 +55,7 @@ const state = {
   manualLock: false, // true = manual switch, prevents auto-failback
   periodicSyncIntervalMs: 15 * 60 * 1000,
   nextPeriodicSyncAt: null, // ISO string
+  lastRealtimeSyncAt: null, // ISO string
   syncLogs: [], // recent sync attempts
 };
 
@@ -101,7 +102,10 @@ function mapTableLabel(table) {
 }
 
 function normalizeSqlIdentifier(raw) {
-  return String(raw || "").replace(/"/g, "").trim().toLowerCase();
+  return String(raw || "")
+    .replace(/"/g, "")
+    .trim()
+    .toLowerCase();
 }
 
 function parseInsertColumns(sql) {
@@ -244,6 +248,29 @@ function buildSyncMessage(ok, details, fallbackMessage) {
   return `${action} ${first.tableLabel}${idPart}${extra}`;
 }
 
+function normalizeCompareValue(value) {
+  if (value instanceof Date) return value.getTime();
+  if (value === null || value === undefined) return null;
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return value;
+}
+
+function rowsDifferIgnoringUpdatedAt(leftRow, rightRow, columns) {
+  for (const column of columns) {
+    if (column === "updated_at") continue;
+    const left = normalizeCompareValue(leftRow?.[column]);
+    const right = normalizeCompareValue(rightRow?.[column]);
+    if (left !== right) return true;
+  }
+  return false;
+}
+
 function extractSqlText(args) {
   const first = args?.[0];
   if (typeof first === "string") return first;
@@ -301,7 +328,12 @@ function scheduleRealtimeSync(reason = "write") {
 
     try {
       const details = consumeRealtimeOperations();
-      await syncBetweenPools({ trigger: "realtime", reason, details });
+      await syncBetweenPools({
+        trigger: "realtime",
+        reason,
+        details,
+        selectiveOnly: true,
+      });
     } catch (err) {
       console.error(`⚠️  Realtime sync error (${reason}):`, err.message);
     }
@@ -429,10 +461,151 @@ const SYNC_TABLES = [
   { table: "user_activity", pk: ["id"] },
 ];
 
+const SYNC_TABLES_MAP = new Map(SYNC_TABLES.map((item) => [item.table, item]));
+const tableMetaCache = new Map();
+
+function getRealtimeTargetPool() {
+  return state.activeDb === "local" ? cloudPool : localPool;
+}
+
+async function getTableMeta(table) {
+  if (tableMetaCache.has(table)) {
+    return tableMetaCache.get(table);
+  }
+
+  const tableCfg = SYNC_TABLES_MAP.get(table);
+  if (!tableCfg) return null;
+
+  const colsResult = await localPool.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+    [table],
+  );
+  const columns = colsResult.rows.map((r) => r.column_name);
+
+  const meta = {
+    table,
+    pk: tableCfg.pk,
+    columns,
+    hasUpdatedAt: columns.includes("updated_at"),
+  };
+
+  tableMetaCache.set(table, meta);
+  return meta;
+}
+
+function buildPkWhere(pk, startIndex = 1) {
+  return pk.map((k, idx) => `"${k}" = $${startIndex + idx}`).join(" AND ");
+}
+
+function getPkValues(row, pk) {
+  return pk.map((k) => row[k]);
+}
+
+async function getRowByPk(poolRef, table, pk, rowLike) {
+  const pkValues = getPkValues(rowLike, pk);
+  if (pkValues.some((v) => v === undefined || v === null)) {
+    return null;
+  }
+
+  const where = buildPkWhere(pk);
+  const found = await poolRef.query(
+    `SELECT * FROM "${table}" WHERE ${where} LIMIT 1`,
+    pkValues,
+  );
+  return found.rows[0] || null;
+}
+
+async function syncRowFromSourceToTarget(
+  sourcePool,
+  targetPool,
+  meta,
+  sourceRow,
+) {
+  const { table, pk, columns, hasUpdatedAt } = meta;
+
+  const targetRow = await getRowByPk(targetPool, table, pk, sourceRow);
+  if (!targetRow) {
+    return upsertRow(targetPool, table, columns, pk, sourceRow);
+  }
+
+  if (hasUpdatedAt && sourceRow.updated_at && targetRow.updated_at) {
+    const sourceTime = new Date(sourceRow.updated_at).getTime();
+    const targetTime = new Date(targetRow.updated_at).getTime();
+    if (sourceTime <= targetTime) return 0;
+  }
+
+  if (!rowsDifferIgnoringUpdatedAt(sourceRow, targetRow, columns)) {
+    return 0;
+  }
+
+  return upsertRow(targetPool, table, columns, pk, sourceRow);
+}
+
+async function syncRecentRowsForTable(table, sinceIso, sourcePool, targetPool) {
+  const meta = await getTableMeta(table);
+  if (!meta || !meta.hasUpdatedAt) return 0;
+
+  const changed = await sourcePool.query(
+    `SELECT * FROM "${table}" WHERE "updated_at" > $1 ORDER BY "updated_at" ASC`,
+    [sinceIso],
+  );
+
+  let synced = 0;
+  for (const sourceRow of changed.rows) {
+    const changedCount = await syncRowFromSourceToTarget(
+      sourcePool,
+      targetPool,
+      meta,
+      sourceRow,
+    );
+    if (changedCount > 0) synced++;
+  }
+
+  if (synced > 0) {
+    console.log(`  📋 ${table}: ${synced} rows synced (realtime selective)`);
+  }
+
+  return synced;
+}
+
+async function syncOperationDetail(detail, sourcePool, targetPool) {
+  if (!detail?.table) return { handled: true, synced: 0 };
+  if (detail.operation === "delete") {
+    return { handled: true, synced: 0 };
+  }
+
+  const meta = await getTableMeta(detail.table);
+  if (!meta) {
+    return { handled: true, synced: 0 };
+  }
+
+  if (meta.pk.length !== 1 || detail.id == null) {
+    return { handled: false, synced: 0 };
+  }
+
+  const sourceRes = await sourcePool.query(
+    `SELECT * FROM "${detail.table}" WHERE "${meta.pk[0]}" = $1 LIMIT 1`,
+    [detail.id],
+  );
+  if (!sourceRes.rows[0]) {
+    return { handled: true, synced: 0 };
+  }
+
+  const changed = await syncRowFromSourceToTarget(
+    sourcePool,
+    targetPool,
+    meta,
+    sourceRes.rows[0],
+  );
+
+  return { handled: true, synced: changed > 0 ? 1 : 0 };
+}
+
 async function syncBetweenPools(options = {}) {
   const trigger = options.trigger || "manual";
   const reason = options.reason || null;
   const details = Array.isArray(options.details) ? options.details : [];
+  const selectiveOnly = Boolean(options.selectiveOnly);
 
   if (state.syncInProgress) {
     console.log("⏳ Sync already in progress, waiting...");
@@ -482,35 +655,96 @@ async function syncBetweenPools(options = {}) {
   console.log("🔄 Starting bi-directional sync...");
 
   try {
-    // ── Step 1: Process deletions FIRST (before row sync re-inserts them) ──
-    try {
-      const deleted = await syncDeletions();
-      totalSynced += deleted;
-      if (deleted > 0) console.log(`  🗑️  ${deleted} deletions propagated`);
-    } catch (err) {
-      totalErrors++;
-      errorDetails.push(`deletions: ${err.message}`);
-      console.error("❌ Deletion sync error:", err.message);
-    }
+    if (trigger === "realtime" && selectiveOnly) {
+      const sourcePool = getActivePool();
+      const targetPool = getRealtimeTargetPool();
+      const sinceIso =
+        state.lastRealtimeSyncAt ||
+        new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      const nowIso = new Date().toISOString();
 
-    // ── Step 2: Sync rows (bi-directional) ──
-    for (const { table, pk } of SYNC_TABLES) {
       try {
-        const synced = await syncTable(table, pk);
-        totalSynced += synced;
+        const deleted = await syncDeletions();
+        totalSynced += deleted;
+        if (deleted > 0) console.log(`  🗑️  ${deleted} deletions propagated`);
       } catch (err) {
         totalErrors++;
-        errorDetails.push(`${table}: ${err.message}`);
-        console.error(`❌ Sync error for ${table}:`, err.message);
+        errorDetails.push(`deletions: ${err.message}`);
+        console.error("❌ Deletion sync error:", err.message);
       }
-    }
 
-    // ── Sync sequences: ensure both DBs have sequences >= max(id) ──
-    try {
-      await syncSequences();
-    } catch (err) {
-      console.error("⚠️  Sequence sync error:", err.message);
-      errorDetails.push(`sequences: ${err.message}`);
+      const fallbackTables = new Set();
+      for (const detail of details) {
+        if (!detail?.table || !SYNC_TABLES_MAP.has(detail.table)) continue;
+        try {
+          const result = await syncOperationDetail(
+            detail,
+            sourcePool,
+            targetPool,
+          );
+          totalSynced += result.synced;
+          if (!result.handled) fallbackTables.add(detail.table);
+        } catch (err) {
+          totalErrors++;
+          errorDetails.push(`${detail.table}: ${err.message}`);
+          console.error(
+            `❌ Realtime selective sync error for ${detail.table}:`,
+            err.message,
+          );
+        }
+      }
+
+      for (const table of fallbackTables) {
+        try {
+          const synced = await syncRecentRowsForTable(
+            table,
+            sinceIso,
+            sourcePool,
+            targetPool,
+          );
+          totalSynced += synced;
+        } catch (err) {
+          totalErrors++;
+          errorDetails.push(`${table}: ${err.message}`);
+          console.error(
+            `❌ Realtime recent sync error for ${table}:`,
+            err.message,
+          );
+        }
+      }
+
+      state.lastRealtimeSyncAt = nowIso;
+    } else {
+      // ── Step 1: Process deletions FIRST (before row sync re-inserts them) ──
+      try {
+        const deleted = await syncDeletions();
+        totalSynced += deleted;
+        if (deleted > 0) console.log(`  🗑️  ${deleted} deletions propagated`);
+      } catch (err) {
+        totalErrors++;
+        errorDetails.push(`deletions: ${err.message}`);
+        console.error("❌ Deletion sync error:", err.message);
+      }
+
+      // ── Step 2: Sync rows (bi-directional) ──
+      for (const { table, pk } of SYNC_TABLES) {
+        try {
+          const synced = await syncTable(table, pk);
+          totalSynced += synced;
+        } catch (err) {
+          totalErrors++;
+          errorDetails.push(`${table}: ${err.message}`);
+          console.error(`❌ Sync error for ${table}:`, err.message);
+        }
+      }
+
+      // ── Sync sequences: ensure both DBs have sequences >= max(id) ──
+      try {
+        await syncSequences();
+      } catch (err) {
+        console.error("⚠️  Sequence sync error:", err.message);
+        errorDetails.push(`sequences: ${err.message}`);
+      }
     }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -610,7 +844,12 @@ async function syncTable(table, pk) {
     } else if (hasUpdatedAt && localRow.updated_at && cloudRow.updated_at) {
       const localTime = new Date(localRow.updated_at).getTime();
       const cloudTime = new Date(cloudRow.updated_at).getTime();
-      if (localTime > cloudTime) {
+      const hasMeaningfulChange = rowsDifferIgnoringUpdatedAt(
+        localRow,
+        cloudRow,
+        columns,
+      );
+      if (localTime > cloudTime && hasMeaningfulChange) {
         pendingOps.push({ pool: cloudPool, row: localRow });
       }
     }
@@ -624,7 +863,12 @@ async function syncTable(table, pk) {
     } else if (hasUpdatedAt && cloudRow.updated_at && localRow.updated_at) {
       const cloudTime = new Date(cloudRow.updated_at).getTime();
       const localTime = new Date(localRow.updated_at).getTime();
-      if (cloudTime > localTime) {
+      const hasMeaningfulChange = rowsDifferIgnoringUpdatedAt(
+        cloudRow,
+        localRow,
+        columns,
+      );
+      if (cloudTime > localTime && hasMeaningfulChange) {
         pendingOps.push({ pool: localPool, row: cloudRow });
       }
     }
@@ -639,8 +883,8 @@ async function syncTable(table, pk) {
     const failed = [];
     for (const op of remaining) {
       try {
-        await upsertRow(op.pool, table, columns, pk, op.row);
-        synced++;
+        const changed = await upsertRow(op.pool, table, columns, pk, op.row);
+        if (changed > 0) synced++;
       } catch (err) {
         // Only retry FK violations, re-throw others
         if (err.code === "23503") {
@@ -791,13 +1035,21 @@ async function upsertRow(targetPool, table, columns, pk, row) {
     .map((c) => `"${c}" = EXCLUDED."${c}"`)
     .join(", ");
 
+  const compareCols = columns.filter(
+    (c) => !pk.includes(c) && c !== "updated_at",
+  );
+  const whereDistinct = compareCols
+    .map((c) => `"${table}"."${c}" IS DISTINCT FROM EXCLUDED."${c}"`)
+    .join(" OR ");
+
   const sql = updateCols
     ? `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})
-       ON CONFLICT (${pkList}) DO UPDATE SET ${updateCols}`
+       ON CONFLICT (${pkList}) DO UPDATE SET ${updateCols}${whereDistinct ? ` WHERE ${whereDistinct}` : ""}`
     : `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})
        ON CONFLICT (${pkList}) DO NOTHING`;
 
-  await targetPool.query(sql, vals);
+  const result = await targetPool.query(sql, vals);
+  return Number(result.rowCount) || 0;
 }
 
 /* ── Periodic sync (every 15 minutes fallback) ── */
