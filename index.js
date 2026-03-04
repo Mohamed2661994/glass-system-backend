@@ -3889,7 +3889,7 @@ app.get("/invoices", async (req, res) => {
         created_by_name
       FROM invoices
       ${whereClause}
-      ORDER BY COALESCE(invoice_date, created_at) DESC
+      ORDER BY id DESC
       LIMIT $${idx++} OFFSET $${idx++}
       `,
       [...values, limit, offset],
