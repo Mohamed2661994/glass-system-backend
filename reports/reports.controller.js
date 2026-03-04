@@ -612,6 +612,8 @@ exports.getCustomerDebtDetails = async (req, res) => {
         'invoice' AS record_type,
         i.id AS invoice_id,
         i.invoice_date,
+        COALESCE(i.subtotal, i.total) AS subtotal,
+        COALESCE(i.discount_total, 0) AS discount_total,
         i.total,
         i.paid_amount,
         i.remaining_amount
@@ -625,6 +627,8 @@ exports.getCustomerDebtDetails = async (req, res) => {
         'payment' AS record_type,
         cp.id AS invoice_id,
         cp.created_at AS invoice_date,
+        0 AS subtotal,
+        0 AS discount_total,
         0 AS total,
         cp.amount AS paid_amount,
         0 AS remaining_amount

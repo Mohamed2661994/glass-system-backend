@@ -7414,30 +7414,34 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
 });
 
 // ✅ تحديث حالة استلام صنف من التحويل
-app.patch("/stock-transfers/items/:itemId", authMiddleware, async (req, res) => {
-  const itemId = Number(req.params.itemId);
-  const { received } = req.body;
+app.patch(
+  "/stock-transfers/items/:itemId",
+  authMiddleware,
+  async (req, res) => {
+    const itemId = Number(req.params.itemId);
+    const { received } = req.body;
 
-  if (typeof received !== "boolean") {
-    return res.status(400).json({ error: "received must be a boolean" });
-  }
-
-  try {
-    const { rowCount } = await pool.query(
-      `UPDATE stock_transfer_items SET received = $1 WHERE id = $2`,
-      [received, itemId],
-    );
-
-    if (!rowCount) {
-      return res.status(404).json({ error: "Item not found" });
+    if (typeof received !== "boolean") {
+      return res.status(400).json({ error: "received must be a boolean" });
     }
 
-    res.json({ success: true, received });
-  } catch (err) {
-    console.error("PATCH TRANSFER ITEM ERROR:", err);
-    res.status(500).json({ error: "Failed to update item" });
-  }
-});
+    try {
+      const { rowCount } = await pool.query(
+        `UPDATE stock_transfer_items SET received = $1 WHERE id = $2`,
+        [received, itemId],
+      );
+
+      if (!rowCount) {
+        return res.status(404).json({ error: "Item not found" });
+      }
+
+      res.json({ success: true, received });
+    } catch (err) {
+      console.error("PATCH TRANSFER ITEM ERROR:", err);
+      res.status(500).json({ error: "Failed to update item" });
+    }
+  },
+);
 
 app.get("/system/tables", authMiddleware, async (req, res) => {
   res.json([
