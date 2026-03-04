@@ -476,11 +476,48 @@ async function getTableMeta(table) {
   const tableCfg = SYNC_TABLES_MAP.get(table);
   if (!tableCfg) return null;
 
-  const colsResult = await localPool.query(
-    `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
-    [table],
-  );
-  const columns = colsResult.rows.map((r) => r.column_name);
+  const [localColsResult, cloudColsResult] = await Promise.all([
+    localPool.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+      [table],
+    ),
+    cloudPool.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+      [table],
+    ),
+  ]);
+
+  const localColumns = localColsResult.rows.map((r) => r.column_name);
+  const cloudColumns = cloudColsResult.rows.map((r) => r.column_name);
+
+  const localSet = new Set(localColumns);
+  const cloudSet = new Set(cloudColumns);
+
+  const columns = localColumns.filter((c) => cloudSet.has(c));
+
+  const localOnly = localColumns.filter((c) => !cloudSet.has(c));
+  const cloudOnly = cloudColumns.filter((c) => !localSet.has(c));
+
+  if (localOnly.length > 0 || cloudOnly.length > 0) {
+    console.warn(
+      `⚠️  Schema mismatch for ${table} — local only: [${localOnly.join(", ")}], cloud only: [${cloudOnly.join(", ")}]. Sync will use shared columns only.`,
+    );
+  }
+
+  if (columns.length === 0) {
+    console.warn(`⚠️  Skip sync for ${table}: no shared columns between DBs`);
+    tableMetaCache.set(table, null);
+    return null;
+  }
+
+  const missingPk = tableCfg.pk.filter((k) => !columns.includes(k));
+  if (missingPk.length > 0) {
+    console.warn(
+      `⚠️  Skip sync for ${table}: missing PK columns in shared schema [${missingPk.join(", ")}]`,
+    );
+    tableMetaCache.set(table, null);
+    return null;
+  }
 
   const meta = {
     table,
@@ -807,20 +844,11 @@ async function syncBetweenPools(options = {}) {
 async function syncTable(table, pk) {
   let synced = 0;
 
-  // Check if table has updated_at column
-  const colCheck = await localPool.query(
-    `SELECT column_name FROM information_schema.columns 
-     WHERE table_name = $1 AND column_name = 'updated_at'`,
-    [table],
-  );
-  const hasUpdatedAt = colCheck.rows.length > 0;
+  const meta = await getTableMeta(table);
+  if (!meta) return 0;
 
-  // Get all columns for this table
-  const colsResult = await localPool.query(
-    `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
-    [table],
-  );
-  const columns = colsResult.rows.map((r) => r.column_name);
+  const { pk: effectivePk, columns, hasUpdatedAt } = meta;
+  pk = effectivePk;
 
   // Fetch all rows from both sides
   const localRows = await localPool.query(`SELECT * FROM "${table}"`);
@@ -1056,6 +1084,30 @@ async function upsertRow(targetPool, table, columns, pk, row) {
 let syncInterval = null;
 const PERIODIC_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 
+async function ensureSyncSchema() {
+  const ensureReceivedSql = `
+    ALTER TABLE stock_transfer_items
+    ADD COLUMN IF NOT EXISTS received BOOLEAN DEFAULT FALSE
+  `;
+
+  for (const [poolRef, label] of [
+    [localPool, "Local"],
+    [cloudPool, "Cloud"],
+  ]) {
+    try {
+      await poolRef.query(ensureReceivedSql);
+      console.log(`✅ ${label}: stock_transfer_items.received column ready`);
+    } catch (err) {
+      console.error(
+        `❌ ${label}: stock_transfer_items.received ensure failed:`,
+        err.message,
+      );
+    }
+  }
+
+  tableMetaCache.clear();
+}
+
 async function runPeriodicSyncTick() {
   state.nextPeriodicSyncAt = new Date(
     Date.now() + PERIODIC_SYNC_INTERVAL_MS,
@@ -1075,7 +1127,9 @@ function startPeriodicSync() {
 
   syncInterval = setInterval(runPeriodicSyncTick, PERIODIC_SYNC_INTERVAL_MS);
 }
-startPeriodicSync();
+ensureSyncSchema().finally(() => {
+  startPeriodicSync();
+});
 
 /* ── Exports ── */
 // Default export is a Proxy that routes queries to the active pool
