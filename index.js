@@ -1616,8 +1616,9 @@ app.post("/invoices", authMiddleware, async (req, res) => {
     let items_discount = 0;
 
     for (const item of items) {
-      subtotal += item.price * item.quantity;
-      items_discount += (item.discount || 0) * item.quantity;
+      const sign = item.is_return ? -1 : 1;
+      subtotal += sign * item.price * item.quantity;
+      items_discount += sign * (item.discount || 0) * item.quantity;
     }
 
     const extra_discount = Number(manual_discount || 0);
@@ -3041,8 +3042,9 @@ app.put("/invoices/:id", async (req, res) => {
     let itemsDiscount = 0;
 
     for (const item of items) {
-      subtotal += item.price * item.quantity;
-      itemsDiscount += (item.discount || 0) * item.quantity;
+      const sign = item.is_return ? -1 : 1;
+      subtotal += sign * item.price * item.quantity;
+      itemsDiscount += sign * (item.discount || 0) * item.quantity;
     }
 
     const extraDiscount = Number(manual_discount || 0);
