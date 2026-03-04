@@ -59,7 +59,7 @@ app.use(
       "https://hg-alshour.online",
       "https://www.hg-alshour.online",
     ],
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   }),
