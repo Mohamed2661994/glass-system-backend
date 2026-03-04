@@ -705,7 +705,20 @@ pool
   .then(() => console.log("✅ invoices audit columns ready"))
   .catch((e) => console.error("❌ invoices audit columns error:", e.message));
 
-// �📦 إنشاء جدول الأكواد الفرعية (عبوات بديلة) لو مش موجود
+// ✅ إضافة عمود استلام الصنف في التحويلات
+pool
+  .query(
+    `
+  ALTER TABLE stock_transfer_items
+    ADD COLUMN IF NOT EXISTS received BOOLEAN DEFAULT FALSE
+  `,
+  )
+  .then(() => console.log("✅ stock_transfer_items.received column ready"))
+  .catch((e) =>
+    console.error("❌ stock_transfer_items.received error:", e.message),
+  );
+
+// 📦 إنشاء جدول الأكواد الفرعية (عبوات بديلة) لو مش موجود
 pool
   .query(
     `
@@ -6981,7 +6994,8 @@ app.get("/stock-transfers/by-date", async (req, res) => {
           ELSE sti.status
         END              AS status,
         st.status         AS transfer_status,
-        st.created_at
+        st.created_at,
+        COALESCE(sti.received, false) AS received
         
       FROM stock_transfer_items sti
       JOIN stock_transfers st ON st.id = sti.transfer_id
@@ -7396,6 +7410,32 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
     });
   } finally {
     client.release();
+  }
+});
+
+// ✅ تحديث حالة استلام صنف من التحويل
+app.patch("/stock-transfers/items/:itemId", authMiddleware, async (req, res) => {
+  const itemId = Number(req.params.itemId);
+  const { received } = req.body;
+
+  if (typeof received !== "boolean") {
+    return res.status(400).json({ error: "received must be a boolean" });
+  }
+
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE stock_transfer_items SET received = $1 WHERE id = $2`,
+      [received, itemId],
+    );
+
+    if (!rowCount) {
+      return res.status(404).json({ error: "Item not found" });
+    }
+
+    res.json({ success: true, received });
+  } catch (err) {
+    console.error("PATCH TRANSFER ITEM ERROR:", err);
+    res.status(500).json({ error: "Failed to update item" });
   }
 });
 
