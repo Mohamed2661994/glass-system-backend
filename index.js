@@ -2777,6 +2777,8 @@ app.get("/invoices/:id/edit", async (req, res) => {
       supplier_name: invoice.supplier_name,
       supplier_phone: invoice.supplier_phone,
 
+      notes: invoice.notes,
+
       created_by: invoice.created_by,
       created_by_name: invoice.created_by_name,
       updated_by: invoice.updated_by,
