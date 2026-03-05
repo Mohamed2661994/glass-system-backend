@@ -795,13 +795,9 @@ pool
 
 // إضافة عمود الملاحظات للفواتير
 pool
-  .query(
-    `ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes TEXT`,
-  )
+  .query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes TEXT`)
   .then(() => console.log("✅ invoices.notes column ready"))
-  .catch((e) =>
-    console.error("❌ invoices.notes column error:", e.message),
-  );
+  .catch((e) => console.error("❌ invoices.notes column error:", e.message));
 
 // إضافة عمود المرتجع للأصناف (item-level)
 pool
@@ -1574,6 +1570,8 @@ app.get("/suppliers/:id/statement", async (req, res) => {
 
 app.post("/invoices", authMiddleware, async (req, res) => {
   console.log("USER FROM TOKEN:", req.user);
+  console.log("📝 INVOICE CREATE - Full body:", JSON.stringify(req.body, null, 2));
+  console.log("📝 INVOICE CREATE - notes value:", req.body.notes);
 
   const userBranchId = req.user.branch_id;
   req.body.branch_id = userBranchId;
@@ -2013,8 +2011,13 @@ app.post("/invoices/retail", async (req, res) => {
       is_return = false,
     } = req.body;
 
-    const { created_by, created_by_name, supplier_name, supplier_phone, notes } =
-      req.body;
+    const {
+      created_by,
+      created_by_name,
+      supplier_name,
+      supplier_phone,
+      notes,
+    } = req.body;
 
     if (
       !branch_id ||
