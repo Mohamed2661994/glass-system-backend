@@ -1570,7 +1570,10 @@ app.get("/suppliers/:id/statement", async (req, res) => {
 
 app.post("/invoices", authMiddleware, async (req, res) => {
   console.log("USER FROM TOKEN:", req.user);
-  console.log("📝 INVOICE CREATE - Full body:", JSON.stringify(req.body, null, 2));
+  console.log(
+    "📝 INVOICE CREATE - Full body:",
+    JSON.stringify(req.body, null, 2),
+  );
   console.log("📝 INVOICE CREATE - notes value:", req.body.notes);
 
   const userBranchId = req.user.branch_id;
