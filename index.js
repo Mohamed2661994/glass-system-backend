@@ -793,6 +793,16 @@ pool
     console.error("❌ invoices.is_return column error:", e.message),
   );
 
+// إضافة عمود الملاحظات للفواتير
+pool
+  .query(
+    `ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes TEXT`,
+  )
+  .then(() => console.log("✅ invoices.notes column ready"))
+  .catch((e) =>
+    console.error("❌ invoices.notes column error:", e.message),
+  );
+
 // إضافة عمود المرتجع للأصناف (item-level)
 pool
   .query(
@@ -1735,10 +1745,11 @@ app.post("/invoices", authMiddleware, async (req, res) => {
   created_by_name,
   supplier_id,
   supplier_name,
-  supplier_phone
+  supplier_phone,
+  notes
 )
 VALUES
-($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
       RETURNING id
       `,
       [
@@ -1764,6 +1775,7 @@ VALUES
         supplierId,
         supplier_name || null,
         supplier_phone || null,
+        notes || null,
       ],
     );
 
@@ -2001,7 +2013,7 @@ app.post("/invoices/retail", async (req, res) => {
       is_return = false,
     } = req.body;
 
-    const { created_by, created_by_name, supplier_name, supplier_phone } =
+    const { created_by, created_by_name, supplier_name, supplier_phone, notes } =
       req.body;
 
     if (
@@ -2111,10 +2123,11 @@ app.post("/invoices/retail", async (req, res) => {
         created_by_name,
         supplier_id,
         supplier_name,
-        supplier_phone
+        supplier_phone,
+        notes
       )
       VALUES
-      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
       RETURNING id
       `,
       [
@@ -2139,6 +2152,7 @@ app.post("/invoices/retail", async (req, res) => {
         supplierId,
         supplier_name || null,
         supplier_phone || null,
+        notes || null,
       ],
     );
 
@@ -2371,6 +2385,7 @@ app.put("/invoices/retail/:id", async (req, res) => {
       supplier_name,
       supplier_phone,
       invoice_date,
+      notes,
     } = req.body;
 
     if (!items || !items.length || final_total === undefined) {
@@ -2531,7 +2546,8 @@ SET
   supplier_id = $15,
   supplier_name = $16,
   supplier_phone = $17,
-  invoice_date = COALESCE($18::date, invoice_date)
+  invoice_date = COALESCE($18::date, invoice_date),
+  notes = $19
 WHERE id = $14
       `,
       [
@@ -2553,6 +2569,7 @@ WHERE id = $14
         supplier_name || null,
         supplier_phone || null,
         invoice_date || null,
+        notes || null,
       ],
     );
 
@@ -2877,6 +2894,7 @@ app.put("/invoices/:id", async (req, res) => {
       supplier_name,
       supplier_phone,
       invoice_date,
+      notes,
     } = req.body;
     if (!items || !items.length) {
       throw new Error("لا يوجد أصناف في الفاتورة");
@@ -3109,7 +3127,8 @@ SET
   supplier_id = $15,
   supplier_name = $16,
   supplier_phone = $17,
-  invoice_date = COALESCE($18::date, invoice_date)
+  invoice_date = COALESCE($18::date, invoice_date),
+  notes = $19
 WHERE id = $14
   `,
       [
@@ -3131,6 +3150,7 @@ WHERE id = $14
         supplier_name || null,
         supplier_phone || null,
         invoice_date || null,
+        notes || null,
       ],
     );
 
