@@ -4407,6 +4407,21 @@ app.post("/admin/opening-stock", async (req, res) => {
       if (p.barcode) barcodeMap.set(p.barcode.trim(), p);
     });
 
+    // 1.5 جلب كل العبوات الفرعية (variants) لربط الـ package بـ variant_id
+    const allVariants = await client.query(
+      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants`,
+    );
+    // بناء خريطة: product_id + package_name -> variant_id
+    const variantMap = new Map();
+    allVariants.rows.forEach((v) => {
+      if (v.wholesale_package) {
+        variantMap.set(`${v.product_id}_${v.wholesale_package.trim()}`, v.id);
+      }
+      if (v.retail_package) {
+        variantMap.set(`${v.product_id}_${v.retail_package.trim()}`, v.id);
+      }
+    });
+
     // 2. مطابقة الأصناف
     const matchedItems = [];
     const unmatchedItems = [];
@@ -4415,13 +4430,18 @@ app.post("/admin/opening-stock", async (req, res) => {
       const code = String(item.product_code).trim();
       const product = barcodeMap.get(code);
       if (product) {
+        const pkg = item.unit || product.retail_package || "";
+        // البحث عن variant_id من اسم العبوة
+        const variantId = variantMap.get(`${product.id}_${pkg.trim()}`) || 0;
+        
         matchedItems.push({
           product_id: product.id,
           product_name: product.name,
-          package: item.unit || product.retail_package || "",
+          package: pkg,
           price: Number(item.price) || 0,
           quantity: Number(item.quantity) || 0,
           barcode: code,
+          variant_id: variantId,
         });
       } else {
         unmatchedItems.push({
@@ -4465,12 +4485,13 @@ app.post("/admin/opening-stock", async (req, res) => {
     // 5. إضافة الأصناف + تحديث المخزون
     for (const item of matchedItems) {
       const itemTotal = item.price * item.quantity;
+      const variantId = item.variant_id || 0;
 
       // إضافة للفاتورة
       await client.query(
         `INSERT INTO invoice_items
          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
-         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 0, false)`,
+         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, false)`,
         [
           invoiceId,
           item.product_id,
@@ -4479,24 +4500,25 @@ app.post("/admin/opening-stock", async (req, res) => {
           item.price,
           item.quantity,
           itemTotal,
+          variantId,
         ],
       );
 
       // تحديث المخزون (شراء = زيادة)
       await client.query(
         `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-         VALUES ($1, $2, 0, $3)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (warehouse_id, product_id, variant_id)
-         DO UPDATE SET quantity = stock.quantity + $3`,
-        [warehouseId, item.product_id, item.quantity],
+         DO UPDATE SET quantity = stock.quantity + $4`,
+        [warehouseId, item.product_id, variantId, item.quantity],
       );
 
       // تسجيل حركة المخزون
       await client.query(
         `INSERT INTO stock_movements
          (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-         VALUES ($1, $2, $3, 0, $4, 'purchase')`,
-        [invoiceId, warehouseId, item.product_id, item.quantity],
+         VALUES ($1, $2, $3, $4, $5, 'purchase')`,
+        [invoiceId, warehouseId, item.product_id, variantId, item.quantity],
       );
     }
 

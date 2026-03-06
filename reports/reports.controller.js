@@ -139,6 +139,7 @@ exports.getProductMovement = async (req, res) => {
         sm.quantity,
         sm.note,
         sm.invoice_id,
+        sm.variant_id,
 
         -- اسم العميل أو المورد من الفاتورة
         i.customer_name AS party_name,
@@ -149,14 +150,19 @@ exports.getProductMovement = async (req, res) => {
         -- نوع الحركة من الفاتورة (sale / purchase)
         i.movement_type AS invoice_movement_type,
 
-        -- العبوة المستخدمة من بنود الفاتورة
-        ii.package AS package_name
+        -- العبوة: من الفاتورة أو من العبوة الفرعية أو من المنتج الأساسي
+        COALESCE(
+          ii.package,
+          CASE WHEN sm.variant_id > 0 THEN pv.wholesale_package END,
+          p.wholesale_package
+        ) AS package_name
 
       FROM stock_movements sm
       JOIN products p ON p.id = sm.product_id
       JOIN warehouses w ON w.id = sm.warehouse_id
       LEFT JOIN invoices i ON i.id = sm.invoice_id
       LEFT JOIN invoice_items ii ON ii.invoice_id = sm.invoice_id AND ii.product_id = sm.product_id AND ii.variant_id = sm.variant_id
+      LEFT JOIN product_variants pv ON pv.id = sm.variant_id
 
       WHERE ${conditions.join(" AND ")}
       ORDER BY sm.created_at ASC
