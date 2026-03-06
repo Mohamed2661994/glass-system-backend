@@ -1056,7 +1056,8 @@ app.get("/products", async (req, res) => {
         SELECT json_agg(json_build_object(
           'variant_id', vs.variant_id,
           'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
-          'quantity', vs.quantity
+          'quantity', vs.quantity,
+          'price', CASE WHEN $1 = 'wholesale' THEN pv.wholesale_price ELSE pv.retail_price END
         ) ORDER BY vs.variant_id)
         FROM stock vs
         LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = p.id
@@ -1096,7 +1097,8 @@ app.get("/products", async (req, res) => {
         SELECT json_agg(json_build_object(
           'variant_id', vs.variant_id,
           'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
-          'quantity', vs.quantity
+          'quantity', vs.quantity,
+          'price', CASE WHEN $1 = 'wholesale' THEN pv.purchase_price ELSE pv.retail_purchase_price END
         ) ORDER BY vs.variant_id)
         FROM stock vs
         LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = p.id
