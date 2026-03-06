@@ -1051,7 +1051,17 @@ app.get("/products", async (req, res) => {
       p.wholesale_price,
       p.retail_price,
       p.discount_amount,
-      COALESCE(SUM(s.quantity), 0) AS available_quantity
+      COALESCE(SUM(s.quantity), 0) AS available_quantity,
+      (
+        SELECT json_agg(json_build_object(
+          'variant_id', vs.variant_id,
+          'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
+          'quantity', vs.quantity
+        ) ORDER BY vs.variant_id)
+        FROM stock vs
+        LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = p.id
+        WHERE vs.product_id = p.id AND vs.warehouse_id = $2
+      ) AS variant_stock
     FROM products p
     LEFT JOIN stock s
       ON s.product_id = p.id
@@ -1081,7 +1091,17 @@ app.get("/products", async (req, res) => {
         ELSE p.retail_purchase_price
       END AS price,
       p.discount_amount,
-     COALESCE(SUM(s.quantity), 0) AS available_quantity
+     COALESCE(SUM(s.quantity), 0) AS available_quantity,
+      (
+        SELECT json_agg(json_build_object(
+          'variant_id', vs.variant_id,
+          'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
+          'quantity', vs.quantity
+        ) ORDER BY vs.variant_id)
+        FROM stock vs
+        LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = p.id
+        WHERE vs.product_id = p.id AND vs.warehouse_id = $2
+      ) AS variant_stock
     FROM products p
     LEFT JOIN stock s
       ON s.product_id = p.id
@@ -4433,7 +4453,7 @@ app.post("/admin/opening-stock", async (req, res) => {
         const pkg = item.unit || product.retail_package || "";
         // البحث عن variant_id من اسم العبوة
         const variantId = variantMap.get(`${product.id}_${pkg.trim()}`) || 0;
-        
+
         matchedItems.push({
           product_id: product.id,
           product_name: product.name,
