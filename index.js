@@ -7219,11 +7219,10 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         [item.to_warehouse_id, item.product_id],
       );
 
-      const available = retailStockRes.rows.length
-        ? retailStockRes.rows[0].quantity
-        : 0;
+      const available = Number(retailStockRes.rows[0]?.quantity || 0);
+      const required = Number(item.to_quantity || 0);
 
-      if (available < item.to_quantity) {
+      if (available < required) {
         throw new Error(
           `لا يمكن إلغاء التحويل: رصيد القطاعي غير كافي للصنف ${item.product_id}`,
         );
@@ -7377,11 +7376,10 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       [item.to_warehouse_id, item.product_id],
     );
 
-    const availableTargetQty = targetStockRes.rows.length
-      ? targetStockRes.rows[0].quantity
-      : 0;
+    const availableTargetQty = Number(targetStockRes.rows[0]?.quantity || 0);
+    const requiredTargetQty = Number(item.to_quantity || 0);
 
-    if (availableTargetQty < item.to_quantity) {
+    if (availableTargetQty < requiredTargetQty) {
       throw new Error("لا يمكن إلغاء الصنف: رصيد المخزن المستلم غير كافي");
     }
 
