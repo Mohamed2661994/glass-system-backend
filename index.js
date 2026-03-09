@@ -7189,19 +7189,39 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
     const itemsRes = await client.query(
       `
       SELECT
+        id,
         product_id,
         from_warehouse_id,
         to_warehouse_id,
         from_quantity,
-        to_quantity
+        to_quantity,
+        COALESCE(status, 'active') AS status
       FROM stock_transfer_items
       WHERE transfer_id = $1
+        AND COALESCE(status, 'active') = 'active'
+      FOR UPDATE
       `,
       [transferId],
     );
 
     if (!itemsRes.rows.length) {
-      throw new Error("لا يوجد أصناف للتحويل");
+      // Idempotent behavior: if all items were already cancelled earlier,
+      // just close the transfer header without touching stock again.
+      await client.query(
+        `
+        UPDATE stock_transfers
+        SET status = 'cancelled'
+        WHERE id = $1
+        `,
+        [transferId],
+      );
+
+      await client.query("COMMIT");
+
+      return res.json({
+        success: true,
+        message: "التحويل ملغي بالفعل",
+      });
     }
 
     // 3️⃣ عكس التأثير
@@ -7309,6 +7329,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
       UPDATE stock_transfer_items
       SET status = 'cancelled'
       WHERE transfer_id = $1
+        AND COALESCE(status, 'active') = 'active'
       `,
       [transferId],
     );
@@ -7372,6 +7393,25 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
 
     if (item.status === "cancelled") {
       throw new Error("تم إلغاء هذا الصنف مسبقًا");
+    }
+
+    // 1.5️⃣ اقفل رأس التحويل لتفادي سباق الإلغاء الكلي مع إلغاء الصنف
+    const transferLockRes = await client.query(
+      `
+      SELECT id, status
+      FROM stock_transfers
+      WHERE id = $1
+      FOR UPDATE
+      `,
+      [item.transfer_id],
+    );
+
+    if (!transferLockRes.rows.length) {
+      throw new Error("التحويل غير موجود");
+    }
+
+    if (transferLockRes.rows[0].status === "cancelled") {
+      throw new Error("التحويل ملغي بالفعل");
     }
 
     // 2️⃣ تأكد إن رصيد المخزن الهدف يسمح بالعكس
@@ -7472,6 +7512,28 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       `,
       [itemId],
     );
+
+    // لو مفيش أي بنود نشطة بعد الإلغاء، اقفل رأس التحويل تلقائيًا
+    const remainingActiveItemsRes = await client.query(
+      `
+      SELECT COUNT(*)::int AS cnt
+      FROM stock_transfer_items
+      WHERE transfer_id = $1
+        AND COALESCE(status, 'active') = 'active'
+      `,
+      [item.transfer_id],
+    );
+
+    if ((remainingActiveItemsRes.rows[0]?.cnt || 0) === 0) {
+      await client.query(
+        `
+        UPDATE stock_transfers
+        SET status = 'cancelled'
+        WHERE id = $1
+        `,
+        [item.transfer_id],
+      );
+    }
 
     await client.query("COMMIT");
 
