@@ -13,7 +13,7 @@ async function fixStockInconsistency() {
   try {
     // 1. احسب الرصيد الفعلي من stock_movements
     console.log("📊 حساب الأرصدة الفعلية من حركات المخزون...");
-    
+
     const actualStockResult = await pool.query(`
       SELECT
         sm.warehouse_id,
@@ -60,7 +60,9 @@ async function fixStockInconsistency() {
       currentStockMap.set(key, Number(row.quantity));
     });
 
-    console.log(`✅ تم جلب ${currentStockResult.rows.length} سجل من جدول stock\n`);
+    console.log(
+      `✅ تم جلب ${currentStockResult.rows.length} سجل من جدول stock\n`,
+    );
 
     // 3. ابحث عن الفروقات
     console.log("🔍 مقارنة الأرصدة...\n");
@@ -89,16 +91,19 @@ async function fixStockInconsistency() {
           FROM products p, warehouses w
           WHERE p.id = $1 AND w.id = $2
           `,
-          [actual.product_id, actual.warehouse_id]
+          [actual.product_id, actual.warehouse_id],
         );
 
-        const info = infoResult.rows[0] || { product_name: "غير معروف", warehouse_name: "غير معروف" };
+        const info = infoResult.rows[0] || {
+          product_name: "غير معروف",
+          warehouse_name: "غير معروف",
+        };
 
         console.log(
           `⚠️  [${info.warehouse_name}] ${info.product_name} (ID: ${actual.product_id}):\n` +
-          `   - الرصيد الحالي في stock: ${currentQty}\n` +
-          `   - الرصيد الفعلي من الحركات: ${actualQty}\n` +
-          `   - الفرق: ${actualQty - currentQty}\n`
+            `   - الرصيد الحالي في stock: ${currentQty}\n` +
+            `   - الرصيد الفعلي من الحركات: ${actualQty}\n` +
+            `   - الفرق: ${actualQty - currentQty}\n`,
         );
       }
     }
@@ -112,7 +117,9 @@ async function fixStockInconsistency() {
 
     // 4. اسأل المستخدم عن التأكيد
     console.log("⚠️  هل تريد تصحيح هذه الفروقات؟ (y/n)");
-    console.log("⚠️  سيتم تحديث جدول stock ليطابق الأرصدة الفعلية من stock_movements\n");
+    console.log(
+      "⚠️  سيتم تحديث جدول stock ليطابق الأرصدة الفعلية من stock_movements\n",
+    );
 
     const readline = require("readline").createInterface({
       input: process.stdin,
@@ -135,7 +142,7 @@ async function fixStockInconsistency() {
           const existsResult = await pool.query(
             `SELECT 1 FROM stock 
              WHERE warehouse_id = $1 AND product_id = $2 AND COALESCE(variant_id, 0) = $3`,
-            [item.warehouse_id, item.product_id, item.variant_id]
+            [item.warehouse_id, item.product_id, item.variant_id],
           );
 
           if (existsResult.rows.length > 0) {
@@ -144,31 +151,47 @@ async function fixStockInconsistency() {
               `UPDATE stock 
                SET quantity = $1, updated_at = NOW()
                WHERE warehouse_id = $2 AND product_id = $3 AND COALESCE(variant_id, 0) = $4`,
-              [item.actual, item.warehouse_id, item.product_id, item.variant_id]
+              [
+                item.actual,
+                item.warehouse_id,
+                item.product_id,
+                item.variant_id,
+              ],
             );
           } else {
             // إضافة سجل جديد
             await pool.query(
               `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity, created_at, updated_at)
                VALUES ($1, $2, $3, $4, NOW(), NOW())`,
-              [item.warehouse_id, item.product_id, item.variant_id || null, item.actual]
+              [
+                item.warehouse_id,
+                item.product_id,
+                item.variant_id || null,
+                item.actual,
+              ],
             );
           }
 
           fixedCount++;
-          console.log(`✅ تم تصحيح: المخزن ${item.warehouse_id} - الصنف ${item.product_id}`);
+          console.log(
+            `✅ تم تصحيح: المخزن ${item.warehouse_id} - الصنف ${item.product_id}`,
+          );
         } catch (err) {
-          console.error(`❌ خطأ في تصحيح الصنف ${item.product_id}:`, err.message);
+          console.error(
+            `❌ خطأ في تصحيح الصنف ${item.product_id}:`,
+            err.message,
+          );
         }
       }
 
-      console.log(`\n✅ تم تصحيح ${fixedCount} من ${inconsistencies.length} سجل بنجاح!\n`);
+      console.log(
+        `\n✅ تم تصحيح ${fixedCount} من ${inconsistencies.length} سجل بنجاح!\n`,
+      );
       console.log("🎉 انتهى إصلاح تضارب الأرصدة\n");
 
       readline.close();
       process.exit(0);
     });
-
   } catch (err) {
     console.error("❌ خطأ في العملية:", err);
     process.exit(1);
