@@ -135,6 +135,11 @@ app.get("/health", async (req, res) => {
     failoverHistory: dbState.failoverHistory.slice(-5),
     lastBackup,
     lastAutoBackup: lastAutoBackup || null,
+    manualLock: dbState.manualLock,
+    manualLockExpiredAt:
+      dbState.manualLock && dbState.manualLockTime
+        ? new Date(dbState.manualLockTime + 3600000).toISOString()
+        : null,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
@@ -157,13 +162,16 @@ app.post("/admin/switch-db", async (req, res) => {
     const prev = dbState.activeDb;
     dbState.activeDb = target;
     dbState.manualLock = true; // Lock to prevent auto-failback
+    dbState.manualLockTime = Date.now(); // Record when lock was set (1-hour timeout)
     dbState.failoverHistory.push({
       from: prev,
       to: target,
       time: new Date().toISOString(),
       reason: "Manual switch (locked)",
     });
-    console.log(`🔄 Manual switch: ${prev} → ${target} (auto-failback locked)`);
+    console.log(
+      `🔄 Manual switch: ${prev} → ${target} (auto-failback locked for 1 hour)`,
+    );
     res.json({ ok: true, activeDb: target, previous: prev });
   } catch (err) {
     res.status(500).json({ error: err.message });

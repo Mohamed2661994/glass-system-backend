@@ -53,6 +53,7 @@ const state = {
   lastSyncResult: null, // { ok, synced, errors, duration, time }
   failoverHistory: [], // [{ from, to, time, reason }]
   manualLock: false, // true = manual switch, prevents auto-failback
+  manualLockTime: null, // timestamp when manual lock was set (for 1-hour timeout)
   periodicSyncIntervalMs: 15 * 60 * 1000,
   nextPeriodicSyncAt: null, // ISO string
   lastRealtimeSyncAt: null, // ISO string
@@ -380,8 +381,20 @@ setInterval(async () => {
   }
 
   // Auto-failback: local recovered → sync first, then switch back
-  // Skip if manualLock is active (user manually switched)
-  if (state.activeDb === "cloud" && state.localAlive && !state.manualLock) {
+  // Skip if manualLock is active AND less than 1 hour old (allow override after timeout)
+  const manualLockExpired =
+    state.manualLockTime && Date.now() - state.manualLockTime > 60 * 60 * 1000; // 1 hour timeout
+
+  if (
+    state.activeDb === "cloud" &&
+    state.localAlive &&
+    (!state.manualLock || manualLockExpired)
+  ) {
+    if (manualLockExpired) {
+      console.log("🔓 Manual lock expired — enabling auto-failback");
+      state.manualLock = false;
+    }
+
     console.log(
       "🔄 Local DB recovered — syncing cloud → local before failback...",
     );
@@ -399,6 +412,8 @@ setInterval(async () => {
       } else {
         console.log("✅ Pre-failback sync complete");
         state.activeDb = "local";
+        state.manualLock = false; // Clear manual lock after successful failback
+        state.manualLockTime = null;
         const record = {
           from: "cloud",
           to: "local",
