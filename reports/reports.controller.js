@@ -840,3 +840,114 @@ exports.getSupplierDebtDetails = async (req, res) => {
     res.status(500).json({ error: "Server error", details: err.message });
   }
 };
+
+/* ===============================
+   📈 ربحية المبيعات حسب الفواتير
+   - فواتير بيع فقط
+   - إجمالي الفاتورة = مجموع بنود الفاتورة بعد خصم كل صنف
+   - صافي الربح = (سعر بيع البند بعد الخصم) - (تكلفة الشراء من جدول الأصناف)
+   - المرتجع يُحسب بالسالب
+================================ */
+exports.getInvoiceSalesProfit = async (req, res) => {
+  try {
+    const {
+      branch_id,
+      invoice_type,
+      customer_name,
+      date_from,
+      date_to,
+      invoice_id,
+    } = req.query;
+
+    const conditions = ["i.movement_type = 'sale'", "i.is_void IS NOT TRUE"];
+    const values = [];
+    let idx = 1;
+
+    if (invoice_id) {
+      conditions.push(`i.id = $${idx++}`);
+      values.push(Number(invoice_id));
+    }
+
+    if (branch_id) {
+      conditions.push(`i.branch_id = $${idx++}`);
+      values.push(Number(branch_id));
+    }
+
+    if (invoice_type) {
+      conditions.push(`i.invoice_type = $${idx++}`);
+      values.push(invoice_type);
+    }
+
+    if (customer_name) {
+      conditions.push(`i.customer_name ILIKE $${idx++}`);
+      values.push(`%${customer_name}%`);
+    }
+
+    if (date_from) {
+      conditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) >= $${idx++}::date`);
+      values.push(date_from);
+    }
+
+    if (date_to) {
+      conditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) <= $${idx++}::date`);
+      values.push(date_to);
+    }
+
+    const whereClause = `WHERE ${conditions.join(" AND ")}`;
+
+    const result = await pool.query(
+      `
+      SELECT
+        i.id AS invoice_id,
+        i.branch_id,
+        i.invoice_type,
+        COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date,
+        COALESCE(NULLIF(TRIM(i.customer_name), ''), 'عميل نقدي') AS customer_name,
+
+        SUM(
+          (CASE WHEN COALESCE(ii.is_return, false) THEN -1 ELSE 1 END)
+          * COALESCE(ii.total, (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)) * COALESCE(ii.quantity, 0))
+        ) AS items_total_after_discount,
+
+        SUM(
+          (CASE WHEN COALESCE(ii.is_return, false) THEN -1 ELSE 1 END)
+          * COALESCE(ii.quantity, 0)
+          * CASE
+              WHEN i.invoice_type = 'retail'
+                THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
+              ELSE COALESCE(p.purchase_price, 0)
+            END
+        ) AS total_cost
+
+      FROM invoices i
+      JOIN invoice_items ii ON ii.invoice_id = i.id
+      JOIN products p ON p.id = ii.product_id
+      ${whereClause}
+      GROUP BY i.id, i.branch_id, i.invoice_type, COALESCE(i.invoice_date::date, i.created_at::date), i.customer_name
+      ORDER BY i.id DESC
+      `,
+      values,
+    );
+
+    const rows = result.rows.map((row) => {
+      const itemsTotal = Number(row.items_total_after_discount || 0);
+      const totalCost = Number(row.total_cost || 0);
+
+      return {
+        invoice_id: Number(row.invoice_id),
+        branch_id: Number(row.branch_id),
+        invoice_type: row.invoice_type,
+        invoice_date: row.invoice_date,
+        customer_name: row.customer_name,
+        items_total_after_discount: itemsTotal,
+        total_cost: totalCost,
+        net_profit: itemsTotal - totalCost,
+      };
+    });
+
+    res.json(rows);
+  } catch (err) {
+    console.error("INVOICE SALES PROFIT ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
