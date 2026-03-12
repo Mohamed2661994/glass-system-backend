@@ -1365,7 +1365,9 @@ app.delete("/customers/:id", async (req, res) => {
       return res.status(404).json({ error: "العميل غير موجود" });
     }
 
-    const normalizedCustomerName = normalizeArabicName(customerRes.rows[0].name);
+    const normalizedCustomerName = normalizeArabicName(
+      customerRes.rows[0].name,
+    );
 
     const linkedInvoicesRes = await pool.query(
       `SELECT id, customer_name FROM invoices WHERE customer_id = $1`,
@@ -1374,7 +1376,8 @@ app.delete("/customers/:id", async (req, res) => {
 
     const staleInvoiceIds = linkedInvoicesRes.rows
       .filter(
-        (inv) => normalizeArabicName(inv.customer_name) !== normalizedCustomerName,
+        (inv) =>
+          normalizeArabicName(inv.customer_name) !== normalizedCustomerName,
       )
       .map((inv) => inv.id);
 
@@ -2964,7 +2967,9 @@ app.put("/invoices/rename-customer", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "يجب تحديد الاسم الجديد" });
   }
   if (!customer_id && !old_name?.trim()) {
-    return res.status(400).json({ error: "يجب تحديد الاسم القديم أو رقم العميل" });
+    return res
+      .status(400)
+      .json({ error: "يجب تحديد الاسم القديم أو رقم العميل" });
   }
   try {
     let result;
@@ -6126,7 +6131,7 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
 ================================ */
 app.get("/cash/out", authMiddleware, async (req, res) => {
   try {
-    const { from_date, to_date, limit = 50, offset = 0 } = req.query;
+    const { from_date, to_date, search_name, limit = 50, offset = 0 } = req.query;
     const branch_id = req.user.branch_id; // ✅ الفرع من التوكن
 
     let conditions = [`branch_id = $1`];
@@ -6146,6 +6151,11 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
     if (to_date) {
       conditions.push(`transaction_date <= $${idx++}`);
       values.push(to_date);
+    }
+
+    if (search_name) {
+      conditions.push(`REPLACE(COALESCE(name, ''), ' ', '') ILIKE $${idx++}`);
+      values.push(`%${String(search_name).replace(/\s+/g, "")}%`);
     }
 
     //const whereClause =
