@@ -2880,6 +2880,29 @@ app.get("/invoices/:id", async (req, res) => {
   }
 });
 
+/* ================================
+   تغيير اسم العميل في كل الفواتير
+================================= */
+app.put("/invoices/rename-customer", authMiddleware, async (req, res) => {
+  const { old_name, new_name } = req.body;
+  if (!old_name?.trim() || !new_name?.trim()) {
+    return res.status(400).json({ error: "يجب تحديد الاسم القديم والجديد" });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE invoices SET customer_name = $1 WHERE customer_name = $2`,
+      [new_name.trim(), old_name.trim()],
+    );
+    res.json({
+      updated: result.rowCount,
+      message: `تم تحديث الاسم في ${result.rowCount} فاتورة`,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "فشل تحديث الاسم في الفواتير" });
+  }
+});
+
 app.put("/invoices/:id", async (req, res) => {
   const client = await pool.connect();
   const invoiceId = Number(req.params.id);
