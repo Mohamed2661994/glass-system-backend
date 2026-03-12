@@ -47,6 +47,10 @@ function getCairoDate() {
 }
 
 const app = express();
+// Public API routes — allow all origins (no auth required)
+app.options(/^\/public\//, cors({ origin: "*", methods: ["GET"] }));
+app.use("/public", cors({ origin: "*", methods: ["GET"], credentials: false }));
+
 app.use(
   cors({
     origin: [
@@ -1174,6 +1178,91 @@ app.get("/public/products", async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error("PUBLIC PRODUCTS ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 📦 Public API — أرصدة الأصناف مع الكميات المتاحة
+// GET /public/stock?branch_id=1&search=زجاج
+// branch_id (اختياري): تصفية بفرع معين
+// search (اختياري): بحث في اسم الصنف أو الباركود
+app.get("/public/stock", async (req, res) => {
+  try {
+    const { branch_id, search } = req.query;
+    const branchId = branch_id ? Number(branch_id) : null;
+    const searchTerm = search ? `%${search}%` : null;
+
+    const result = await pool.query(
+      `
+      SELECT
+        p.id,
+        p.name,
+        p.barcode,
+        p.manufacturer,
+        p.wholesale_package,
+        p.retail_package,
+        p.wholesale_price,
+        p.retail_price,
+        p.description,
+        COALESCE((
+          SELECT SUM(s.quantity)
+          FROM stock s
+          JOIN warehouses w ON w.id = s.warehouse_id
+          WHERE s.product_id = p.id
+            AND ($1::int IS NULL OR w.branch_id = $1)
+        ), 0) AS total_stock,
+        (
+          SELECT json_agg(json_build_object(
+            'warehouse_id', sq.wid,
+            'warehouse_name', sq.wname,
+            'quantity', sq.qty
+          ) ORDER BY sq.wid)
+          FROM (
+            SELECT s.warehouse_id AS wid, w.name AS wname, SUM(s.quantity) AS qty
+            FROM stock s
+            JOIN warehouses w ON w.id = s.warehouse_id
+            WHERE s.product_id = p.id
+              AND ($1::int IS NULL OR w.branch_id = $1)
+            GROUP BY s.warehouse_id, w.name
+          ) sq
+        ) AS stock_by_warehouse,
+        (
+          SELECT json_agg(json_build_object(
+            'id', pv.id,
+            'label', pv.label,
+            'barcode', pv.barcode,
+            'retail_price', pv.retail_price,
+            'wholesale_price', pv.wholesale_price,
+            'total_stock', COALESCE((
+              SELECT SUM(sv.quantity)
+              FROM stock sv
+              JOIN warehouses wv ON wv.id = sv.warehouse_id
+              WHERE sv.product_id = p.id AND sv.variant_id = pv.id
+                AND ($1::int IS NULL OR wv.branch_id = $1)
+            ), 0)
+          ) ORDER BY pv.id)
+          FROM product_variants pv
+          WHERE pv.product_id = p.id
+        ) AS variants
+      FROM products p
+      WHERE p.is_active = true
+        AND ($2::text IS NULL OR p.name ILIKE $2 OR p.barcode ILIKE $2)
+      ORDER BY p.name
+      `,
+      [branchId, searchTerm],
+    );
+
+    res.json({
+      count: result.rows.length,
+      products: result.rows.map((row) => ({
+        ...row,
+        total_stock: Number(row.total_stock),
+        variants: row.variants || [],
+        stock_by_warehouse: row.stock_by_warehouse || [],
+      })),
+    });
+  } catch (err) {
+    console.error("PUBLIC STOCK ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
