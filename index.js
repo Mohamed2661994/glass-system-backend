@@ -1343,8 +1343,48 @@ app.delete("/customers/:id/phones/:phoneId", async (req, res) => {
 // Delete a customer (only if no invoices reference them)
 app.delete("/customers/:id", async (req, res) => {
   try {
-    const { id } = req.params;
-    // Check if customer has any invoices
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: "معرف عميل غير صالح" });
+    }
+
+    const normalizeArabicName = (value = "") =>
+      String(value)
+        .trim()
+        .replace(/[أإآ]/g, "ا")
+        .replace(/ى/g, "ي")
+        .replace(/ة/g, "ه")
+        .replace(/\s+/g, " ");
+
+    const customerRes = await pool.query(
+      `SELECT id, name FROM customers WHERE id = $1 LIMIT 1`,
+      [id],
+    );
+
+    if (!customerRes.rows.length) {
+      return res.status(404).json({ error: "العميل غير موجود" });
+    }
+
+    const normalizedCustomerName = normalizeArabicName(customerRes.rows[0].name);
+
+    const linkedInvoicesRes = await pool.query(
+      `SELECT id, customer_name FROM invoices WHERE customer_id = $1`,
+      [id],
+    );
+
+    const staleInvoiceIds = linkedInvoicesRes.rows
+      .filter(
+        (inv) => normalizeArabicName(inv.customer_name) !== normalizedCustomerName,
+      )
+      .map((inv) => inv.id);
+
+    if (staleInvoiceIds.length > 0) {
+      await pool.query(
+        `UPDATE invoices SET customer_id = NULL WHERE id = ANY($1::int[])`,
+        [staleInvoiceIds],
+      );
+    }
+
     const { rows } = await pool.query(
       `SELECT COUNT(*)::int AS cnt FROM invoices WHERE customer_id = $1`,
       [id],
@@ -2538,6 +2578,39 @@ app.put("/invoices/retail/:id", async (req, res) => {
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
+    let customerId = null;
+    if (customer_name?.trim()) {
+      const existingCustomer = await client.query(
+        `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
+        [customer_name.trim()],
+      );
+      if (existingCustomer.rows.length > 0) {
+        customerId = existingCustomer.rows[0].id;
+      } else {
+        const newCustomer = await client.query(
+          `INSERT INTO customers (name, customer_type)
+           VALUES ($1, 'retail')
+           RETURNING id`,
+          [customer_name.trim()],
+        );
+        customerId = newCustomer.rows[0].id;
+      }
+
+      if (customer_phone) {
+        await client.query(
+          `INSERT INTO customer_phones (customer_id, phone)
+           VALUES ($1, $2)
+           ON CONFLICT (phone) DO NOTHING`,
+          [customerId, customer_phone],
+        );
+      }
+
+      await client.query(
+        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
+        [apply_items_discount, customerId],
+      );
+    }
+
     // ===== حل المورد لفواتير الشراء =====
     let supplierId = null;
     if (movement_type === "purchase" && supplier_name) {
@@ -2566,6 +2639,7 @@ app.put("/invoices/retail/:id", async (req, res) => {
       `
     UPDATE invoices
 SET
+  customer_id = $20,
   customer_name = $1,
   customer_phone = $2,
   previous_balance = $3,
@@ -2606,6 +2680,7 @@ WHERE id = $14
         supplier_phone || null,
         invoice_date || null,
         notes || null,
+        customerId,
       ],
     );
 
@@ -2884,15 +2959,26 @@ app.get("/invoices/:id", async (req, res) => {
    تغيير اسم العميل في كل الفواتير
 ================================= */
 app.put("/invoices/rename-customer", authMiddleware, async (req, res) => {
-  const { old_name, new_name } = req.body;
-  if (!old_name?.trim() || !new_name?.trim()) {
-    return res.status(400).json({ error: "يجب تحديد الاسم القديم والجديد" });
+  const { old_name, new_name, customer_id } = req.body;
+  if (!new_name?.trim()) {
+    return res.status(400).json({ error: "يجب تحديد الاسم الجديد" });
+  }
+  if (!customer_id && !old_name?.trim()) {
+    return res.status(400).json({ error: "يجب تحديد الاسم القديم أو رقم العميل" });
   }
   try {
-    const result = await pool.query(
-      `UPDATE invoices SET customer_name = $1 WHERE customer_name = $2`,
-      [new_name.trim(), old_name.trim()],
-    );
+    let result;
+    if (customer_id) {
+      result = await pool.query(
+        `UPDATE invoices SET customer_name = $1 WHERE customer_id = $2`,
+        [new_name.trim(), Number(customer_id)],
+      );
+    } else {
+      result = await pool.query(
+        `UPDATE invoices SET customer_name = $1 WHERE customer_name = $2`,
+        [new_name.trim(), old_name.trim()],
+      );
+    }
     res.json({
       updated: result.rowCount,
       message: `تم تحديث الاسم في ${result.rowCount} فاتورة`,
@@ -3139,6 +3225,39 @@ app.put("/invoices/:id", async (req, res) => {
     const payment_status =
       remaining <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
+    let customerId = null;
+    if (customer_name?.trim()) {
+      const existingCustomer = await client.query(
+        `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
+        [customer_name.trim()],
+      );
+      if (existingCustomer.rows.length > 0) {
+        customerId = existingCustomer.rows[0].id;
+      } else {
+        const newCustomer = await client.query(
+          `INSERT INTO customers (name, customer_type)
+           VALUES ($1, $2)
+           RETURNING id`,
+          [customer_name.trim(), invoice_type],
+        );
+        customerId = newCustomer.rows[0].id;
+      }
+
+      if (customer_phone) {
+        await client.query(
+          `INSERT INTO customer_phones (customer_id, phone)
+           VALUES ($1, $2)
+           ON CONFLICT (phone) DO NOTHING`,
+          [customerId, customer_phone],
+        );
+      }
+
+      await client.query(
+        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
+        [apply_items_discount, customerId],
+      );
+    }
+
     /* ================================
        6️⃣ حل المورد لفواتير الشراء
     ================================= */
@@ -3172,6 +3291,7 @@ app.put("/invoices/:id", async (req, res) => {
       `
  UPDATE invoices
 SET
+  customer_id = $20,
   customer_name = $1,
   customer_phone = $2,
   previous_balance = $3,
@@ -3212,6 +3332,7 @@ WHERE id = $14
         supplier_phone || null,
         invoice_date || null,
         notes || null,
+        customerId,
       ],
     );
 
