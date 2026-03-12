@@ -47,10 +47,6 @@ function getCairoDate() {
 }
 
 const app = express();
-// Public API routes — allow all origins (no auth required)
-app.options(/^\/public\//, cors({ origin: "*", methods: ["GET"] }));
-app.use("/public", cors({ origin: "*", methods: ["GET"], credentials: false }));
-
 app.use(
   cors({
     origin: [
