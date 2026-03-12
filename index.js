@@ -3889,6 +3889,7 @@ app.get("/invoices", async (req, res) => {
       invoice_type,
       movement_type,
       customer_name,
+      customer_id,
       is_return,
       invoice_id,
       date_from,
@@ -3932,6 +3933,11 @@ app.get("/invoices", async (req, res) => {
       );
       values.push(`%${customer_name}%`);
       idx++;
+    }
+
+    if (customer_id) {
+      conditions.push(`customer_id = $${idx++}`);
+      values.push(Number(customer_id));
     }
 
     if (date_from) {
