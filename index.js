@@ -6131,10 +6131,16 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
 ================================ */
 app.get("/cash/out", authMiddleware, async (req, res) => {
   try {
-    const { from_date, to_date, search_name, limit = 50, offset = 0 } = req.query;
+    const {
+      from_date,
+      to_date,
+      search_name,
+      limit = 50,
+      offset = 0,
+    } = req.query;
     const branch_id = req.user.branch_id; // ✅ الفرع من التوكن
 
-    let conditions = [`branch_id = $1`];
+    let conditions = [`co.branch_id = $1`];
     let values = [branch_id];
     let idx = 2;
 
@@ -6144,17 +6150,19 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
     // }
 
     if (from_date) {
-      conditions.push(`transaction_date >= $${idx++}`);
+      conditions.push(`co.transaction_date >= $${idx++}`);
       values.push(from_date);
     }
 
     if (to_date) {
-      conditions.push(`transaction_date <= $${idx++}`);
+      conditions.push(`co.transaction_date <= $${idx++}`);
       values.push(to_date);
     }
 
     if (search_name) {
-      conditions.push(`REPLACE(COALESCE(name, ''), ' ', '') ILIKE $${idx++}`);
+      conditions.push(
+        `REPLACE(COALESCE(co.name, ''), ' ', '') ILIKE $${idx++}`,
+      );
       values.push(`%${String(search_name).replace(/\s+/g, "")}%`);
     }
 
@@ -6176,7 +6184,7 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
         s.name AS supplier_name
       FROM cash_out co
       LEFT JOIN suppliers s ON s.id = co.supplier_id
-      WHERE ${conditions.map((c) => c.replace("branch_id", "co.branch_id").replace("transaction_date", "co.transaction_date")).join(" AND ")}
+      WHERE ${conditions.join(" AND ")}
       ORDER BY co.transaction_date DESC, co.created_at DESC, co.id DESC
       LIMIT $${idx++} OFFSET $${idx++}
       `,
