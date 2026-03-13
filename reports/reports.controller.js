@@ -846,7 +846,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
    - فواتير بيع فقط
    - إجمالي الفاتورة = مجموع بنود الفاتورة بعد خصم كل صنف
    - صافي الربح = (سعر بيع البند بعد الخصم) - (تكلفة الشراء من جدول الأصناف)
-   - المرتجع يُحسب بالسالب
+  - بنود المرتجع لا تخصم من الربح في هذا التقرير
 ================================ */
 exports.getInvoiceSalesProfit = async (req, res) => {
   try {
@@ -909,18 +909,22 @@ exports.getInvoiceSalesProfit = async (req, res) => {
         COALESCE(NULLIF(TRIM(i.customer_name), ''), 'عميل نقدي') AS customer_name,
 
         SUM(
-          (CASE WHEN COALESCE(ii.is_return, false) THEN -1 ELSE 1 END)
-          * COALESCE(ii.total, (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)) * COALESCE(ii.quantity, 0))
+          CASE
+            WHEN COALESCE(ii.is_return, false) THEN 0
+            ELSE COALESCE(ii.total, (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)) * COALESCE(ii.quantity, 0))
+          END
         ) AS items_total_after_discount,
 
         SUM(
-          (CASE WHEN COALESCE(ii.is_return, false) THEN -1 ELSE 1 END)
-          * COALESCE(ii.quantity, 0)
-          * CASE
-              WHEN i.invoice_type = 'retail'
-                THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
-              ELSE COALESCE(p.purchase_price, 0)
-            END
+          CASE
+            WHEN COALESCE(ii.is_return, false) THEN 0
+            ELSE COALESCE(ii.quantity, 0)
+              * CASE
+                  WHEN i.invoice_type = 'retail'
+                    THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
+                  ELSE COALESCE(p.purchase_price, 0)
+                END
+          END
         ) AS total_cost
 
       FROM invoices i
