@@ -884,12 +884,16 @@ exports.getInvoiceSalesProfit = async (req, res) => {
     }
 
     if (date_from) {
-      conditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) >= $${idx++}::date`);
+      conditions.push(
+        `COALESCE(i.invoice_date::date, i.created_at::date) >= $${idx++}::date`,
+      );
       values.push(date_from);
     }
 
     if (date_to) {
-      conditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) <= $${idx++}::date`);
+      conditions.push(
+        `COALESCE(i.invoice_date::date, i.created_at::date) <= $${idx++}::date`,
+      );
       values.push(date_to);
     }
 

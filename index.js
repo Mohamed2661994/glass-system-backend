@@ -1368,9 +1368,10 @@ app.get("/customers/by-phone", async (req, res) => {
 // List all customers with phones
 app.get("/customers", async (req, res) => {
   try {
-    const { search } = req.query;
+    const { search, market_only } = req.query;
     let query = `
       SELECT c.id, c.name, c.apply_items_discount,
+             COALESCE(c.is_market_customer, false) AS is_market_customer,
              COALESCE(
                json_agg(json_build_object('id', cp.id, 'phone', cp.phone))
                FILTER (WHERE cp.id IS NOT NULL), '[]'
@@ -1379,9 +1380,19 @@ app.get("/customers", async (req, res) => {
       LEFT JOIN customer_phones cp ON cp.customer_id = c.id
     `;
     const params = [];
+    const whereClauses = [];
     if (search && search.trim().length >= 2) {
-      query += ` WHERE c.name ILIKE $1 OR c.id::text = $1 OR EXISTS (SELECT 1 FROM customer_phones cp2 WHERE cp2.customer_id = c.id AND cp2.phone ILIKE $1)`;
       params.push(`%${search.trim()}%`);
+      const searchParamIndex = params.length;
+      whereClauses.push(
+        `(c.name ILIKE $${searchParamIndex} OR c.id::text ILIKE $${searchParamIndex} OR EXISTS (SELECT 1 FROM customer_phones cp2 WHERE cp2.customer_id = c.id AND cp2.phone ILIKE $${searchParamIndex}))`,
+      );
+    }
+    if (String(market_only || "") === "1") {
+      whereClauses.push(`COALESCE(c.is_market_customer, false) = true`);
+    }
+    if (whereClauses.length > 0) {
+      query += ` WHERE ${whereClauses.join(" AND ")}`;
     }
     query += ` GROUP BY c.id ORDER BY c.name`;
     const result = await pool.query(query, params);
@@ -1396,13 +1407,32 @@ app.get("/customers", async (req, res) => {
 app.put("/customers/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name } = req.body;
-    if (!name || !name.trim())
-      return res.status(400).json({ error: "الاسم مطلوب" });
-    await pool.query(`UPDATE customers SET name = $1 WHERE id = $2`, [
-      name.trim(),
-      id,
-    ]);
+    const { name, is_market_customer } = req.body;
+    const updates = [];
+    const params = [];
+
+    if (name !== undefined) {
+      if (!String(name).trim()) {
+        return res.status(400).json({ error: "الاسم مطلوب" });
+      }
+      params.push(String(name).trim());
+      updates.push(`name = $${params.length}`);
+    }
+
+    if (typeof is_market_customer === "boolean") {
+      params.push(is_market_customer);
+      updates.push(`is_market_customer = $${params.length}`);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "لا توجد بيانات للتحديث" });
+    }
+
+    params.push(id);
+    await pool.query(
+      `UPDATE customers SET ${updates.join(", ")} WHERE id = $${params.length}`,
+      params,
+    );
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -9251,6 +9281,15 @@ pool
     `
   ALTER TABLE customers
   ADD COLUMN IF NOT EXISTS apply_items_discount BOOLEAN DEFAULT true
+`,
+  )
+  .catch(() => {});
+
+pool
+  .query(
+    `
+  ALTER TABLE customers
+  ADD COLUMN IF NOT EXISTS is_market_customer BOOLEAN DEFAULT false
 `,
   )
   .catch(() => {});
