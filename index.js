@@ -6428,7 +6428,7 @@ async function loadCurrentUserAccess(req) {
 
   const result = await pool.query(
     `
-    SELECT id, username, branch_id, full_name, role, permissions
+    SELECT id, username, branch_id, full_name, role, permissions, theme
     FROM users
     WHERE id = $1
     `,
@@ -6448,6 +6448,7 @@ async function loadCurrentUserAccess(req) {
     full_name: currentUser.full_name || "",
     role: currentUser.role === "admin" ? "admin" : "user",
     permissions: normalizeUserPermissions(currentUser.permissions),
+    theme: currentUser.theme || "system",
   };
 
   return req.user;
@@ -9013,6 +9014,27 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: "Token غير صالح" });
   }
 }
+
+app.get("/auth/me", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await loadCurrentUserAccess(req);
+
+    res.json({
+      user: {
+        id: currentUser.id,
+        username: currentUser.username,
+        branch_id: currentUser.branch_id,
+        full_name: currentUser.full_name || "",
+        role: currentUser.role,
+        permissions: currentUser.permissions,
+        theme: currentUser.theme || "system",
+      },
+    });
+  } catch (err) {
+    console.error("AUTH ME ERROR:", err);
+    res.status(500).json({ error: "فشل تحميل بيانات المستخدم" });
+  }
+});
 
 /* ===============================
    🔔 NOTIFICATIONS - جلب إشعارات الفرع
