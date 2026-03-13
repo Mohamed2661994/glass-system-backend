@@ -1,5 +1,25 @@
 const pool = require("../db");
 
+let ensureInvoiceItemsCostPriceColumnPromise = null;
+
+async function ensureInvoiceItemsCostPriceColumn() {
+  if (!ensureInvoiceItemsCostPriceColumnPromise) {
+    ensureInvoiceItemsCostPriceColumnPromise = pool
+      .query(
+        `
+        ALTER TABLE invoice_items
+        ADD COLUMN IF NOT EXISTS cost_price NUMERIC
+        `,
+      )
+      .catch((error) => {
+        ensureInvoiceItemsCostPriceColumnPromise = null;
+        throw error;
+      });
+  }
+
+  return ensureInvoiceItemsCostPriceColumnPromise;
+}
+
 /* ===============================
    📦 تقرير جرد المخزن الشامل
    وارد + منصرف + رصيد حالي
@@ -850,6 +870,8 @@ exports.getSupplierDebtDetails = async (req, res) => {
 ================================ */
 exports.getInvoiceSalesProfit = async (req, res) => {
   try {
+    await ensureInvoiceItemsCostPriceColumn();
+
     const {
       branch_id,
       invoice_type,
