@@ -1023,6 +1023,26 @@ async function getWholesaleWarehouseByBranch(branch_id, client = pool) {
   return res.rows[0].id;
 }
 
+let ensureCustomersMarketColumnPromise = null;
+
+async function ensureCustomersMarketColumn() {
+  if (!ensureCustomersMarketColumnPromise) {
+    ensureCustomersMarketColumnPromise = pool
+      .query(
+        `
+        ALTER TABLE customers
+        ADD COLUMN IF NOT EXISTS is_market_customer BOOLEAN DEFAULT false
+        `,
+      )
+      .catch((error) => {
+        ensureCustomersMarketColumnPromise = null;
+        throw error;
+      });
+  }
+
+  return ensureCustomersMarketColumnPromise;
+}
+
 app.get("/products", async (req, res) => {
   try {
     const { branch_id, invoice_type, movement_type } = req.query;
@@ -1368,6 +1388,7 @@ app.get("/customers/by-phone", async (req, res) => {
 // List all customers with phones
 app.get("/customers", async (req, res) => {
   try {
+    await ensureCustomersMarketColumn();
     const { search, market_only } = req.query;
     let query = `
       SELECT c.id, c.name, c.apply_items_discount,
@@ -1406,6 +1427,7 @@ app.get("/customers", async (req, res) => {
 // Update customer name
 app.put("/customers/:id", async (req, res) => {
   try {
+    await ensureCustomersMarketColumn();
     const { id } = req.params;
     const { name, is_market_customer } = req.body;
     const updates = [];
