@@ -1105,6 +1105,12 @@ async function ensureSyncSchema() {
     ADD COLUMN IF NOT EXISTS received BOOLEAN DEFAULT FALSE
   `;
 
+  const ensureUsersAccessSql = `
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user',
+      ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'
+  `;
+
   for (const [poolRef, label] of [
     [localPool, "Local"],
     [cloudPool, "Cloud"],
@@ -1115,6 +1121,16 @@ async function ensureSyncSchema() {
     } catch (err) {
       console.error(
         `❌ ${label}: stock_transfer_items.received ensure failed:`,
+        err.message,
+      );
+    }
+
+    try {
+      await poolRef.query(ensureUsersAccessSql);
+      console.log(`✅ ${label}: users access columns ready`);
+    } catch (err) {
+      console.error(
+        `❌ ${label}: users access columns ensure failed:`,
         err.message,
       );
     }

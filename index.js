@@ -6351,12 +6351,18 @@ let ensureUsersAccessControlColumnsPromise = null;
 async function ensureUsersAccessControlColumns() {
   if (!ensureUsersAccessControlColumnsPromise) {
     ensureUsersAccessControlColumnsPromise = (async () => {
-      await pool.query(
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'`,
+      const candidatePools = [pool.localPool, pool.cloudPool, pool].filter(
+        Boolean,
       );
-      await pool.query(
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
-      );
+
+      for (const poolRef of candidatePools) {
+        await poolRef.query(
+          `ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'`,
+        );
+        await poolRef.query(
+          `ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
+        );
+      }
     })().catch((error) => {
       ensureUsersAccessControlColumnsPromise = null;
       throw error;
