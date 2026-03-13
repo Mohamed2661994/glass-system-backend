@@ -1111,6 +1111,24 @@ async function ensureSyncSchema() {
       ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'
   `;
 
+  const ensureUsersRoleConstraintSql = `
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'users'::regclass
+          AND conname = 'users_role_check'
+      ) THEN
+        ALTER TABLE users DROP CONSTRAINT users_role_check;
+      END IF;
+
+      ALTER TABLE users
+      ADD CONSTRAINT users_role_check
+      CHECK (role IS NULL OR role IN ('admin', 'cashier', 'user'));
+    END $$;
+  `;
+
   for (const [poolRef, label] of [
     [localPool, "Local"],
     [cloudPool, "Cloud"],
@@ -1131,6 +1149,16 @@ async function ensureSyncSchema() {
     } catch (err) {
       console.error(
         `❌ ${label}: users access columns ensure failed:`,
+        err.message,
+      );
+    }
+
+    try {
+      await poolRef.query(ensureUsersRoleConstraintSql);
+      console.log(`✅ ${label}: users.role constraint ready`);
+    } catch (err) {
+      console.error(
+        `❌ ${label}: users.role constraint ensure failed:`,
         err.message,
       );
     }

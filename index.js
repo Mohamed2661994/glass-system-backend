@@ -6355,6 +6355,24 @@ async function ensureUsersAccessControlColumns() {
         Boolean,
       );
 
+      const ensureUsersRoleConstraintSql = `
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid = 'users'::regclass
+              AND conname = 'users_role_check'
+          ) THEN
+            ALTER TABLE users DROP CONSTRAINT users_role_check;
+          END IF;
+
+          ALTER TABLE users
+          ADD CONSTRAINT users_role_check
+          CHECK (role IS NULL OR role IN ('admin', 'cashier', 'user'));
+        END $$;
+      `;
+
       for (const poolRef of candidatePools) {
         await poolRef.query(
           `ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'`,
@@ -6362,6 +6380,7 @@ async function ensureUsersAccessControlColumns() {
         await poolRef.query(
           `ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
         );
+        await poolRef.query(ensureUsersRoleConstraintSql);
       }
     })().catch((error) => {
       ensureUsersAccessControlColumnsPromise = null;
