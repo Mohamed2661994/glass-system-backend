@@ -919,11 +919,14 @@ exports.getInvoiceSalesProfit = async (req, res) => {
           CASE
             WHEN COALESCE(ii.is_return, false) THEN 0
             ELSE COALESCE(ii.quantity, 0)
-              * CASE
-                  WHEN i.invoice_type = 'retail'
-                    THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
-                  ELSE COALESCE(p.purchase_price, 0)
-                END
+              * COALESCE(
+                  ii.cost_price,
+                  CASE
+                    WHEN i.invoice_type = 'retail'
+                      THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
+                    ELSE COALESCE(p.purchase_price, 0)
+                  END
+                )
           END
         ) AS total_cost
 

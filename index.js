@@ -817,6 +817,13 @@ pool
     console.error("❌ invoice_items.is_return column error:", e.message),
   );
 
+pool
+  .query(`ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS cost_price NUMERIC`)
+  .then(() => console.log("✅ invoice_items.cost_price column ready"))
+  .catch((e) =>
+    console.error("❌ invoice_items.cost_price column error:", e.message),
+  );
+
 // 📦 migrations لـ variant_id (متسلسلة عشان الـ constraint يشتغل بعد الأعمدة)
 (async () => {
   try {
@@ -1041,6 +1048,86 @@ async function ensureCustomersMarketColumn() {
   }
 
   return ensureCustomersMarketColumnPromise;
+}
+
+async function getInvoiceItemCostSnapshot(
+  productId,
+  variantId,
+  invoiceType,
+  client = pool,
+) {
+  const resolvedVariantId = Number(variantId) || 0;
+  const result = await client.query(
+    `
+    SELECT
+      p.purchase_price,
+      p.retail_purchase_price,
+      pv.purchase_price AS variant_purchase_price,
+      pv.retail_purchase_price AS variant_retail_purchase_price
+    FROM products p
+    LEFT JOIN product_variants pv
+      ON pv.id = $2 AND pv.product_id = p.id
+    WHERE p.id = $1
+    LIMIT 1
+    `,
+    [productId, resolvedVariantId],
+  );
+
+  if (!result.rows.length) return 0;
+
+  const row = result.rows[0];
+  const productPurchasePrice = Number(row.purchase_price || 0);
+  const productRetailPurchasePrice = Number(row.retail_purchase_price || 0);
+  const variantPurchasePrice = Number(row.variant_purchase_price || 0);
+  const variantRetailPurchasePrice = Number(
+    row.variant_retail_purchase_price || 0,
+  );
+
+  if (invoiceType === "retail") {
+    return (
+      variantRetailPurchasePrice ||
+      productRetailPurchasePrice ||
+      variantPurchasePrice ||
+      productPurchasePrice
+    );
+  }
+
+  return (
+    variantPurchasePrice ||
+    productPurchasePrice ||
+    variantRetailPurchasePrice ||
+    productRetailPurchasePrice
+  );
+}
+
+async function normalizeInvoiceItemsForStorage(items, invoiceType, client = pool) {
+  const normalizedItems = [];
+
+  for (const item of items) {
+    const quantity = Number(item.quantity || 0);
+    const price = Number(item.price || 0);
+    const discount = Number(item.discount || 0);
+    const variantId = Number(item.variant_id || 0);
+
+    normalizedItems.push({
+      ...item,
+      package: item.package || "",
+      quantity,
+      price,
+      discount,
+      variant_id: variantId,
+      itemIsReturn: Boolean(item.is_return),
+      itemTotal: price * quantity - discount * quantity,
+      costPrice: await getInvoiceItemCostSnapshot(
+        item.product_id,
+        variantId,
+        invoiceType,
+        client,
+      ),
+    });
+  }
+
+  return normalizedItems;
 }
 
 app.get("/products", async (req, res) => {
@@ -1995,22 +2082,24 @@ VALUES
 
     /* ================== المخزن ================== */
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
+    const normalizedItems = await normalizeInvoiceItemsForStorage(
+      items,
+      invoice_type,
+      client,
+    );
 
     // 🚀 Batch INSERT for invoice_items
-    if (items.length > 0) {
+    if (normalizedItems.length > 0) {
       const itemValues = [];
       const itemParams = [];
       let paramIdx = 1;
 
-      for (const item of items) {
-        const itemTotal =
-          item.price * item.quantity - (item.discount || 0) * item.quantity;
+      for (const item of normalizedItems) {
         const packageText = item.package || "";
         const variantId = item.variant_id || 0;
-        const itemIsReturn = item.is_return || false;
 
         itemValues.push(
-          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`,
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`,
         );
         itemParams.push(
           invoiceId,
@@ -2019,25 +2108,26 @@ VALUES
           packageText,
           item.price,
           item.quantity,
-          item.discount || 0,
-          itemTotal,
+          item.discount,
+          item.itemTotal,
           variantId,
-          itemIsReturn,
+          item.itemIsReturn,
+          item.costPrice,
         );
       }
 
       await client.query(
         `INSERT INTO invoice_items
-          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
+          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return, cost_price)
          VALUES ${itemValues.join(",")}`,
         itemParams,
       );
     }
 
     // Stock updates per item (need conditional logic)
-    for (const item of items) {
+    for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
-      const itemIsReturn = item.is_return || false;
+      const itemIsReturn = item.itemIsReturn;
 
       /* ===== تحديث المخزن ===== */
       if (movement_type === "purchase") {
@@ -2376,22 +2466,24 @@ app.post("/invoices/retail", async (req, res) => {
     // ✅ تسجيل العميل تلقائي لو فيه رقم
 
     const warehouseId = getWarehouseIdByInvoiceType("retail");
+    const normalizedItems = await normalizeInvoiceItemsForStorage(
+      items,
+      "retail",
+      client,
+    );
 
     /* ================== الأصناف + المخزن ================== */
     // 🚀 Batch INSERT for invoice_items
-    if (items.length > 0) {
+    if (normalizedItems.length > 0) {
       const itemValues = [];
       const itemParams = [];
       let paramIdx = 1;
 
-      for (const item of items) {
-        const itemTotal =
-          item.price * item.quantity - (item.discount || 0) * item.quantity;
+      for (const item of normalizedItems) {
         const variantId = item.variant_id || 0;
-        const itemIsReturn = item.is_return || false;
 
         itemValues.push(
-          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`,
+          `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`,
         );
         itemParams.push(
           invoiceId,
@@ -2400,25 +2492,26 @@ app.post("/invoices/retail", async (req, res) => {
           item.package || "",
           item.price,
           item.quantity,
-          item.discount || 0,
-          itemTotal,
+          item.discount,
+          item.itemTotal,
           variantId,
-          itemIsReturn,
+          item.itemIsReturn,
+          item.costPrice,
         );
       }
 
       await client.query(
         `INSERT INTO invoice_items
-          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return)
+          (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return, cost_price)
          VALUES ${itemValues.join(",")}`,
         itemParams,
       );
     }
 
     // Stock updates per item
-    for (const item of items) {
+    for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
-      const itemIsReturn = item.is_return || false;
+      const itemIsReturn = item.itemIsReturn;
 
       if (movement_type === "sale") {
         if (itemIsReturn) {
@@ -2608,6 +2701,12 @@ app.put("/invoices/retail/:id", async (req, res) => {
       throw new Error("بيانات غير مكتملة");
     }
 
+    const normalizedItems = await normalizeInvoiceItemsForStorage(
+      items,
+      "retail",
+      client,
+    );
+
     const prevBalance =
       bodyPrevBalance !== undefined
         ? Number(bodyPrevBalance)
@@ -2616,11 +2715,9 @@ app.put("/invoices/retail/:id", async (req, res) => {
     /* ================================
        4️⃣ إضافة الأصناف الجديدة
     ================================= */
-    for (const item of items) {
-      const itemTotal =
-        item.price * item.quantity - (item.discount || 0) * item.quantity;
+    for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
-      const itemIsReturn = item.is_return || false;
+      const itemIsReturn = item.itemIsReturn;
 
       await client.query(
         `
@@ -2635,9 +2732,10 @@ app.put("/invoices/retail/:id", async (req, res) => {
           discount,
           total,
           variant_id,
-          is_return
+          is_return,
+          cost_price
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         `,
         [
           invoiceId,
@@ -2646,10 +2744,11 @@ app.put("/invoices/retail/:id", async (req, res) => {
           item.package,
           item.price,
           item.quantity,
-          item.discount || 0,
-          itemTotal,
+          item.discount,
+          item.itemTotal,
           variantId,
           itemIsReturn,
+          item.costPrice,
         ],
       );
 
@@ -3189,6 +3288,12 @@ app.put("/invoices/:id", async (req, res) => {
       throw new Error("لا يوجد أصناف في الفاتورة");
     }
 
+    const normalizedItems = await normalizeInvoiceItemsForStorage(
+      items,
+      invoice_type,
+      client,
+    );
+
     /* =========================================
        1️⃣ رجّع المخزن (الأصناف القديمة)
     ========================================= */
@@ -3253,11 +3358,9 @@ app.put("/invoices/:id", async (req, res) => {
     /* =========================================
        4️⃣ إدخال الأصناف الجديدة وتحديث المخزن
     ========================================= */
-    for (const item of items) {
-      const itemTotal =
-        item.price * item.quantity - (item.discount || 0) * item.quantity;
+    for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
-      const itemIsReturn = item.is_return || false;
+      const itemIsReturn = item.itemIsReturn;
 
       // ➕ invoice_items
       await client.query(
@@ -3273,9 +3376,10 @@ app.put("/invoices/:id", async (req, res) => {
           discount,
           total,
           variant_id,
-          is_return
+          is_return,
+          cost_price
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         `,
         [
           invoiceId,
@@ -3284,10 +3388,11 @@ app.put("/invoices/:id", async (req, res) => {
           item.package,
           item.price,
           item.quantity,
-          item.discount || 0,
-          itemTotal,
+          item.discount,
+          item.itemTotal,
           variantId,
           itemIsReturn,
+          item.costPrice,
         ],
       );
 
