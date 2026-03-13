@@ -3066,6 +3066,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
       FROM invoice_items ii
       JOIN products p ON p.id = ii.product_id
       WHERE ii.invoice_id = $1
+      ORDER BY ii.id
       `,
       [id],
     );
