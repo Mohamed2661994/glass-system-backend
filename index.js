@@ -818,7 +818,9 @@ pool
   );
 
 pool
-  .query(`ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS cost_price NUMERIC`)
+  .query(
+    `ALTER TABLE invoice_items ADD COLUMN IF NOT EXISTS cost_price NUMERIC`,
+  )
   .then(() => console.log("✅ invoice_items.cost_price column ready"))
   .catch((e) =>
     console.error("❌ invoice_items.cost_price column error:", e.message),
@@ -1100,7 +1102,11 @@ async function getInvoiceItemCostSnapshot(
   );
 }
 
-async function normalizeInvoiceItemsForStorage(items, invoiceType, client = pool) {
+async function normalizeInvoiceItemsForStorage(
+  items,
+  invoiceType,
+  client = pool,
+) {
   const normalizedItems = [];
 
   for (const item of items) {
@@ -4554,7 +4560,13 @@ app.get("/dashboard/stats", async (req, res) => {
     const warehouseId = invoice_type === "retail" ? 1 : 2;
 
     // Run queries in parallel
-    const [salesToday, cashToday, lowStockCount, negativeStockCount] =
+    const [
+      salesToday,
+      cashToday,
+      lowStockCount,
+      negativeStockCount,
+      todayProfitSummary,
+    ] =
       await Promise.all([
         // Today's sales total
         pool.query(
@@ -4595,7 +4607,45 @@ app.get("/dashboard/stats", async (req, res) => {
           ) neg`,
           [warehouseId],
         ),
+        // Today's profit percentage using the same logic as the invoice profit report
+        pool.query(
+          `SELECT
+             COALESCE(SUM(
+               CASE
+                 WHEN COALESCE(ii.is_return, false) THEN 0
+                 ELSE COALESCE(ii.total, (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)) * COALESCE(ii.quantity, 0))
+               END
+             ), 0) AS sales_total,
+             COALESCE(SUM(
+               CASE
+                 WHEN COALESCE(ii.is_return, false) THEN 0
+                 ELSE COALESCE(ii.quantity, 0)
+                   * COALESCE(
+                       ii.cost_price,
+                       CASE
+                         WHEN i.invoice_type = 'retail'
+                           THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
+                         ELSE COALESCE(p.purchase_price, 0)
+                       END
+                     )
+               END
+             ), 0) AS total_cost
+           FROM invoices i
+           JOIN invoice_items ii ON ii.invoice_id = i.id
+           JOIN products p ON p.id = ii.product_id
+           WHERE i.invoice_type = $1
+             AND i.movement_type = 'sale'
+             AND i.is_void IS NOT TRUE
+             AND COALESCE(i.invoice_date::date, i.created_at::date) = CURRENT_DATE`,
+          [invoice_type],
+        ),
       ]);
+
+    const todaySalesTotal = Number(todayProfitSummary.rows[0].sales_total || 0);
+    const todayTotalCost = Number(todayProfitSummary.rows[0].total_cost || 0);
+    const todayNetProfit = todaySalesTotal - todayTotalCost;
+    const todayProfitPercentage =
+      todaySalesTotal > 0 ? (todayNetProfit / todaySalesTotal) * 100 : 0;
 
     const statsResult = {
       today_sales: Number(salesToday.rows[0].total_sales),
@@ -4603,6 +4653,7 @@ app.get("/dashboard/stats", async (req, res) => {
       today_cash: Number(cashToday.rows[0].total_cash),
       low_stock_count: Number(lowStockCount.rows[0].count),
       negative_stock_count: Number(negativeStockCount.rows[0].count),
+      today_profit_percentage: todayProfitPercentage,
     };
     _cache.set(cacheKey, { data: statsResult, ts: Date.now() });
     res.json(statsResult);
