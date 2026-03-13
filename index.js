@@ -2623,11 +2623,14 @@ app.post("/invoices/retail", async (req, res) => {
   }
 });
 
-app.put("/invoices/retail/:id", async (req, res) => {
+app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
   const client = await pool.connect();
   const invoiceId = Number(req.params.id);
 
   try {
+    const currentUser = await requirePermission(req, res, "invoice_edit");
+    if (!currentUser) return;
+
     await client.query("BEGIN");
 
     /* ================================
@@ -3249,11 +3252,14 @@ app.put("/invoices/rename-customer", authMiddleware, async (req, res) => {
   }
 });
 
-app.put("/invoices/:id", async (req, res) => {
+app.put("/invoices/:id", authMiddleware, async (req, res) => {
   const client = await pool.connect();
   const invoiceId = Number(req.params.id);
 
   try {
+    const currentUser = await requirePermission(req, res, "invoice_edit");
+    if (!currentUser) return;
+
     await client.query("BEGIN");
 
     /* ================================
@@ -4674,11 +4680,14 @@ app.get("/dashboard/stats", async (req, res) => {
   }
 });
 
-app.delete("/invoices/:id", async (req, res) => {
+app.delete("/invoices/:id", authMiddleware, async (req, res) => {
   const client = await pool.connect();
   const invoiceId = Number(req.params.id);
 
   try {
+    const currentUser = await requirePermission(req, res, "invoice_delete");
+    if (!currentUser) return;
+
     await client.query("BEGIN");
 
     // 0️⃣ مسح قيد اليومية المرتبط بالفاتورة (لو موجود)
@@ -6319,6 +6328,8 @@ const ACCESS_PERMISSION_KEYS = [
   "cash_in_delete",
   "cash_out_edit",
   "cash_out_delete",
+  "invoice_edit",
+  "invoice_delete",
 ];
 
 function normalizeUserPermissions(rawPermissions) {
