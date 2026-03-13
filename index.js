@@ -781,6 +781,18 @@ pool
   .then(() => console.log("✅ users.full_name column ready"))
   .catch((e) => console.error("❌ users.full_name column error:", e.message));
 
+pool
+  .query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'`)
+  .then(() => console.log("✅ users.role column ready"))
+  .catch((e) => console.error("❌ users.role column error:", e.message));
+
+pool
+  .query(
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
+  )
+  .then(() => console.log("✅ users.permissions column ready"))
+  .catch((e) => console.error("❌ users.permissions column error:", e.message));
+
 // إضافة عمود has_wholesale للأصناف
 pool
   .query(
@@ -4566,38 +4578,37 @@ app.get("/dashboard/stats", async (req, res) => {
       lowStockCount,
       negativeStockCount,
       todayProfitSummary,
-    ] =
-      await Promise.all([
-        // Today's sales total
-        pool.query(
-          `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
+    ] = await Promise.all([
+      // Today's sales total
+      pool.query(
+        `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
          FROM invoices
          WHERE invoice_type = $1
            AND movement_type = 'sale'
            AND is_return = false
            AND created_at >= CURRENT_DATE
            AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-          [invoice_type],
-        ),
-        // Today's cash collected
-        pool.query(
-          `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
+        [invoice_type],
+      ),
+      // Today's cash collected
+      pool.query(
+        `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
          FROM invoices
          WHERE invoice_type = $1
            AND created_at >= CURRENT_DATE
            AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-          [invoice_type],
-        ),
-        // Low stock count (quantity <= 5)
-        pool.query(
-          `SELECT COUNT(DISTINCT product_id) AS count
+        [invoice_type],
+      ),
+      // Low stock count (quantity <= 5)
+      pool.query(
+        `SELECT COUNT(DISTINCT product_id) AS count
          FROM stock
          WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
-          [warehouseId],
-        ),
-        // Negative stock count — calculated from stock_movements
-        pool.query(
-          `SELECT COUNT(*) AS count FROM (
+        [warehouseId],
+      ),
+      // Negative stock count — calculated from stock_movements
+      pool.query(
+        `SELECT COUNT(*) AS count FROM (
             SELECT sm.product_id
             FROM stock_movements sm
             JOIN products p ON p.id = sm.product_id
@@ -4605,11 +4616,11 @@ app.get("/dashboard/stats", async (req, res) => {
             GROUP BY sm.product_id, sm.variant_id
             HAVING SUM(sm.quantity) < 0
           ) neg`,
-          [warehouseId],
-        ),
-        // Today's profit percentage using the same logic as the invoice profit report
-        pool.query(
-          `SELECT
+        [warehouseId],
+      ),
+      // Today's profit percentage using the same logic as the invoice profit report
+      pool.query(
+        `SELECT
              COALESCE(SUM(
                CASE
                  WHEN COALESCE(ii.is_return, false) THEN 0
@@ -4637,9 +4648,9 @@ app.get("/dashboard/stats", async (req, res) => {
              AND i.movement_type = 'sale'
              AND i.is_void IS NOT TRUE
              AND COALESCE(i.invoice_date::date, i.created_at::date) = CURRENT_DATE`,
-          [invoice_type],
-        ),
-      ]);
+        [invoice_type],
+      ),
+    ]);
 
     const todaySalesTotal = Number(todayProfitSummary.rows[0].sales_total || 0);
     const todayTotalCost = Number(todayProfitSummary.rows[0].total_cost || 0);
@@ -6303,6 +6314,153 @@ app.post("/stock/replace", async (req, res) => {
   }
 });
 
+const ACCESS_PERMISSION_KEYS = [
+  "cash_in_edit",
+  "cash_in_delete",
+  "cash_out_edit",
+  "cash_out_delete",
+];
+
+function normalizeUserPermissions(rawPermissions) {
+  let parsedPermissions = rawPermissions;
+
+  if (typeof parsedPermissions === "string") {
+    try {
+      parsedPermissions = JSON.parse(parsedPermissions);
+    } catch {
+      parsedPermissions = {};
+    }
+  }
+
+  if (
+    !parsedPermissions ||
+    typeof parsedPermissions !== "object" ||
+    Array.isArray(parsedPermissions)
+  ) {
+    parsedPermissions = {};
+  }
+
+  return ACCESS_PERMISSION_KEYS.reduce((acc, key) => {
+    acc[key] = Boolean(parsedPermissions[key]);
+    return acc;
+  }, {});
+}
+
+let ensureUsersAccessControlColumnsPromise = null;
+
+async function ensureUsersAccessControlColumns() {
+  if (!ensureUsersAccessControlColumnsPromise) {
+    ensureUsersAccessControlColumnsPromise = (async () => {
+      await pool.query(
+        `ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'`,
+      );
+      await pool.query(
+        `ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
+      );
+    })().catch((error) => {
+      ensureUsersAccessControlColumnsPromise = null;
+      throw error;
+    });
+  }
+
+  return ensureUsersAccessControlColumnsPromise;
+}
+
+function createAccessError(message, statusCode = 500) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function isSuperAdmin(user) {
+  return Number(user?.id) === 7;
+}
+
+function isAdminUser(user) {
+  return isSuperAdmin(user) || user?.role === "admin";
+}
+
+function canManageBranch(user, branchId) {
+  return (
+    isSuperAdmin(user) ||
+    (user?.role === "admin" && Number(user?.branch_id) === Number(branchId))
+  );
+}
+
+async function loadCurrentUserAccess(req) {
+  await ensureUsersAccessControlColumns();
+
+  const result = await pool.query(
+    `
+    SELECT id, username, branch_id, full_name, role, permissions
+    FROM users
+    WHERE id = $1
+    `,
+    [req.user.id],
+  );
+
+  if (!result.rows.length) {
+    throw createAccessError("المستخدم غير موجود", 401);
+  }
+
+  const currentUser = result.rows[0];
+  req.user = {
+    ...req.user,
+    id: currentUser.id,
+    username: currentUser.username,
+    branch_id: currentUser.branch_id,
+    full_name: currentUser.full_name || "",
+    role: currentUser.role === "admin" ? "admin" : "user",
+    permissions: normalizeUserPermissions(currentUser.permissions),
+  };
+
+  return req.user;
+}
+
+function sendAccessError(res, err, fallbackMessage) {
+  const statusCode = err?.statusCode || 500;
+  return res.status(statusCode).json({
+    error: statusCode === 401 ? err.message : fallbackMessage,
+  });
+}
+
+async function requireAdminUser(req, res) {
+  try {
+    const currentUser = await loadCurrentUserAccess(req);
+
+    if (!isAdminUser(currentUser)) {
+      res.status(403).json({ error: "غير مصرح" });
+      return null;
+    }
+
+    return currentUser;
+  } catch (err) {
+    console.error("ADMIN ACCESS ERROR:", err);
+    sendAccessError(res, err, "خطأ في التحقق من صلاحيات المستخدم");
+    return null;
+  }
+}
+
+async function requirePermission(req, res, permissionKey) {
+  try {
+    const currentUser = await loadCurrentUserAccess(req);
+
+    if (
+      isAdminUser(currentUser) ||
+      currentUser.permissions?.[permissionKey] === true
+    ) {
+      return currentUser;
+    }
+
+    res.status(403).json({ error: "ليس لديك صلاحية تنفيذ هذا الإجراء" });
+    return null;
+  } catch (err) {
+    console.error("PERMISSION CHECK ERROR:", err);
+    sendAccessError(res, err, "خطأ في التحقق من الصلاحيات");
+    return null;
+  }
+}
+
 /* ===============================
    💸 CASH OUT - إضافة إذن صرف
 ================================ */
@@ -6374,7 +6532,10 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
 ================================ */
 app.put("/cash/out/:id", authMiddleware, async (req, res) => {
   try {
-    const branch_id = req.user.branch_id;
+    const currentUser = await requirePermission(req, res, "cash_out_edit");
+    if (!currentUser) return;
+
+    const branch_id = currentUser.branch_id;
     const { id } = req.params;
     const { name, amount, notes, date, entry_type, supplier_id } = req.body;
     const safeEntryType =
@@ -6535,7 +6696,10 @@ app.get("/cash/out/:id", authMiddleware, async (req, res) => {
 
 app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
   try {
-    const branch_id = req.user.branch_id;
+    const currentUser = await requirePermission(req, res, "cash_out_delete");
+    if (!currentUser) return;
+
+    const branch_id = currentUser.branch_id;
     const { id } = req.params;
 
     const result = await pool.query(
@@ -6857,7 +7021,10 @@ app.get("/cash-in", authMiddleware, async (req, res) => {
 });
 app.delete("/cash-in/:id", authMiddleware, async (req, res) => {
   const { id } = req.params;
-  const branch_id = req.user.branch_id;
+  const currentUser = await requirePermission(req, res, "cash_in_delete");
+  if (!currentUser) return;
+
+  const branch_id = currentUser.branch_id;
   const client = await pool.connect();
 
   try {
@@ -6895,7 +7062,10 @@ app.delete("/cash-in/:id", authMiddleware, async (req, res) => {
 app.put("/cash-in/:id", authMiddleware, async (req, res) => {
   const { id } = req.params;
   const { customer_name, description, amount, transaction_date } = req.body;
-  const branch_id = req.user.branch_id;
+  const currentUser = await requirePermission(req, res, "cash_in_edit");
+  if (!currentUser) return;
+
+  const branch_id = currentUser.branch_id;
   const client = await pool.connect();
 
   try {
@@ -8158,7 +8328,11 @@ const bcrypt = require("bcrypt");
 
 app.post("/users", authMiddleware, async (req, res) => {
   try {
-    const { username, password, branch_id, full_name } = req.body;
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
+    const { username, password, branch_id, full_name, role, permissions } =
+      req.body;
 
     if (!username || !password || !branch_id) {
       return res.status(400).json({ error: "بيانات ناقصة" });
@@ -8169,11 +8343,28 @@ app.post("/users", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "branch_id غير صالح" });
     }
 
+    if (!canManageBranch(currentUser, branchIdNum)) {
+      return res.status(403).json({ error: "غير مصرح بإدارة هذا الفرع" });
+    }
+
+    const safeRole = role === "admin" ? "admin" : "user";
+    const safePermissions = normalizeUserPermissions(permissions);
+
     const hashedPassword = await bcrypt.hash(password, 10);
 
     await pool.query(
-      "INSERT INTO users (username, password, branch_id, full_name) VALUES ($1,$2,$3,$4)",
-      [username, hashedPassword, branchIdNum, full_name || ""],
+      `
+      INSERT INTO users (username, password, branch_id, full_name, role, permissions)
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+      `,
+      [
+        username,
+        hashedPassword,
+        branchIdNum,
+        full_name || "",
+        safeRole,
+        JSON.stringify(safePermissions),
+      ],
     );
 
     res.json({ success: true });
@@ -8243,10 +8434,34 @@ app.put("/user/preferences", authMiddleware, async (req, res) => {
 
 app.get("/users", authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT id, username, branch_id, full_name FROM users ORDER BY id DESC",
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
+    const result = isSuperAdmin(currentUser)
+      ? await pool.query(
+          `
+          SELECT id, username, branch_id, full_name, role, permissions
+          FROM users
+          ORDER BY id DESC
+          `,
+        )
+      : await pool.query(
+          `
+          SELECT id, username, branch_id, full_name, role, permissions
+          FROM users
+          WHERE branch_id = $1
+          ORDER BY id DESC
+          `,
+          [currentUser.branch_id],
+        );
+
+    res.json(
+      result.rows.map((row) => ({
+        ...row,
+        role: row.role === "admin" ? "admin" : "user",
+        permissions: normalizeUserPermissions(row.permissions),
+      })),
     );
-    res.json(result.rows);
   } catch (err) {
     console.error("GET USERS ERROR:", err);
     res.status(500).json({ error: "فشل تحميل المستخدمين" });
@@ -8258,11 +8473,31 @@ app.get("/users", authMiddleware, async (req, res) => {
 ========================= */
 app.delete("/users/:id", authMiddleware, async (req, res) => {
   try {
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
     const userId = Number(req.params.id);
 
     // لا يمكن حذف نفسك
-    if (userId === req.user.id) {
+    if (userId === currentUser.id) {
       return res.status(400).json({ error: "لا يمكنك حذف حسابك الحالي" });
+    }
+
+    const targetUser = await pool.query(
+      `SELECT id, branch_id FROM users WHERE id = $1`,
+      [userId],
+    );
+
+    if (!targetUser.rows.length) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    if (userId === 7 && !isSuperAdmin(currentUser)) {
+      return res.status(403).json({ error: "غير مصرح بحذف هذا المستخدم" });
+    }
+
+    if (!canManageBranch(currentUser, targetUser.rows[0].branch_id)) {
+      return res.status(403).json({ error: "غير مصرح بإدارة هذا المستخدم" });
     }
 
     const result = await pool.query(
@@ -8330,6 +8565,9 @@ app.put("/users/:id/password", authMiddleware, async (req, res) => {
 /* ========================= reset another user password ========================= */
 app.put("/users/:id/reset-password", authMiddleware, async (req, res) => {
   try {
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
     const userId = Number(req.params.id);
     const { new_password } = req.body;
 
@@ -8343,11 +8581,20 @@ app.put("/users/:id/reset-password", authMiddleware, async (req, res) => {
         .json({ error: "كلمة المرور يجب أن تكون 4 أحرف على الأقل" });
     }
 
-    const userResult = await pool.query("SELECT id FROM users WHERE id = $1", [
-      userId,
-    ]);
+    const userResult = await pool.query(
+      "SELECT id, branch_id FROM users WHERE id = $1",
+      [userId],
+    );
     if (!userResult.rows.length) {
       return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    if (userId === 7 && !isSuperAdmin(currentUser)) {
+      return res.status(403).json({ error: "غير مصرح بإدارة هذا المستخدم" });
+    }
+
+    if (!canManageBranch(currentUser, userResult.rows[0].branch_id)) {
+      return res.status(403).json({ error: "غير مصرح بإدارة هذا المستخدم" });
     }
 
     const hashedPassword = await bcrypt.hash(new_password, 10);
@@ -8360,6 +8607,81 @@ app.put("/users/:id/reset-password", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("RESET PASSWORD ERROR:", err);
     res.status(500).json({ error: "فشل إعادة تعيين كلمة المرور" });
+  }
+});
+
+app.put("/users/:id/access", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
+    const userId = Number(req.params.id);
+    const { full_name, branch_id, role, permissions } = req.body;
+
+    if (userId === currentUser.id) {
+      return res
+        .status(400)
+        .json({ error: "لا يمكنك تعديل صلاحيات حسابك الحالي" });
+    }
+
+    const branchIdNum = Number(branch_id);
+    if (isNaN(branchIdNum) || branchIdNum <= 0) {
+      return res.status(400).json({ error: "branch_id غير صالح" });
+    }
+
+    const targetUser = await pool.query(
+      `SELECT id, branch_id FROM users WHERE id = $1`,
+      [userId],
+    );
+
+    if (!targetUser.rows.length) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    if (userId === 7 && !isSuperAdmin(currentUser)) {
+      return res.status(403).json({ error: "غير مصرح بإدارة هذا المستخدم" });
+    }
+
+    if (
+      !canManageBranch(currentUser, targetUser.rows[0].branch_id) ||
+      !canManageBranch(currentUser, branchIdNum)
+    ) {
+      return res.status(403).json({ error: "غير مصرح بإدارة هذا الفرع" });
+    }
+
+    const safeRole = role === "admin" ? "admin" : "user";
+    const safePermissions = normalizeUserPermissions(permissions);
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET full_name = $1,
+          branch_id = $2,
+          role = $3,
+          permissions = $4::jsonb
+      WHERE id = $5
+      RETURNING id, username, branch_id, full_name, role, permissions
+      `,
+      [
+        (full_name || "").trim(),
+        branchIdNum,
+        safeRole,
+        JSON.stringify(safePermissions),
+        userId,
+      ],
+    );
+
+    res.json({
+      success: true,
+      user: {
+        ...result.rows[0],
+        role: result.rows[0].role === "admin" ? "admin" : "user",
+        permissions: normalizeUserPermissions(result.rows[0].permissions),
+      },
+    });
+  } catch (err) {
+    console.error("UPDATE USER ACCESS ERROR:", err);
+    res.status(500).json({ error: "فشل تحديث بيانات المستخدم" });
   }
 });
 
@@ -8538,6 +8860,8 @@ const jwt = require("jsonwebtoken");
 
 app.post("/login", async (req, res) => {
   try {
+    await ensureUsersAccessControlColumns();
+
     const { username, password } = req.body;
 
     const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [
@@ -8549,6 +8873,8 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+    const role = user.role === "admin" ? "admin" : "user";
+    const permissions = normalizeUserPermissions(user.permissions);
 
     const isMatch = await bcrypt.compare(password, user.password);
 
@@ -8561,6 +8887,8 @@ app.post("/login", async (req, res) => {
         id: user.id,
         branch_id: user.branch_id,
         username: user.username,
+        role,
+        permissions,
       },
       process.env.JWT_SECRET,
       { expiresIn: "7d" },
@@ -8574,6 +8902,8 @@ app.post("/login", async (req, res) => {
         branch_id: user.branch_id,
         theme: user.theme,
         full_name: user.full_name || "",
+        role,
+        permissions,
       },
     });
 
