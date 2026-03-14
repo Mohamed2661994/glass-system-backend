@@ -443,6 +443,166 @@ app.post("/admin/backup", (req, res) => {
   });
 });
 
+function roundMoney(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) {
+    return 0;
+  }
+
+  return Math.round(amount * 100) / 100;
+}
+
+function formatInvoiceCashMetadataValue(value) {
+  return roundMoney(value).toFixed(2).replace(/\.00$/, "").replace(/(\.\d*[1-9])0$/, "$1");
+}
+
+function extractInvoiceIdFromCashDescription(description) {
+  const match = String(description || "").match(/#\s*(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function buildInvoiceCashDescription(
+  invoiceType,
+  invoiceId,
+  totalAmount,
+  paidAmount,
+  remainingAmount,
+) {
+  const label = invoiceType === "retail" ? "فاتورة قطاعي رقم #" : "فاتورة جملة رقم #";
+  return `${label}${invoiceId}{{${formatInvoiceCashMetadataValue(totalAmount)}|${formatInvoiceCashMetadataValue(paidAmount)}|${formatInvoiceCashMetadataValue(remainingAmount)}}}`;
+}
+
+async function syncInvoiceCashEntry(
+  client,
+  {
+    invoiceId,
+    branchId,
+    invoiceType,
+    customerId = null,
+    customerName,
+    totalAmount,
+    paidAmount,
+    remainingAmount,
+    transactionDate,
+  },
+) {
+  const normalizedInvoiceId = Number(invoiceId);
+  const normalizedBranchId = Number(branchId);
+  const normalizedTotalAmount = roundMoney(totalAmount);
+  const normalizedPaidAmount = roundMoney(paidAmount);
+  const normalizedRemainingAmount = roundMoney(remainingAmount);
+  const normalizedCustomerName = customerName?.trim() || "عميل نقدي";
+  const description = buildInvoiceCashDescription(
+    invoiceType,
+    normalizedInvoiceId,
+    normalizedTotalAmount,
+    normalizedPaidAmount,
+    normalizedRemainingAmount,
+  );
+
+  const cashRowsRes = await client.query(
+    `
+    SELECT id, invoice_id, description
+    FROM cash_in
+    WHERE source_type = 'invoice'
+      AND branch_id = $2
+      AND (invoice_id = $1 OR invoice_id IS NULL)
+    ORDER BY CASE WHEN invoice_id = $1 THEN 0 ELSE 1 END, id ASC
+    `,
+    [normalizedInvoiceId, normalizedBranchId],
+  );
+
+  const matchingRows = cashRowsRes.rows.filter((row) => {
+    if (Number(row.invoice_id) === normalizedInvoiceId) {
+      return true;
+    }
+
+    return (
+      row.invoice_id == null &&
+      extractInvoiceIdFromCashDescription(row.description) === normalizedInvoiceId
+    );
+  });
+
+  if (!matchingRows.length && normalizedPaidAmount <= 0) {
+    return { action: "skipped", duplicateIds: [] };
+  }
+
+  if (matchingRows.length) {
+    const primaryRow = matchingRows[0];
+    const duplicateIds = matchingRows.slice(1).map((row) => Number(row.id));
+
+    await client.query(
+      `
+      UPDATE cash_in
+      SET
+        branch_id = $1,
+        invoice_id = $2,
+        customer_id = $3,
+        customer_name = $4,
+        amount = $5,
+        paid_amount = $6,
+        remaining_amount = $7,
+        description = $8,
+        transaction_date = COALESCE($9::date, transaction_date)
+      WHERE id = $10
+      `,
+      [
+        normalizedBranchId,
+        normalizedInvoiceId,
+        customerId,
+        normalizedCustomerName,
+        normalizedTotalAmount,
+        normalizedPaidAmount,
+        normalizedRemainingAmount,
+        description,
+        transactionDate || null,
+        primaryRow.id,
+      ],
+    );
+
+    if (duplicateIds.length) {
+      await client.query(`DELETE FROM cash_in WHERE id = ANY($1::int[])`, [
+        duplicateIds,
+      ]);
+    }
+
+    return { action: "updated", duplicateIds };
+  }
+
+  await client.query(
+    `
+    INSERT INTO cash_in
+    (
+      branch_id,
+      invoice_id,
+      customer_id,
+      customer_name,
+      amount,
+      paid_amount,
+      remaining_amount,
+      description,
+      source_type,
+      transaction_date
+    )
+    VALUES
+    ($1,$2,$3,$4,$5,$6,$7,$8,'invoice',COALESCE($9::date, CURRENT_DATE))
+    `,
+    [
+      normalizedBranchId,
+      normalizedInvoiceId,
+      customerId,
+      normalizedCustomerName,
+      normalizedTotalAmount,
+      normalizedPaidAmount,
+      normalizedRemainingAmount,
+      description,
+      transactionDate || null,
+    ],
+  );
+
+  return { action: "inserted", duplicateIds: [] };
+}
+
 /* ── Automatic Hourly Backup to Google Drive ── */
 let lastAutoBackup = null;
 
@@ -2948,69 +3108,18 @@ WHERE id = $14
    6️⃣ تحديث / إنشاء قيد اليومية (قطاعي)
 ================================ */
 
-    if (movement_type === "sale" && Number(paid_amount) > 0) {
-      const cashInRes = await client.query(
-        `
-    SELECT id
-    FROM cash_in
-    WHERE invoice_id = $1
-      AND source_type = 'invoice'
-    `,
-        [invoiceId],
-      );
-
-      if (cashInRes.rows.length) {
-        // 🟡 تحديث قيد موجود
-        await client.query(
-          `
-      UPDATE cash_in
-      SET
-        amount = $1,
-        paid_amount = $1,
-        remaining_amount = $2,
-        customer_name = $3,
-        transaction_date = COALESCE($5::date, transaction_date)
-      WHERE invoice_id = $4
-        AND source_type = 'invoice'
-      `,
-          [
-            Number(paid_amount),
-            remaining_amount,
-            customer_name,
-            invoiceId,
-            invoice_date || null,
-          ],
-        );
-      } else {
-        // 🟢 إنشاء قيد جديد
-        await client.query(
-          `
-      INSERT INTO cash_in
-      (
-        branch_id,
-        invoice_id,
-        customer_name,
-        amount,
-        paid_amount,
-        remaining_amount,
-        description,
-        source_type,
-        transaction_date
-      )
-      VALUES
-      ($1,$2,$3,$4,$4,$5,$6,'invoice',COALESCE($7::date, CURRENT_DATE))
-      `,
-          [
-            1, // فرع القطاعي
-            invoiceId,
-            customer_name,
-            Number(paid_amount),
-            remaining_amount,
-            `تحصيل تعديل فاتورة قطاعي رقم ${invoiceId}`,
-            invoice_date || null,
-          ],
-        );
-      }
+    if (movement_type === "sale") {
+      await syncInvoiceCashEntry(client, {
+        invoiceId,
+        branchId: 1,
+        invoiceType: "retail",
+        customerId,
+        customerName: customer_name,
+        totalAmount: totalWithPrevious,
+        paidAmount: Number(paid_amount || 0),
+        remainingAmount: remaining_amount,
+        transactionDate: invoice_date || null,
+      });
     }
 
     await client.query("COMMIT");
@@ -3612,69 +3721,18 @@ WHERE id = $14
    7️⃣ تحديث / إنشاء قيد اليومية
 ================================ */
 
-    if (movement_type === "sale" && Number(paid_amount) > 0) {
-      const cashInRes = await client.query(
-        `
-    SELECT id
-    FROM cash_in
-    WHERE invoice_id = $1
-      AND source_type = 'invoice'
-    `,
-        [invoiceId],
-      );
-
-      if (cashInRes.rows.length) {
-        // 🟡 تحديث قيد موجود
-        await client.query(
-          `
-      UPDATE cash_in
-      SET
-        amount = $1,
-        paid_amount = $1,
-        remaining_amount = $2,
-        customer_name = $3,
-        transaction_date = COALESCE($5::date, transaction_date)
-      WHERE invoice_id = $4
-        AND source_type = 'invoice'
-      `,
-          [
-            Number(paid_amount),
-            remaining,
-            customer_name,
-            invoiceId,
-            invoice_date || null,
-          ],
-        );
-      } else {
-        // 🟢 إنشاء قيد جديد
-        await client.query(
-          `
-      INSERT INTO cash_in
-      (
-        branch_id,
-        invoice_id,
-        customer_name,
-        amount,
-        paid_amount,
-        remaining_amount,
-        description,
-        source_type,
-        transaction_date
-      )
-      VALUES
-      ($1,$2,$3,$4,$4,$5,$6,'invoice',COALESCE($7::date, CURRENT_DATE))
-      `,
-          [
-            /* branch_id */ 2, // أو خده من الفاتورة لو موجود
-            invoiceId,
-            customer_name,
-            Number(paid_amount),
-            remaining,
-            `تحصيل تعديل فاتورة رقم ${invoiceId}`,
-            invoice_date || null,
-          ],
-        );
-      }
+    if (movement_type === "sale") {
+      await syncInvoiceCashEntry(client, {
+        invoiceId,
+        branchId: 2,
+        invoiceType,
+        customerId,
+        customerName: customer_name,
+        totalAmount: totalWithPrevious,
+        paidAmount: Number(paid_amount || 0),
+        remainingAmount: remaining,
+        transactionDate: invoice_date || null,
+      });
     }
 
     await client.query("COMMIT");
@@ -6779,7 +6837,9 @@ app.post("/cash/in/from-invoice", authMiddleware, async (req, res) => {
   paid_amount,
   total,
   previous_balance,
-  movement_type
+  movement_type,
+  invoice_type,
+  invoice_date
 FROM invoices
 WHERE id = $1
       `,
@@ -6809,103 +6869,26 @@ WHERE id = $1
 
     const remainingCash = totalWithPrevious - Number(invoice.paid_amount || 0);
 
-    if (Number(invoice.paid_amount) <= 0) {
-      await client.query(
-        `
-    UPDATE cash_in
-    SET
-      amount = 0,
-      paid_amount = 0,
-      remaining_amount = $1,
-      transaction_date = CURRENT_DATE
-    WHERE invoice_id = $2
-      AND source_type = 'invoice'
-      AND branch_id = $3
-    `,
-        [totalWithPrevious, invoice.id, userBranchId],
-      );
+    const syncResult = await syncInvoiceCashEntry(client, {
+      invoiceId: invoice.id,
+      branchId: userBranchId,
+      invoiceType:
+        invoice.invoice_type || (Number(userBranchId) === 1 ? "retail" : "wholesale"),
+      customerId: invoice.customer_id || null,
+      customerName: invoice.customer_name,
+      totalAmount: totalWithPrevious,
+      paidAmount: Number(invoice.paid_amount || 0),
+      remainingAmount: remainingCash,
+      transactionDate: invoice.invoice_date || null,
+    });
 
-      await client.query("COMMIT");
-      return res.json({
-        success: true,
-        message: "تم تحديث اليومية (لا يوجد مبلغ مدفوع)",
-      });
-    }
-
-    // 2️⃣ هل الفاتورة مترحلة؟
-    const cashInRes = await client.query(
-      `
-     SELECT id
-FROM cash_in
-WHERE invoice_id = $1
-  AND source_type = 'invoice'
-  AND branch_id = $2
-      `,
-      [invoice_id, userBranchId],
-    );
-
-    const description = "فاتورة";
-
-    let message = "";
-
-    if (cashInRes.rows.length) {
-      // ✅ تحديث القيد الموجود
-      await client.query(
-        `
-  UPDATE cash_in
-  SET
-    amount = $1,
-    paid_amount = $1,
-    remaining_amount = $2,
-    transaction_date = CURRENT_DATE,
-    customer_name = $3
-  WHERE invoice_id = $4
-    AND source_type = 'invoice'
-    AND branch_id = $5
-  `,
-        [
-          invoice.paid_amount,
-          remainingCash,
-          invoice.customer_name,
-          invoice.id,
-          userBranchId,
-        ],
-      );
-
-      message = "تم تحديث اليومية بنجاح";
-    } else {
-      // ➕ ترحيل جديد
-      await client.query(
-        `
-  INSERT INTO cash_in
-  (
-    branch_id,
-    invoice_id,
-    customer_id,
-    customer_name,
-    amount,
-    paid_amount,
-    remaining_amount,
-    description,
-    source_type,
-    transaction_date
-  )
-  VALUES
-  ($1,$2,$3,$4,$5,$6,$7,$8,'invoice',CURRENT_DATE)
-  `,
-        [
-          userBranchId,
-          invoice.id,
-          invoice.customer_id || null,
-          invoice.customer_name,
-          invoice.paid_amount, // amount
-          invoice.paid_amount, // paid_amount
-          remainingCash,
-          description,
-        ],
-      );
-
+    let message = "تم تحديث اليومية بنجاح";
+    if (syncResult.action === "inserted") {
       message = "تم ترحيل الفاتورة إلى اليومية";
+    } else if (syncResult.action === "skipped") {
+      message = "لا يوجد مبلغ مدفوع لهذه الفاتورة";
+    } else if (Number(invoice.paid_amount || 0) <= 0) {
+      message = "تم تحديث اليومية (لا يوجد مبلغ مدفوع)";
     }
 
     await client.query("COMMIT");
