@@ -864,9 +864,9 @@ exports.getSupplierDebtDetails = async (req, res) => {
 /* ===============================
    📈 ربحية المبيعات حسب الفواتير
    - فواتير بيع فقط
-   - إجمالي الفاتورة = مجموع بنود الفاتورة بعد خصم كل صنف
-   - صافي الربح = (سعر بيع البند بعد الخصم) - (تكلفة الشراء من جدول الأصناف)
-  - بنود المرتجع لا تخصم من الربح في هذا التقرير
+  - قيمة البيع المعتمدة = الإجمالي النهائي للفواتير بعد استبعاد الحساب السابق
+  - صافي الربح = قيمة البيع المعتمدة - إجمالي تكلفة الشراء
+  - بنود المرتجع لا تدخل في تكلفة التقرير
 ================================ */
 exports.getInvoiceSalesProfit = async (req, res) => {
   try {
@@ -930,12 +930,8 @@ exports.getInvoiceSalesProfit = async (req, res) => {
         COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date,
         COALESCE(NULLIF(TRIM(i.customer_name), ''), 'عميل نقدي') AS customer_name,
 
-        SUM(
-          CASE
-            WHEN COALESCE(ii.is_return, false) THEN 0
-            ELSE COALESCE(ii.total, (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)) * COALESCE(ii.quantity, 0))
-          END
-        ) AS items_total_after_discount,
+        (COALESCE(i.total, 0) + COALESCE(i.previous_balance, 0)) AS final_total_with_previous,
+        COALESCE(i.previous_balance, 0) AS previous_balance,
 
         SUM(
           CASE
@@ -956,14 +952,17 @@ exports.getInvoiceSalesProfit = async (req, res) => {
       JOIN invoice_items ii ON ii.invoice_id = i.id
       JOIN products p ON p.id = ii.product_id
       ${whereClause}
-      GROUP BY i.id, i.branch_id, i.invoice_type, COALESCE(i.invoice_date::date, i.created_at::date), i.customer_name
+      GROUP BY i.id, i.branch_id, i.invoice_type, COALESCE(i.invoice_date::date, i.created_at::date), i.customer_name, i.total, i.previous_balance
       ORDER BY i.id DESC
       `,
       values,
     );
 
     const rows = result.rows.map((row) => {
-      const itemsTotal = Number(row.items_total_after_discount || 0);
+      const finalTotalWithPrevious = Number(row.final_total_with_previous || 0);
+      const previousBalance = Number(row.previous_balance || 0);
+      const itemsTotal =
+        Math.round((finalTotalWithPrevious - previousBalance) * 100) / 100;
       const totalCost = Number(row.total_cost || 0);
 
       return {
