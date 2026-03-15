@@ -453,7 +453,10 @@ function roundMoney(value) {
 }
 
 function formatInvoiceCashMetadataValue(value) {
-  return roundMoney(value).toFixed(2).replace(/\.00$/, "").replace(/(\.\d*[1-9])0$/, "$1");
+  return roundMoney(value)
+    .toFixed(2)
+    .replace(/\.00$/, "")
+    .replace(/(\.\d*[1-9])0$/, "$1");
 }
 
 function extractInvoiceIdFromCashDescription(description) {
@@ -468,7 +471,8 @@ function buildInvoiceCashDescription(
   paidAmount,
   remainingAmount,
 ) {
-  const label = invoiceType === "retail" ? "فاتورة قطاعي رقم #" : "فاتورة جملة رقم #";
+  const label =
+    invoiceType === "retail" ? "فاتورة قطاعي رقم #" : "فاتورة جملة رقم #";
   return `${label}${invoiceId}{{${formatInvoiceCashMetadataValue(totalAmount)}|${formatInvoiceCashMetadataValue(paidAmount)}|${formatInvoiceCashMetadataValue(remainingAmount)}}}`;
 }
 
@@ -519,7 +523,8 @@ async function syncInvoiceCashEntry(
 
     return (
       row.invoice_id == null &&
-      extractInvoiceIdFromCashDescription(row.description) === normalizedInvoiceId
+      extractInvoiceIdFromCashDescription(row.description) ===
+        normalizedInvoiceId
     );
   });
 
@@ -3725,7 +3730,7 @@ WHERE id = $14
       await syncInvoiceCashEntry(client, {
         invoiceId,
         branchId: 2,
-        invoiceType,
+        invoiceType: invoice_type,
         customerId,
         customerName: customer_name,
         totalAmount: totalWithPrevious,
@@ -6873,7 +6878,8 @@ WHERE id = $1
       invoiceId: invoice.id,
       branchId: userBranchId,
       invoiceType:
-        invoice.invoice_type || (Number(userBranchId) === 1 ? "retail" : "wholesale"),
+        invoice.invoice_type ||
+        (Number(userBranchId) === 1 ? "retail" : "wholesale"),
       customerId: invoice.customer_id || null,
       customerName: invoice.customer_name,
       totalAmount: totalWithPrevious,
