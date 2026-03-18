@@ -114,15 +114,24 @@ exports.getInventorySummary = async (req, res) => {
 ================================ */
 exports.getProductMovement = async (req, res) => {
   try {
-    const { product_name, warehouse_id, from, to, party_name } = req.query;
+    const { product_id, product_name, warehouse_id, from, to, party_name } =
+      req.query;
 
-    if (!product_name) {
-      return res.status(400).json({ error: "product_name مطلوب" });
+    if (!product_id && !product_name) {
+      return res.status(400).json({ error: "product_id أو product_name مطلوب" });
     }
 
-    let conditions = ["LOWER(p.name) LIKE LOWER($1)"];
-    let values = [`%${product_name}%`];
-    let idx = 2;
+    const conditions = [];
+    const values = [];
+    let idx = 1;
+
+    if (product_id) {
+      conditions.push(`sm.product_id = $${idx++}`);
+      values.push(Number(product_id));
+    } else {
+      conditions.push(`LOWER(p.name) LIKE LOWER($${idx++})`);
+      values.push(`%${product_name}%`);
+    }
 
     // 🏬 فلترة المخزن
     if (warehouse_id) {
