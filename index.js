@@ -1279,18 +1279,131 @@ async function getInvoiceItemCostSnapshot(
   );
 }
 
+function normalizePackageName(packageName) {
+  return String(packageName || "").trim();
+}
+
+async function getProductVariantPackageMeta(
+  productId,
+  client = pool,
+  cache = new Map(),
+) {
+  const normalizedProductId = Number(productId || 0);
+  if (!normalizedProductId) {
+    return {
+      validVariantIds: new Set(),
+      variantPackageMap: new Map(),
+      basePackages: new Set(),
+    };
+  }
+
+  if (cache.has(normalizedProductId)) {
+    return cache.get(normalizedProductId);
+  }
+
+  const [productResult, variantsResult] = await Promise.all([
+    client.query(
+      `SELECT wholesale_package, retail_package FROM products WHERE id = $1 LIMIT 1`,
+      [normalizedProductId],
+    ),
+    client.query(
+      `SELECT id, wholesale_package, retail_package FROM product_variants WHERE product_id = $1`,
+      [normalizedProductId],
+    ),
+  ]);
+
+  const basePackages = new Set();
+  const variantPackageMap = new Map();
+  const validVariantIds = new Set();
+
+  const productRow = productResult.rows[0] || {};
+  const wholesalePackage = normalizePackageName(productRow.wholesale_package);
+  const retailPackage = normalizePackageName(productRow.retail_package);
+
+  if (wholesalePackage) basePackages.add(wholesalePackage);
+  if (retailPackage) basePackages.add(retailPackage);
+
+  for (const variant of variantsResult.rows) {
+    const variantId = Number(variant.id || 0);
+    if (!variantId) continue;
+
+    validVariantIds.add(variantId);
+
+    const variantWholesalePackage = normalizePackageName(
+      variant.wholesale_package,
+    );
+    const variantRetailPackage = normalizePackageName(variant.retail_package);
+
+    if (variantWholesalePackage) {
+      variantPackageMap.set(variantWholesalePackage, variantId);
+    }
+    if (variantRetailPackage) {
+      variantPackageMap.set(variantRetailPackage, variantId);
+    }
+  }
+
+  const meta = {
+    validVariantIds,
+    variantPackageMap,
+    basePackages,
+  };
+
+  cache.set(normalizedProductId, meta);
+  return meta;
+}
+
+async function resolveInvoiceItemVariantId(
+  item,
+  client = pool,
+  cache = new Map(),
+) {
+  const incomingVariantId = Number(item?.variant_id || 0);
+  const productId = Number(item?.product_id || 0);
+  const packageName = normalizePackageName(item?.package);
+
+  if (!productId) {
+    return incomingVariantId > 0 ? incomingVariantId : 0;
+  }
+
+  const { validVariantIds, variantPackageMap, basePackages } =
+    await getProductVariantPackageMeta(productId, client, cache);
+
+  const matchedVariantId = packageName
+    ? Number(variantPackageMap.get(packageName) || 0)
+    : 0;
+
+  if (matchedVariantId) {
+    return matchedVariantId;
+  }
+
+  if (packageName && basePackages.has(packageName)) {
+    return 0;
+  }
+
+  if (incomingVariantId > 0 && validVariantIds.has(incomingVariantId)) {
+    return incomingVariantId;
+  }
+
+  return 0;
+}
+
 async function normalizeInvoiceItemsForStorage(
   items,
   invoiceType,
   client = pool,
 ) {
   const normalizedItems = [];
+  const variantMetaCache = new Map();
 
   for (const item of items) {
     const quantity = Number(item.quantity || 0);
     const price = Number(item.price || 0);
     const discount = Number(item.discount || 0);
-    const variantId = Number(item.variant_id || 0);
+    const variantId = await resolveInvoiceItemVariantId(
+      item,
+      client,
+      variantMetaCache,
+    );
 
     normalizedItems.push({
       ...item,
@@ -3196,6 +3309,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
         ii.quantity,
         ii.discount,
         ii.total,
+        COALESCE(ii.variant_id, 0) AS variant_id,
         ii.is_return,
         p.manufacturer
       FROM invoice_items ii
@@ -3307,6 +3421,7 @@ app.get("/invoices/:id", async (req, res) => {
     ii.quantity,
     ii.discount,
     ii.total,
+    COALESCE(ii.variant_id, 0) AS variant_id,
     p.manufacturer
   FROM invoice_items ii
   JOIN products p ON p.id = ii.product_id

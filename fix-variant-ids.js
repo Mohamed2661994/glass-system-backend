@@ -1,17 +1,104 @@
 /**
- * سكريبت تصحيح variant_id في البيانات القديمة
+ * سكريبت تصحيح variant_id في البيانات القديمة.
  *
- * المشكلة: بعض الفواتير تم حفظها بـ variant_id = 0 رغم أن العبوة المستخدمة
- * هي عبوة فرعية (variant). هذا السكريبت يصحح هذه البيانات.
- *
- * الخطوات:
- * 1. البحث عن invoice_items حيث variant_id = 0 لكن package يطابق variant
- * 2. تحديث variant_id في invoice_items
- * 3. تحديث variant_id في stock_movements
- * 4. إعادة حساب جدول stock
+ * الاستخدام:
+ *   node fix-variant-ids.js        -> معاينة ثم تأكيد يدوي
+ *   node fix-variant-ids.js --yes  -> تنفيذ مباشر
  */
 
+const readline = require("readline");
 const pool = require("./db");
+
+const AUTO_CONFIRM = process.argv.includes("--yes");
+
+const FIXABLE_ITEMS_CTE = `
+WITH variant_packages AS (
+  SELECT product_id, TRIM(wholesale_package) AS package_name, id AS expected_variant_id
+  FROM product_variants
+  WHERE TRIM(COALESCE(wholesale_package, '')) <> ''
+
+  UNION ALL
+
+  SELECT product_id, TRIM(retail_package) AS package_name, id AS expected_variant_id
+  FROM product_variants
+  WHERE TRIM(COALESCE(retail_package, '')) <> ''
+),
+unique_variant_packages AS (
+  SELECT product_id, package_name, MIN(expected_variant_id) AS expected_variant_id
+  FROM variant_packages
+  GROUP BY product_id, package_name
+  HAVING COUNT(DISTINCT expected_variant_id) = 1
+),
+variant_invoice_items AS (
+  SELECT
+    ii.id AS invoice_item_id,
+    ii.invoice_id,
+    ii.product_id,
+    p.name AS product_name,
+    TRIM(COALESCE(ii.package, '')) AS package_name,
+    ii.quantity,
+    COALESCE(ii.variant_id, 0) AS invoice_item_variant_id,
+    unique_variant_packages.expected_variant_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY ii.invoice_id, ii.product_id
+      ORDER BY ii.id
+    ) AS row_num
+  FROM invoice_items ii
+  JOIN products p ON p.id = ii.product_id
+  JOIN unique_variant_packages
+    ON unique_variant_packages.product_id = ii.product_id
+   AND unique_variant_packages.package_name = TRIM(COALESCE(ii.package, ''))
+),
+candidate_movements AS (
+  SELECT
+    sm.id AS stock_movement_id,
+    sm.invoice_id,
+    sm.product_id,
+    sm.quantity,
+    COALESCE(sm.variant_id, 0) AS movement_variant_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY sm.invoice_id, sm.product_id
+      ORDER BY sm.id
+    ) AS row_num
+  FROM stock_movements sm
+),
+fix_targets AS (
+  SELECT
+    vii.invoice_item_id,
+    cm.stock_movement_id,
+    vii.invoice_id,
+    vii.product_id,
+    vii.product_name,
+    vii.package_name,
+    vii.quantity,
+    vii.invoice_item_variant_id,
+    COALESCE(cm.movement_variant_id, 0) AS movement_variant_id,
+    vii.expected_variant_id
+  FROM variant_invoice_items vii
+  LEFT JOIN candidate_movements cm
+    ON cm.invoice_id = vii.invoice_id
+   AND cm.product_id = vii.product_id
+   AND cm.row_num = vii.row_num
+  WHERE vii.invoice_item_variant_id <> vii.expected_variant_id
+     OR COALESCE(cm.movement_variant_id, 0) <> vii.expected_variant_id
+)
+`;
+
+function askForConfirmation() {
+  if (AUTO_CONFIRM) return Promise.resolve(true);
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  return new Promise((resolve) => {
+    rl.question("\n⚠️  هل تريد تنفيذ التصحيحات؟ (yes/no): ", (answer) => {
+      rl.close();
+      resolve(String(answer || "").trim().toLowerCase() === "yes");
+    });
+  });
+}
 
 async function fixVariantIds() {
   const client = await pool.connect();
@@ -19,85 +106,72 @@ async function fixVariantIds() {
   try {
     console.log("🔍 جاري البحث عن السجلات التي تحتاج تصحيح...\n");
 
-    // 1. جلب كل العبوات الفرعية
-    const variantsRes = await client.query(`
-      SELECT id, product_id, wholesale_package, retail_package
-      FROM product_variants
+    const previewResult = await client.query(`
+      ${FIXABLE_ITEMS_CTE}
+      SELECT
+        invoice_item_id,
+        stock_movement_id,
+        invoice_id,
+        product_id,
+        product_name,
+        package_name,
+        quantity,
+        invoice_item_variant_id,
+        movement_variant_id,
+        expected_variant_id
+      FROM fix_targets
+      ORDER BY invoice_id, invoice_item_id
     `);
 
-    // بناء خريطة: product_id + package -> variant_id
-    const variantMap = new Map();
-    for (const v of variantsRes.rows) {
-      if (v.wholesale_package) {
-        variantMap.set(`${v.product_id}_${v.wholesale_package.trim()}`, v.id);
-      }
-      if (v.retail_package) {
-        variantMap.set(`${v.product_id}_${v.retail_package.trim()}`, v.id);
-      }
-    }
-
-    console.log(`📦 عدد العبوات الفرعية: ${variantsRes.rows.length}`);
-    console.log(`🗺️  خريطة العبوات: ${variantMap.size} عنصر\n`);
-
-    // 2. البحث عن invoice_items التي تحتاج تصحيح
-    const itemsToFix = await client.query(`
-      SELECT ii.id, ii.invoice_id, ii.product_id, ii.package, ii.variant_id,
-             p.name as product_name
-      FROM invoice_items ii
-      JOIN products p ON p.id = ii.product_id
-      WHERE ii.variant_id = 0 OR ii.variant_id IS NULL
-      ORDER BY ii.invoice_id
-    `);
-
-    console.log(`🔎 عدد السجلات للفحص: ${itemsToFix.rows.length}\n`);
-
-    let fixedCount = 0;
-    const fixes = [];
-
-    for (const item of itemsToFix.rows) {
-      const pkg = (item.package || "").trim();
-      const key = `${item.product_id}_${pkg}`;
-      const correctVariantId = variantMap.get(key);
-
-      if (correctVariantId && correctVariantId !== item.variant_id) {
-        fixes.push({
-          invoice_item_id: item.id,
-          invoice_id: item.invoice_id,
-          product_id: item.product_id,
-          product_name: item.product_name,
-          package: pkg,
-          old_variant_id: item.variant_id || 0,
-          new_variant_id: correctVariantId,
-        });
-        fixedCount++;
-      }
-    }
+    const fixes = previewResult.rows;
 
     if (fixes.length === 0) {
       console.log("✅ لا توجد سجلات تحتاج تصحيح!");
       return;
     }
 
-    console.log(`📝 عدد السجلات التي تحتاج تصحيح: ${fixes.length}\n`);
-    console.log("التفاصيل:");
-    console.table(fixes.slice(0, 20)); // عرض أول 20 فقط
-    if (fixes.length > 20) {
-      console.log(`... و ${fixes.length - 20} سجل آخر\n`);
+    const unmatchedMovements = fixes.filter((row) => !row.stock_movement_id);
+    if (unmatchedMovements.length > 0) {
+      console.error("❌ تم إيقاف التنفيذ لأن بعض السجلات لم يتم ربطها بحركة مخزون مطابقة.");
+      console.table(unmatchedMovements.slice(0, 20));
+      throw new Error("Unmatched stock_movements detected");
     }
 
-    // السؤال قبل التنفيذ
-    const readline = require("readline");
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    const productSummaryMap = new Map();
+    for (const fix of fixes) {
+      const key = `${fix.product_id}`;
+      if (!productSummaryMap.has(key)) {
+        productSummaryMap.set(key, {
+          product_id: fix.product_id,
+          product_name: fix.product_name,
+          rows: 0,
+          total_quantity: 0,
+        });
+      }
+      const entry = productSummaryMap.get(key);
+      entry.rows += 1;
+      entry.total_quantity += Number(fix.quantity || 0);
+    }
 
-    const answer = await new Promise((resolve) => {
-      rl.question("\n⚠️  هل تريد تنفيذ التصحيحات؟ (yes/no): ", resolve);
-    });
-    rl.close();
+    console.log(`📝 عدد السجلات التي تحتاج تصحيح: ${fixes.length}`);
+    console.log(`📦 عدد الأصناف المتأثرة: ${productSummaryMap.size}\n`);
+    console.table(Array.from(productSummaryMap.values()));
+    console.log("\nعينة من السجلات:");
+    console.table(
+      fixes.slice(0, 20).map((row) => ({
+        invoice_id: row.invoice_id,
+        product_id: row.product_id,
+        product_name: row.product_name,
+        package_name: row.package_name,
+        quantity: row.quantity,
+        invoice_item_variant_id: row.invoice_item_variant_id,
+        movement_variant_id: row.movement_variant_id,
+        expected_variant_id: row.expected_variant_id,
+      })),
+    );
 
-    if (answer.toLowerCase() !== "yes") {
+    const confirmed = await askForConfirmation();
+    if (!confirmed) {
       console.log("❌ تم الإلغاء");
       return;
     }
@@ -106,65 +180,58 @@ async function fixVariantIds() {
 
     await client.query("BEGIN");
 
-    for (const fix of fixes) {
-      // 1. تحديث invoice_items
-      await client.query(
-        `UPDATE invoice_items SET variant_id = $1 WHERE id = $2`,
-        [fix.new_variant_id, fix.invoice_item_id],
-      );
+    const invoiceItemsUpdate = await client.query(`
+      ${FIXABLE_ITEMS_CTE}
+      UPDATE invoice_items ii
+      SET variant_id = fix_targets.expected_variant_id
+      FROM fix_targets
+      WHERE ii.id = fix_targets.invoice_item_id
+        AND fix_targets.invoice_item_variant_id <> fix_targets.expected_variant_id
+    `);
 
-      // 2. تحديث stock_movements
-      await client.query(
-        `UPDATE stock_movements 
-         SET variant_id = $1 
-         WHERE invoice_id = $2 AND product_id = $3 AND variant_id = $4`,
-        [
-          fix.new_variant_id,
-          fix.invoice_id,
-          fix.product_id,
-          fix.old_variant_id,
-        ],
-      );
+    const stockMovementsUpdate = await client.query(`
+      ${FIXABLE_ITEMS_CTE}
+      UPDATE stock_movements sm
+      SET variant_id = fix_targets.expected_variant_id
+      FROM fix_targets
+      WHERE sm.id = fix_targets.stock_movement_id
+        AND fix_targets.movement_variant_id <> fix_targets.expected_variant_id
+    `);
 
-      console.log(
-        `✅ فاتورة #${fix.invoice_id} - ${fix.product_name} - ${fix.package}: ${fix.old_variant_id} → ${fix.new_variant_id}`,
-      );
-    }
+    const affectedProductIds = Array.from(productSummaryMap.values()).map((row) =>
+      Number(row.product_id),
+    );
 
-    // 3. إعادة حساب جدول stock
-    console.log("\n🔄 جاري إعادة حساب المخزون...");
+    await client.query(`DELETE FROM stock WHERE product_id = ANY($1::int[])`, [
+      affectedProductIds,
+    ]);
 
-    // الحصول على الأصناف المتأثرة
-    const affectedProducts = [...new Set(fixes.map((f) => f.product_id))];
-
-    for (const productId of affectedProducts) {
-      // إعادة حساب stock من stock_movements
-      await client.query(
-        `
-        INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-        SELECT 
-          sm.warehouse_id,
-          sm.product_id,
-          sm.variant_id,
-          SUM(CASE 
+    await client.query(
+      `
+      INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+      SELECT
+        sm.warehouse_id,
+        sm.product_id,
+        COALESCE(sm.variant_id, 0) AS variant_id,
+        SUM(
+          CASE
             WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale') THEN sm.quantity
             WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase') THEN -sm.quantity
             ELSE 0
-          END) as quantity
-        FROM stock_movements sm
-        WHERE sm.product_id = $1
-        GROUP BY sm.warehouse_id, sm.product_id, sm.variant_id
-        ON CONFLICT (warehouse_id, product_id, variant_id)
-        DO UPDATE SET quantity = EXCLUDED.quantity
+          END
+        ) AS quantity
+      FROM stock_movements sm
+      WHERE sm.product_id = ANY($1::int[])
+      GROUP BY sm.warehouse_id, sm.product_id, COALESCE(sm.variant_id, 0)
       `,
-        [productId],
-      );
-    }
+      [affectedProductIds],
+    );
 
     await client.query("COMMIT");
 
-    console.log(`\n✅ تم تصحيح ${fixes.length} سجل بنجاح!`);
-    console.log(`✅ تم إعادة حساب المخزون لـ ${affectedProducts.length} صنف`);
+    console.log(`✅ تم تحديث invoice_items: ${invoiceItemsUpdate.rowCount}`);
+    console.log(`✅ تم تحديث stock_movements: ${stockMovementsUpdate.rowCount}`);
+    console.log(`✅ تم إعادة بناء stock لـ ${affectedProductIds.length} صنف`);
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("❌ خطأ:", err.message);
@@ -174,7 +241,6 @@ async function fixVariantIds() {
   }
 }
 
-// تشغيل السكريبت
 fixVariantIds()
   .then(() => {
     console.log("\n🏁 انتهى السكريبت");
