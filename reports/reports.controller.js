@@ -197,6 +197,87 @@ exports.getProductMovement = async (req, res) => {
   }
 };
 
+exports.getProductCurrentStock = async (req, res) => {
+  try {
+    const { product_id, warehouse_id } = req.query;
+
+    if (!product_id) {
+      return res.status(400).json({ error: "product_id مطلوب" });
+    }
+
+    let where = "WHERE s.product_id = $1";
+    const values = [product_id];
+
+    if (warehouse_id) {
+      where += " AND s.warehouse_id = $2";
+      values.push(warehouse_id);
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        w.id AS warehouse_id,
+        w.name AS warehouse_name,
+        s.variant_id,
+        COALESCE(SUM(s.quantity), 0) AS current_stock,
+        p.wholesale_package,
+        p.retail_package
+      FROM stock s
+      JOIN warehouses w ON w.id = s.warehouse_id
+      JOIN products p ON p.id = s.product_id
+      ${where}
+      GROUP BY w.id, w.name, s.variant_id, p.wholesale_package, p.retail_package
+      ORDER BY w.id, s.variant_id
+      `,
+      values,
+    );
+
+    const variantsRes = await pool.query(
+      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`,
+    );
+    const variantsById = {};
+    for (const v of variantsRes.rows) {
+      variantsById[v.id] = v;
+    }
+
+    const rows = result.rows.map((row) => {
+      const vid = Number(row.variant_id) || 0;
+      let pkgLabel;
+      if (vid === 0) {
+        pkgLabel =
+          [row.wholesale_package, row.retail_package]
+            .filter(Boolean)
+            .join(" / ") || "-";
+      } else {
+        const v = variantsById[vid];
+        pkgLabel = v
+          ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ")
+          : "-";
+      }
+
+      return {
+        ...row,
+        current_stock: Number(row.current_stock || 0),
+        package_name: pkgLabel,
+      };
+    });
+
+    const totalCurrentStock = rows.reduce(
+      (sum, row) => sum + Number(row.current_stock || 0),
+      0,
+    );
+
+    res.json({
+      product_id: Number(product_id),
+      total_current_stock: totalCurrentStock,
+      rows,
+    });
+  } catch (err) {
+    console.error("PRODUCT CURRENT STOCK ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
+
 /* ===============================
    ⚠️ تقرير نقص المخزون
 ================================ */
