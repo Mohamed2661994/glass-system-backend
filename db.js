@@ -314,6 +314,28 @@ function isMutatingQuery(sql) {
   return false;
 }
 
+function getTransactionControl(sql) {
+  const cleaned = stripLeadingSqlComments(sql).toLowerCase();
+  if (!cleaned) return null;
+  if (/^begin\b/.test(cleaned) || /^start\s+transaction\b/.test(cleaned)) {
+    return "begin";
+  }
+  if (/^commit\b/.test(cleaned)) {
+    return "commit";
+  }
+  if (/^rollback\b/.test(cleaned)) {
+    return "rollback";
+  }
+  return null;
+}
+
+function pushRealtimeOperations(ops) {
+  if (!Array.isArray(ops) || ops.length === 0) return;
+  for (const op of ops) {
+    pushRealtimeOperation(op);
+  }
+}
+
 function scheduleRealtimeSync(reason = "write") {
   realtimeSyncRequested = true;
   if (realtimeSyncTimer) return;
@@ -1211,19 +1233,56 @@ const pool = new Proxy(localPool, {
     if (prop === "connect") {
       return async (...args) => {
         const client = await activePool.connect(...args);
+        const txState = { active: false, ops: [] };
         return new Proxy(client, {
           get(cTarget, cProp) {
             if (cProp === "query") {
               return async (...qArgs) => {
                 const sql = extractSqlText(qArgs);
+                const txControl = getTransactionControl(sql);
+
+                if (txControl === "begin") {
+                  const result = await cTarget.query(...qArgs);
+                  txState.active = true;
+                  txState.ops = [];
+                  return result;
+                }
+
+                if (txControl === "rollback") {
+                  try {
+                    return await cTarget.query(...qArgs);
+                  } finally {
+                    txState.active = false;
+                    txState.ops = [];
+                  }
+                }
+
+                if (txControl === "commit") {
+                  const result = await cTarget.query(...qArgs);
+                  const committedOps = txState.ops;
+                  txState.active = false;
+                  txState.ops = [];
+                  if (committedOps.length > 0) {
+                    pushRealtimeOperations(committedOps);
+                    scheduleRealtimeSync("client.commit");
+                  }
+                  return result;
+                }
+
                 const result = await cTarget.query(...qArgs);
                 if (isMutatingQuery(sql)) {
                   const params = Array.isArray(qArgs?.[1])
                     ? qArgs[1]
                     : qArgs?.[0]?.values;
                   const op = parseOperationInfo(sql, params, result);
-                  pushRealtimeOperation(op);
-                  scheduleRealtimeSync("client.query");
+                  if (txState.active) {
+                    if (op) {
+                      txState.ops.push(op);
+                    }
+                  } else {
+                    pushRealtimeOperation(op);
+                    scheduleRealtimeSync("client.query");
+                  }
                 }
                 return result;
               };
