@@ -337,10 +337,19 @@ function pushRealtimeOperations(ops) {
   }
 }
 
-async function enqueueSyncOutbox(target, entityType, entityId, operation = "upsert") {
+async function enqueueSyncOutbox(
+  target,
+  entityType,
+  entityId,
+  operation = "upsert",
+) {
   const normalizedEntityId = Number(entityId);
 
-  if (!entityType || !Number.isInteger(normalizedEntityId) || normalizedEntityId <= 0) {
+  if (
+    !entityType ||
+    !Number.isInteger(normalizedEntityId) ||
+    normalizedEntityId <= 0
+  ) {
     return;
   }
 
@@ -358,11 +367,19 @@ async function enqueueSyncOutbox(target, entityType, entityId, operation = "upse
           attempts = 0,
           last_error = NULL
     `,
-    [entityType, normalizedEntityId, operation === "delete" ? "delete" : "upsert"],
+    [
+      entityType,
+      normalizedEntityId,
+      operation === "delete" ? "delete" : "upsert",
+    ],
   );
 }
 
-async function enqueueInvoiceAggregateSync(target, invoiceId, operation = "upsert") {
+async function enqueueInvoiceAggregateSync(
+  target,
+  invoiceId,
+  operation = "upsert",
+) {
   return enqueueSyncOutbox(target, "invoice", invoiceId, operation);
 }
 
@@ -375,6 +392,10 @@ async function replaceInvoiceScopedRows(targetClient, meta, invoiceId, rows) {
   for (const row of rows) {
     await upsertRow(targetClient, meta.table, meta.columns, meta.pk, row);
   }
+}
+
+async function enableSyncDeleteContext(client) {
+  await client.query(`SELECT set_config('app.sync_origin', 'sync', true)`);
 }
 
 async function syncInvoiceAggregateFromSource(
@@ -404,6 +425,7 @@ async function syncInvoiceAggregateFromSource(
   const targetClient = await targetPool.connect();
   try {
     await targetClient.query("BEGIN");
+    await enableSyncDeleteContext(targetClient);
 
     if (shouldDelete) {
       await targetClient.query(`DELETE FROM cash_in WHERE invoice_id = $1`, [
@@ -413,9 +435,10 @@ async function syncInvoiceAggregateFromSource(
         `DELETE FROM stock_movements WHERE invoice_id = $1`,
         [normalizedInvoiceId],
       );
-      await targetClient.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [
-        normalizedInvoiceId,
-      ]);
+      await targetClient.query(
+        `DELETE FROM invoice_items WHERE invoice_id = $1`,
+        [normalizedInvoiceId],
+      );
       await targetClient.query(`DELETE FROM invoices WHERE id = $1`, [
         normalizedInvoiceId,
       ]);
@@ -471,10 +494,11 @@ async function syncInvoiceAggregateFromSource(
       const productId = Number(movement.product_id || 0);
       const variantId = Number(movement.variant_id || 0);
       if (!warehouseId || !productId) continue;
-      stockKeys.set(
-        `${warehouseId}|${productId}|${variantId}`,
-        { warehouseId, productId, variantId },
-      );
+      stockKeys.set(`${warehouseId}|${productId}|${variantId}`, {
+        warehouseId,
+        productId,
+        variantId,
+      });
     }
 
     for (const stockKey of stockKeys.values()) {
@@ -539,7 +563,9 @@ async function processSyncOutbox(sourcePool, targetPool, label) {
         );
       }
 
-      await sourcePool.query(`DELETE FROM sync_outbox WHERE id = $1`, [entry.id]);
+      await sourcePool.query(`DELETE FROM sync_outbox WHERE id = $1`, [
+        entry.id,
+      ]);
       processedCount++;
     } catch (err) {
       await sourcePool.query(
@@ -1236,22 +1262,41 @@ async function syncDeletions() {
   const localDels = await localPool.query(
     `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`,
   );
-  for (const del of localDels.rows) {
-    const pk = tablePkMap[del.table_name];
-    if (!pk) continue; // table not in sync list
+  if (localDels.rows.length > 0) {
+    const cloudClient = await cloudPool.connect();
     try {
-      const pkParts = del.pk_value.split("|");
-      const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
-      await cloudPool.query(
-        `DELETE FROM "${del.table_name}" WHERE ${where}`,
-        pkParts,
-      );
-      totalDeleted++;
+      await cloudClient.query("BEGIN");
+      await enableSyncDeleteContext(cloudClient);
+
+      for (const del of localDels.rows) {
+        const pk = tablePkMap[del.table_name];
+        if (!pk) continue;
+        try {
+          const pkParts = del.pk_value.split("|");
+          const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
+          await cloudClient.query(
+            `DELETE FROM "${del.table_name}" WHERE ${where}`,
+            pkParts,
+          );
+          totalDeleted++;
+        } catch (err) {
+          console.error(
+            `  ⚠️  Delete ${del.table_name}(${del.pk_value}) on cloud failed:`,
+            err.message,
+          );
+        }
+      }
+
+      await cloudClient.query("COMMIT");
     } catch (err) {
-      console.error(
-        `  ⚠️  Delete ${del.table_name}(${del.pk_value}) on cloud failed:`,
-        err.message,
-      );
+      try {
+        await cloudClient.query("ROLLBACK");
+      } catch {
+        // ignore rollback failure
+      }
+      throw err;
+    } finally {
+      cloudClient.release();
     }
   }
   // Clear processed deletions from local
@@ -1264,22 +1309,41 @@ async function syncDeletions() {
   const cloudDels = await cloudPool.query(
     `SELECT id, table_name, pk_value, deleted_at FROM sync_deletions ORDER BY id`,
   );
-  for (const del of cloudDels.rows) {
-    const pk = tablePkMap[del.table_name];
-    if (!pk) continue;
+  if (cloudDels.rows.length > 0) {
+    const localClient = await localPool.connect();
     try {
-      const pkParts = del.pk_value.split("|");
-      const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
-      await localPool.query(
-        `DELETE FROM "${del.table_name}" WHERE ${where}`,
-        pkParts,
-      );
-      totalDeleted++;
+      await localClient.query("BEGIN");
+      await enableSyncDeleteContext(localClient);
+
+      for (const del of cloudDels.rows) {
+        const pk = tablePkMap[del.table_name];
+        if (!pk) continue;
+        try {
+          const pkParts = del.pk_value.split("|");
+          const where = pk.map((k, i) => `"${k}" = $${i + 1}`).join(" AND ");
+          await localClient.query(
+            `DELETE FROM "${del.table_name}" WHERE ${where}`,
+            pkParts,
+          );
+          totalDeleted++;
+        } catch (err) {
+          console.error(
+            `  ⚠️  Delete ${del.table_name}(${del.pk_value}) on local failed:`,
+            err.message,
+          );
+        }
+      }
+
+      await localClient.query("COMMIT");
     } catch (err) {
-      console.error(
-        `  ⚠️  Delete ${del.table_name}(${del.pk_value}) on local failed:`,
-        err.message,
-      );
+      try {
+        await localClient.query("ROLLBACK");
+      } catch {
+        // ignore rollback failure
+      }
+      throw err;
+    } finally {
+      localClient.release();
     }
   }
   // Clear processed deletions from cloud
@@ -1415,6 +1479,37 @@ async function ensureSyncSchema() {
     WHERE processed_at IS NULL
   `;
 
+  const ensureTrackDeletionSql = `
+    CREATE OR REPLACE FUNCTION public.track_deletion()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      pk_val TEXT := '';
+      val TEXT;
+      cols TEXT[];
+      sync_origin TEXT;
+    BEGIN
+      sync_origin := current_setting('app.sync_origin', true);
+      IF sync_origin = 'sync' THEN
+        RETURN OLD;
+      END IF;
+
+      cols := TG_ARGV;
+      FOR i IN 0..array_upper(cols, 1) LOOP
+        EXECUTE format('SELECT ($1).%I::TEXT', cols[i]) INTO val USING OLD;
+        IF i > 0 THEN pk_val := pk_val || '|'; END IF;
+        pk_val := pk_val || COALESCE(val, '');
+      END LOOP;
+
+      INSERT INTO sync_deletions (table_name, pk_value)
+      VALUES (TG_TABLE_NAME, pk_val);
+
+      RETURN OLD;
+    END;
+    $$
+  `;
+
   for (const [poolRef, label] of [
     [localPool, "Local"],
     [cloudPool, "Cloud"],
@@ -1455,6 +1550,13 @@ async function ensureSyncSchema() {
       console.log(`✅ ${label}: sync_outbox ready`);
     } catch (err) {
       console.error(`❌ ${label}: sync_outbox ensure failed:`, err.message);
+    }
+
+    try {
+      await poolRef.query(ensureTrackDeletionSql);
+      console.log(`✅ ${label}: track_deletion function ready`);
+    } catch (err) {
+      console.error(`❌ ${label}: track_deletion ensure failed:`, err.message);
     }
   }
 
