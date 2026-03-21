@@ -8036,32 +8036,35 @@ app.get("/cash-in", authMiddleware, async (req, res) => {
 
     let query = `
       SELECT
-        id,
-        branch_id,
-        customer_name,
-        amount,
-        paid_amount,
-        remaining_amount,
-        COALESCE(notes, description) AS notes,
-        to_char(transaction_date, 'YYYY-MM-DD') AS transaction_date,
-        source_type,
-        invoice_id,
-        created_at
-      FROM cash_in
-      WHERE branch_id = $1
+        ci.id,
+        ci.branch_id,
+        ci.customer_name,
+        ci.amount,
+        ci.paid_amount,
+        ci.remaining_amount,
+        COALESCE(ci.notes, ci.description) AS notes,
+        to_char(ci.transaction_date, 'YYYY-MM-DD') AS transaction_date,
+        ci.source_type,
+        ci.invoice_id,
+        ci.created_at,
+        inv.invoice_source,
+        inv.external_order_id
+      FROM cash_in ci
+      LEFT JOIN invoices inv ON inv.id = ci.invoice_id
+      WHERE ci.branch_id = $1
     `;
     const values = [branch_id];
 
     if (from_date) {
       values.push(from_date);
-      query += ` AND transaction_date >= $${values.length}::date`;
+      query += ` AND ci.transaction_date >= $${values.length}::date`;
     }
     if (to_date) {
       values.push(to_date);
-      query += ` AND transaction_date <= $${values.length}::date`;
+      query += ` AND ci.transaction_date <= $${values.length}::date`;
     }
 
-    query += ` ORDER BY transaction_date DESC, id DESC`;
+    query += ` ORDER BY ci.transaction_date DESC, ci.id DESC`;
 
     const result = await client.query(query, values);
 
@@ -8202,19 +8205,22 @@ app.get("/cash-in/:id", authMiddleware, async (req, res) => {
     const result = await client.query(
       `
       SELECT
-        id,
-        branch_id,
-        customer_name,
-        amount,
-        paid_amount,
-        remaining_amount,
-        description,
-        to_char(transaction_date, 'YYYY-MM-DD') AS transaction_date,
-        source_type,
-        invoice_id,
-        created_at
-      FROM cash_in
-      WHERE id = $1 AND branch_id = $2
+        ci.id,
+        ci.branch_id,
+        ci.customer_name,
+        ci.amount,
+        ci.paid_amount,
+        ci.remaining_amount,
+        ci.description,
+        to_char(ci.transaction_date, 'YYYY-MM-DD') AS transaction_date,
+        ci.source_type,
+        ci.invoice_id,
+        ci.created_at,
+        inv.invoice_source,
+        inv.external_order_id
+      FROM cash_in ci
+      LEFT JOIN invoices inv ON inv.id = ci.invoice_id
+      WHERE ci.id = $1 AND ci.branch_id = $2
       `,
       [id, branch_id],
     );
