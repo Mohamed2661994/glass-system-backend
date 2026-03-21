@@ -1594,7 +1594,9 @@ async function buildOnlineInvoiceItems(items, invoiceType, client = pool) {
         ? catalogItem.retail_price
         : catalogItem.wholesale_price,
     );
-    const discount = roundMoney(catalogItem.discount_amount || 0);
+    const discount = roundMoney(
+      invoiceType === "retail" ? catalogItem.discount_amount || 0 : 0,
+    );
 
     const mergeKey = [
       catalogItem.product_id,
@@ -2806,7 +2808,7 @@ app.post(
           paidAmount,
           remainingAmount,
           paymentStatus,
-          true,
+          invoiceType === "retail",
           false,
           null,
           "Online Integration",
