@@ -84,6 +84,7 @@ function mapTableLabel(table) {
   const labels = {
     invoices: "فاتورة",
     invoice_items: "بند فاتورة",
+    online_invoice_audit: "أرشيف فاتورة أونلاين",
     customers: "عميل",
     suppliers: "مورد",
     products: "صنف",
@@ -736,6 +737,7 @@ const SYNC_TABLES = [
   { table: "users", pk: ["id"] },
   { table: "invoices", pk: ["id"] },
   { table: "invoice_items", pk: ["id"] },
+  { table: "online_invoice_audit", pk: ["id"] },
   { table: "stock_transfers", pk: ["id"] },
   { table: "stock_transfer_items", pk: ["id"] },
   { table: "stock_movements", pk: ["id"] },
@@ -1479,6 +1481,49 @@ async function ensureSyncSchema() {
     WHERE processed_at IS NULL
   `;
 
+  const ensureOnlineInvoiceAuditSql = `
+    CREATE TABLE IF NOT EXISTS online_invoice_audit (
+      id BIGSERIAL PRIMARY KEY,
+      source TEXT NOT NULL,
+      external_order_id TEXT NOT NULL,
+      invoice_id BIGINT,
+      invoice_type TEXT NOT NULL,
+      branch_id INTEGER,
+      movement_type TEXT NOT NULL DEFAULT 'sale',
+      customer_name TEXT,
+      customer_phone TEXT,
+      paid_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+      previous_balance NUMERIC(12,2) NOT NULL DEFAULT 0,
+      request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      resolved_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+      invoice_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'created',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+
+  const ensureOnlineInvoiceAuditIndexSql = `
+    CREATE UNIQUE INDEX IF NOT EXISTS online_invoice_audit_source_external_order_unique
+    ON online_invoice_audit (source, external_order_id)
+  `;
+
+  const ensureOnlineInvoiceAuditUpdatedAtTriggerSql = `
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'trg_updated_at_online_invoice_audit'
+          AND tgrelid = 'online_invoice_audit'::regclass
+      ) THEN
+        CREATE TRIGGER trg_updated_at_online_invoice_audit
+        BEFORE UPDATE ON public.online_invoice_audit
+        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+      END IF;
+    END $$;
+  `;
+
   const ensureTrackDeletionSql = `
     CREATE OR REPLACE FUNCTION public.track_deletion()
     RETURNS trigger
@@ -1550,6 +1595,18 @@ async function ensureSyncSchema() {
       console.log(`✅ ${label}: sync_outbox ready`);
     } catch (err) {
       console.error(`❌ ${label}: sync_outbox ensure failed:`, err.message);
+    }
+
+    try {
+      await poolRef.query(ensureOnlineInvoiceAuditSql);
+      await poolRef.query(ensureOnlineInvoiceAuditIndexSql);
+      await poolRef.query(ensureOnlineInvoiceAuditUpdatedAtTriggerSql);
+      console.log(`✅ ${label}: online_invoice_audit ready`);
+    } catch (err) {
+      console.error(
+        `❌ ${label}: online_invoice_audit ensure failed:`,
+        err.message,
+      );
     }
 
     try {

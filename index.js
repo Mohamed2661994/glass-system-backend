@@ -1320,7 +1320,9 @@ function secureCompareStrings(a, b) {
 }
 
 function onlineIntegrationAuthMiddleware(req, res, next) {
-  const expectedApiKey = String(process.env.ONLINE_INVOICE_API_KEY || "").trim();
+  const expectedApiKey = String(
+    process.env.ONLINE_INVOICE_API_KEY || "",
+  ).trim();
 
   if (!expectedApiKey) {
     return res.status(500).json({
@@ -1329,7 +1331,10 @@ function onlineIntegrationAuthMiddleware(req, res, next) {
   }
 
   const providedApiKey = getOnlineIntegrationApiKeyFromRequest(req);
-  if (!providedApiKey || !secureCompareStrings(providedApiKey, expectedApiKey)) {
+  if (
+    !providedApiKey ||
+    !secureCompareStrings(providedApiKey, expectedApiKey)
+  ) {
     return res.status(401).json({ error: "Unauthorized integration request" });
   }
 
@@ -1337,7 +1342,9 @@ function onlineIntegrationAuthMiddleware(req, res, next) {
 }
 
 function normalizeOnlineInvoiceSource(source) {
-  const normalizedSource = String(source || "website").trim().toLowerCase();
+  const normalizedSource = String(source || "website")
+    .trim()
+    .toLowerCase();
   return normalizedSource || "website";
 }
 
@@ -1363,6 +1370,96 @@ function buildOnlineInvoiceReferenceNote(notes, source, externalOrderId) {
   }
 
   return `${referenceLine}\n${normalizedNotes}`;
+}
+
+function buildOnlineInvoiceResolvedItemsSnapshot(items) {
+  return items.map((item) => ({
+    product_id: Number(item.product_id || 0),
+    product_name: item.product_name || "",
+    variant_id: Number(item.variant_id || 0),
+    package: item.package || "",
+    price: Number(item.price || 0),
+    quantity: Number(item.quantity || 0),
+    discount: Number(item.discount || 0),
+    item_total: Number(item.itemTotal || 0),
+    cost_price: Number(item.costPrice || 0),
+    is_return: Boolean(item.itemIsReturn),
+  }));
+}
+
+async function upsertOnlineInvoiceAuditRecord(
+  {
+    source,
+    externalOrderId,
+    invoiceId,
+    invoiceType,
+    branchId,
+    movementType,
+    customerName,
+    customerPhone,
+    paidAmount,
+    previousBalance,
+    requestPayload,
+    resolvedItems,
+    invoiceSnapshot,
+    status = "created",
+  },
+  client,
+) {
+  await client.query(
+    `
+    INSERT INTO online_invoice_audit (
+      source,
+      external_order_id,
+      invoice_id,
+      invoice_type,
+      branch_id,
+      movement_type,
+      customer_name,
+      customer_phone,
+      paid_amount,
+      previous_balance,
+      request_payload,
+      resolved_items,
+      invoice_snapshot,
+      status
+    )
+    VALUES (
+      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14
+    )
+    ON CONFLICT (source, external_order_id)
+    DO UPDATE SET
+      invoice_id = EXCLUDED.invoice_id,
+      invoice_type = EXCLUDED.invoice_type,
+      branch_id = EXCLUDED.branch_id,
+      movement_type = EXCLUDED.movement_type,
+      customer_name = EXCLUDED.customer_name,
+      customer_phone = EXCLUDED.customer_phone,
+      paid_amount = EXCLUDED.paid_amount,
+      previous_balance = EXCLUDED.previous_balance,
+      request_payload = EXCLUDED.request_payload,
+      resolved_items = EXCLUDED.resolved_items,
+      invoice_snapshot = EXCLUDED.invoice_snapshot,
+      status = EXCLUDED.status,
+      updated_at = NOW()
+    `,
+    [
+      source,
+      externalOrderId,
+      invoiceId || null,
+      invoiceType,
+      Number(branchId || 0) || null,
+      movementType,
+      customerName || null,
+      customerPhone || null,
+      roundMoney(paidAmount),
+      roundMoney(previousBalance),
+      JSON.stringify(requestPayload || {}),
+      JSON.stringify(resolvedItems || []),
+      JSON.stringify(invoiceSnapshot || {}),
+      status,
+    ],
+  );
 }
 
 async function upsertOnlineInvoiceCustomer(
@@ -2538,7 +2635,9 @@ app.post(
       const externalOrderId = String(
         req.body.externalOrderId || req.body.external_order_id || "",
       ).trim();
-      const invoiceType = String(req.body.invoiceType || req.body.invoice_type || "")
+      const invoiceType = String(
+        req.body.invoiceType || req.body.invoice_type || "",
+      )
         .trim()
         .toLowerCase();
       const movementType = "sale";
@@ -2548,15 +2647,23 @@ app.post(
       const branchId =
         Number(req.body.branch_id || req.body.branchId) ||
         getOnlineInvoiceDefaultBranchId(invoiceType);
-      const paidAmount = roundMoney(req.body.paid_amount || req.body.paidAmount || 0);
+      const paidAmount = roundMoney(
+        req.body.paid_amount || req.body.paidAmount || 0,
+      );
       const previousBalance = roundMoney(
         req.body.previous_balance || req.body.previousBalance || 0,
       );
       const customerName = String(
-        req.body.customer?.name || req.body.customer_name || req.body.customerName || "",
+        req.body.customer?.name ||
+          req.body.customer_name ||
+          req.body.customerName ||
+          "",
       ).trim();
       const customerPhone = String(
-        req.body.customer?.phone || req.body.customer_phone || req.body.customerPhone || "",
+        req.body.customer?.phone ||
+          req.body.customer_phone ||
+          req.body.customerPhone ||
+          "",
       ).trim();
       const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
 
@@ -2599,7 +2706,9 @@ app.post(
           invoice_type: existingInvoice.rows[0].invoice_type,
           total: Number(existingInvoice.rows[0].total || 0),
           paid_amount: Number(existingInvoice.rows[0].paid_amount || 0),
-          remaining_amount: Number(existingInvoice.rows[0].remaining_amount || 0),
+          remaining_amount: Number(
+            existingInvoice.rows[0].remaining_amount || 0,
+          ),
         });
       }
 
@@ -2607,6 +2716,9 @@ app.post(
         rawItems,
         invoiceType,
         client,
+      );
+      const resolvedItemsSnapshot = buildOnlineInvoiceResolvedItemsSnapshot(
+        normalizedItems,
       );
 
       const subtotal = roundMoney(
@@ -2698,6 +2810,36 @@ app.post(
       const invoiceId = invoiceRes.rows[0].id;
       const warehouseId = getWarehouseIdByInvoiceType(invoiceType);
 
+      await upsertOnlineInvoiceAuditRecord(
+        {
+          source,
+          externalOrderId,
+          invoiceId,
+          invoiceType,
+          branchId,
+          movementType,
+          customerName,
+          customerPhone,
+          paidAmount,
+          previousBalance,
+          requestPayload: req.body,
+          resolvedItems: resolvedItemsSnapshot,
+          invoiceSnapshot: {
+            invoice_id: invoiceId,
+            warehouse_id: warehouseId,
+            subtotal,
+            discount_total: discountTotal,
+            total,
+            paid_amount: paidAmount,
+            remaining_amount: remainingAmount,
+            payment_status: paymentStatus,
+            invoice_date: invoiceDate || getCairoDate(),
+          },
+          status: "created",
+        },
+        client,
+      );
+
       if (normalizedItems.length > 0) {
         const itemValues = [];
         const itemParams = [];
@@ -2780,7 +2922,11 @@ app.post(
         journalPosted = true;
       }
 
-      if (invoiceType === "wholesale" && paidAmount > 0 && Number(branchId) === 2) {
+      if (
+        invoiceType === "wholesale" &&
+        paidAmount > 0 &&
+        Number(branchId) === 2
+      ) {
         await client.query(
           `
           INSERT INTO cash_in
