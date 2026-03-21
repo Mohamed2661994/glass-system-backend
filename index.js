@@ -2804,6 +2804,15 @@ app.post(
       await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
       await client.query("COMMIT");
 
+      const io = req.app.get("io");
+      if (io) {
+        io.emit("data:invoices", {
+          action: "create",
+          invoice_id: invoiceId,
+          source,
+        });
+      }
+
       res.status(201).json({
         success: true,
         invoice_id: invoiceId,
@@ -4067,6 +4076,8 @@ app.get("/invoices/:id/edit", async (req, res) => {
       apply_items_discount: invoice.apply_items_discount,
       is_return: invoice.is_return || false,
       invoice_revision: Number(invoice.invoice_revision || 0),
+      invoice_source: invoice.invoice_source || null,
+      external_order_id: invoice.external_order_id || null,
 
       supplier_id: invoice.supplier_id,
       supplier_name: invoice.supplier_name,
@@ -5188,6 +5199,9 @@ app.get("/invoices", async (req, res) => {
       customer_id,
       is_return,
       invoice_id,
+      invoice_source,
+      external_order_id,
+      online_only,
       date_from,
       date_to,
       limit = 50,
@@ -5201,6 +5215,10 @@ app.get("/invoices", async (req, res) => {
     if (invoice_id) {
       conditions.push(`id = $${idx++}`);
       values.push(Number(invoice_id));
+    }
+
+    if (online_only === "true") {
+      conditions.push(`invoice_source IS NOT NULL`);
     }
 
     if (branch_id) {
@@ -5234,6 +5252,16 @@ app.get("/invoices", async (req, res) => {
     if (customer_id) {
       conditions.push(`customer_id = $${idx++}`);
       values.push(Number(customer_id));
+    }
+
+    if (invoice_source) {
+      conditions.push(`invoice_source = $${idx++}`);
+      values.push(String(invoice_source).trim().toLowerCase());
+    }
+
+    if (external_order_id) {
+      conditions.push(`external_order_id ILIKE $${idx++}`);
+      values.push(`%${external_order_id}%`);
     }
 
     if (date_from) {
@@ -5271,7 +5299,10 @@ app.get("/invoices", async (req, res) => {
         payment_status,
         invoice_date,
         created_at,
-        created_by_name
+        created_by_name,
+        invoice_source,
+        external_order_id,
+        notes
       FROM invoices
       ${whereClause}
       ORDER BY id DESC
