@@ -1524,6 +1524,7 @@ async function findCatalogItemByBarcode(code, client = pool) {
         p.name AS product_name,
         COALESCE(p.wholesale_price, 0) AS wholesale_price,
         COALESCE(p.retail_price, 0) AS retail_price,
+        COALESCE(p.discount_amount, 0) AS discount_amount,
         COALESCE(NULLIF(TRIM(p.wholesale_package), ''), '') AS wholesale_package,
         COALESCE(NULLIF(TRIM(p.retail_package), ''), '') AS retail_package
       FROM products p
@@ -1541,6 +1542,7 @@ async function findCatalogItemByBarcode(code, client = pool) {
         END AS product_name,
         COALESCE(pv.wholesale_price, p.wholesale_price, 0) AS wholesale_price,
         COALESCE(pv.retail_price, p.retail_price, 0) AS retail_price,
+        COALESCE(pv.discount_amount, p.discount_amount, 0) AS discount_amount,
         COALESCE(NULLIF(TRIM(pv.wholesale_package), ''), COALESCE(NULLIF(TRIM(p.wholesale_package), ''), '')) AS wholesale_package,
         COALESCE(NULLIF(TRIM(pv.retail_package), ''), COALESCE(NULLIF(TRIM(p.retail_package), ''), '')) AS retail_package
       FROM product_variants pv
@@ -1592,12 +1594,14 @@ async function buildOnlineInvoiceItems(items, invoiceType, client = pool) {
         ? catalogItem.retail_price
         : catalogItem.wholesale_price,
     );
+    const discount = roundMoney(catalogItem.discount_amount || 0);
 
     const mergeKey = [
       catalogItem.product_id,
       variantId,
       resolvedPackage,
       price,
+      discount,
     ].join(":");
 
     if (!mergedItems.has(mergeKey)) {
@@ -1608,7 +1612,7 @@ async function buildOnlineInvoiceItems(items, invoiceType, client = pool) {
         package: resolvedPackage,
         price,
         quantity: 0,
-        discount: 0,
+        discount,
         itemIsReturn: false,
       });
     }
@@ -1621,7 +1625,7 @@ async function buildOnlineInvoiceItems(items, invoiceType, client = pool) {
   for (const item of mergedItems.values()) {
     normalizedItems.push({
       ...item,
-      itemTotal: roundMoney(item.price * item.quantity),
+      itemTotal: roundMoney((item.price - item.discount) * item.quantity),
       costPrice: await getInvoiceItemCostSnapshot(
         item.product_id,
         item.variant_id,
@@ -2717,15 +2721,23 @@ app.post(
         invoiceType,
         client,
       );
-      const resolvedItemsSnapshot = buildOnlineInvoiceResolvedItemsSnapshot(
-        normalizedItems,
-      );
+      const resolvedItemsSnapshot =
+        buildOnlineInvoiceResolvedItemsSnapshot(normalizedItems);
 
       const subtotal = roundMoney(
-        normalizedItems.reduce((sum, item) => sum + item.itemTotal, 0),
+        normalizedItems.reduce(
+          (sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0),
+          0,
+        ),
       );
-      const discountTotal = 0;
-      const total = subtotal;
+      const discountTotal = roundMoney(
+        normalizedItems.reduce(
+          (sum, item) =>
+            sum + Number(item.discount || 0) * Number(item.quantity || 0),
+          0,
+        ),
+      );
+      const total = roundMoney(subtotal - discountTotal);
       const totalWithPrevious = roundMoney(total + previousBalance);
       const remainingAmount = roundMoney(totalWithPrevious - paidAmount);
       const paymentStatus =
@@ -2794,7 +2806,7 @@ app.post(
           paidAmount,
           remainingAmount,
           paymentStatus,
-          false,
+          true,
           false,
           null,
           "Online Integration",
@@ -2856,7 +2868,7 @@ app.post(
             item.package || "",
             item.price,
             item.quantity,
-            0,
+            item.discount,
             item.itemTotal,
             item.variant_id || 0,
             false,
