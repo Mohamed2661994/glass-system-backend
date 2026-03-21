@@ -4,6 +4,7 @@ require("dotenv").config();
 const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const multer = require("multer");
 const puppeteer = require("puppeteer");
 const webPush = require("web-push");
@@ -61,7 +62,7 @@ app.use(
       "https://www.hg-alshour.online",
     ],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
     credentials: true,
   }),
 );
@@ -70,7 +71,13 @@ app.use(express.json({ limit: "50mb" }));
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
 // Global auth middleware — protects ALL routes except public ones
-const PUBLIC_PATHS = ["/login", "/health", "/public", "/admin"];
+const PUBLIC_PATHS = [
+  "/login",
+  "/health",
+  "/public",
+  "/admin",
+  "/integrations",
+];
 const jwt_auth = require("jsonwebtoken");
 app.use((req, res, next) => {
   // Allow public paths
@@ -1161,6 +1168,13 @@ pool
 (async () => {
   try {
     await pool.query(`
+      ALTER TABLE invoices
+      ADD COLUMN IF NOT EXISTS invoice_source TEXT;
+      ALTER TABLE invoices
+      ADD COLUMN IF NOT EXISTS external_order_id TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_source_external_order
+      ON invoices (invoice_source, external_order_id)
+      WHERE external_order_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_invoices_type_date ON invoices (invoice_type, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices (customer_name);
       CREATE INDEX IF NOT EXISTS idx_invoices_movement ON invoices (movement_type);
@@ -1278,6 +1292,249 @@ async function getInvoiceItemCostSnapshot(
     variantRetailPurchasePrice ||
     productRetailPurchasePrice
   );
+}
+
+function getOnlineIntegrationApiKeyFromRequest(req) {
+  const apiKeyHeader = String(req.headers["x-api-key"] || "").trim();
+  if (apiKeyHeader) {
+    return apiKeyHeader;
+  }
+
+  const authHeader = String(req.headers.authorization || "").trim();
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    return authHeader.slice(7).trim();
+  }
+
+  return "";
+}
+
+function secureCompareStrings(a, b) {
+  const aBuffer = Buffer.from(String(a || ""));
+  const bBuffer = Buffer.from(String(b || ""));
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
+}
+
+function onlineIntegrationAuthMiddleware(req, res, next) {
+  const expectedApiKey = String(process.env.ONLINE_INVOICE_API_KEY || "").trim();
+
+  if (!expectedApiKey) {
+    return res.status(500).json({
+      error: "ONLINE_INVOICE_API_KEY غير مضبوط على السيرفر",
+    });
+  }
+
+  const providedApiKey = getOnlineIntegrationApiKeyFromRequest(req);
+  if (!providedApiKey || !secureCompareStrings(providedApiKey, expectedApiKey)) {
+    return res.status(401).json({ error: "Unauthorized integration request" });
+  }
+
+  next();
+}
+
+function normalizeOnlineInvoiceSource(source) {
+  const normalizedSource = String(source || "website").trim().toLowerCase();
+  return normalizedSource || "website";
+}
+
+function getOnlineInvoiceDefaultBranchId(invoiceType) {
+  const configuredBranchId = Number(process.env.ONLINE_INVOICE_BRANCH_ID || 0);
+  if (configuredBranchId > 0) {
+    return configuredBranchId;
+  }
+
+  return invoiceType === "wholesale" ? 2 : 1;
+}
+
+function buildOnlineInvoiceReferenceNote(notes, source, externalOrderId) {
+  const referenceLine = `طلب اونلاين ${source} #${externalOrderId}`;
+  const normalizedNotes = String(notes || "").trim();
+
+  if (!normalizedNotes) {
+    return referenceLine;
+  }
+
+  if (normalizedNotes.includes(referenceLine)) {
+    return normalizedNotes;
+  }
+
+  return `${referenceLine}\n${normalizedNotes}`;
+}
+
+async function upsertOnlineInvoiceCustomer(
+  customerName,
+  customerPhone,
+  invoiceType,
+  applyItemsDiscount,
+  client,
+) {
+  const normalizedName = String(customerName || "").trim();
+  const normalizedPhone = String(customerPhone || "").trim();
+
+  if (!normalizedName) {
+    return null;
+  }
+
+  const existingCustomer = await client.query(
+    `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
+    [normalizedName],
+  );
+
+  let customerId = existingCustomer.rows[0]?.id || null;
+  if (!customerId) {
+    const newCustomer = await client.query(
+      `
+      INSERT INTO customers (name, customer_type)
+      VALUES ($1, $2)
+      RETURNING id
+      `,
+      [normalizedName, invoiceType],
+    );
+    customerId = newCustomer.rows[0].id;
+  }
+
+  if (normalizedPhone) {
+    await client.query(
+      `
+      INSERT INTO customer_phones (customer_id, phone)
+      VALUES ($1, $2)
+      ON CONFLICT (phone) DO NOTHING
+      `,
+      [customerId, normalizedPhone],
+    );
+  }
+
+  await client.query(
+    `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
+    [Boolean(applyItemsDiscount), customerId],
+  );
+
+  return customerId;
+}
+
+async function findCatalogItemByBarcode(code, client = pool) {
+  const result = await client.query(
+    `
+    WITH candidates AS (
+      SELECT
+        0 AS priority,
+        p.id AS product_id,
+        0 AS variant_id,
+        p.name AS product_name,
+        COALESCE(p.wholesale_price, 0) AS wholesale_price,
+        COALESCE(p.retail_price, 0) AS retail_price,
+        COALESCE(NULLIF(TRIM(p.wholesale_package), ''), '') AS wholesale_package,
+        COALESCE(NULLIF(TRIM(p.retail_package), ''), '') AS retail_package
+      FROM products p
+      WHERE p.barcode = $1
+
+      UNION ALL
+
+      SELECT
+        1 AS priority,
+        p.id AS product_id,
+        pv.id AS variant_id,
+        CASE
+          WHEN COALESCE(NULLIF(TRIM(pv.label), ''), '') = '' THEN p.name
+          ELSE p.name || ' - ' || pv.label
+        END AS product_name,
+        COALESCE(pv.wholesale_price, p.wholesale_price, 0) AS wholesale_price,
+        COALESCE(pv.retail_price, p.retail_price, 0) AS retail_price,
+        COALESCE(NULLIF(TRIM(pv.wholesale_package), ''), COALESCE(NULLIF(TRIM(p.wholesale_package), ''), '')) AS wholesale_package,
+        COALESCE(NULLIF(TRIM(pv.retail_package), ''), COALESCE(NULLIF(TRIM(p.retail_package), ''), '')) AS retail_package
+      FROM product_variants pv
+      JOIN products p ON p.id = pv.product_id
+      WHERE pv.barcode = $1
+    )
+    SELECT *
+    FROM candidates
+    ORDER BY priority DESC
+    LIMIT 1
+    `,
+    [code],
+  );
+
+  return result.rows[0] || null;
+}
+
+async function buildOnlineInvoiceItems(items, invoiceType, client = pool) {
+  const mergedItems = new Map();
+
+  for (const rawItem of items) {
+    const code = String(rawItem?.code || rawItem?.barcode || "").trim();
+    const quantity = Number(rawItem?.quantity || 0);
+    const requestedPackage = normalizePackageName(rawItem?.package);
+
+    if (!code) {
+      throw new Error("كل صنف لازم يكون له code أو barcode");
+    }
+
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error(`الكمية غير صحيحة للصنف ${code}`);
+    }
+
+    const catalogItem = await findCatalogItemByBarcode(code, client);
+    if (!catalogItem) {
+      throw new Error(`الكود ${code} غير موجود في الأصناف`);
+    }
+
+    const variantId = Number(catalogItem.variant_id || 0);
+    const resolvedPackage =
+      requestedPackage ||
+      normalizePackageName(
+        invoiceType === "retail"
+          ? catalogItem.retail_package
+          : catalogItem.wholesale_package,
+      );
+    const price = roundMoney(
+      invoiceType === "retail"
+        ? catalogItem.retail_price
+        : catalogItem.wholesale_price,
+    );
+
+    const mergeKey = [
+      catalogItem.product_id,
+      variantId,
+      resolvedPackage,
+      price,
+    ].join(":");
+
+    if (!mergedItems.has(mergeKey)) {
+      mergedItems.set(mergeKey, {
+        product_id: Number(catalogItem.product_id),
+        product_name: catalogItem.product_name,
+        variant_id: variantId,
+        package: resolvedPackage,
+        price,
+        quantity: 0,
+        discount: 0,
+        itemIsReturn: false,
+      });
+    }
+
+    const currentItem = mergedItems.get(mergeKey);
+    currentItem.quantity = roundMoney(currentItem.quantity + quantity);
+  }
+
+  const normalizedItems = [];
+  for (const item of mergedItems.values()) {
+    normalizedItems.push({
+      ...item,
+      itemTotal: roundMoney(item.price * item.quantity),
+      costPrice: await getInvoiceItemCostSnapshot(
+        item.product_id,
+        item.variant_id,
+        invoiceType,
+        client,
+      ),
+    });
+  }
+
+  return normalizedItems;
 }
 
 function normalizePackageName(packageName) {
@@ -1506,7 +1763,9 @@ async function invoiceItemsHaveStructuralChanges(
 
 class InvoiceRevisionConflictError extends Error {
   constructor(currentRevision) {
-    super("الفاتورة تم تعديلها من شاشة أخرى. أعد تحميل الفاتورة ثم حاول مرة أخرى");
+    super(
+      "الفاتورة تم تعديلها من شاشة أخرى. أعد تحميل الفاتورة ثم حاول مرة أخرى",
+    );
     this.name = "InvoiceRevisionConflictError";
     this.currentRevision = Number(currentRevision || 0);
   }
@@ -2267,6 +2526,303 @@ app.get("/suppliers/:id/statement", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+app.post(
+  "/integrations/online-invoices",
+  onlineIntegrationAuthMiddleware,
+  async (req, res) => {
+    const client = await pool.connect();
+
+    try {
+      const source = normalizeOnlineInvoiceSource(req.body.source);
+      const externalOrderId = String(
+        req.body.externalOrderId || req.body.external_order_id || "",
+      ).trim();
+      const invoiceType = String(req.body.invoiceType || req.body.invoice_type || "")
+        .trim()
+        .toLowerCase();
+      const movementType = "sale";
+      const invoiceDate = String(
+        req.body.invoiceDate || req.body.invoice_date || getCairoDate(),
+      ).trim();
+      const branchId =
+        Number(req.body.branch_id || req.body.branchId) ||
+        getOnlineInvoiceDefaultBranchId(invoiceType);
+      const paidAmount = roundMoney(req.body.paid_amount || req.body.paidAmount || 0);
+      const previousBalance = roundMoney(
+        req.body.previous_balance || req.body.previousBalance || 0,
+      );
+      const customerName = String(
+        req.body.customer?.name || req.body.customer_name || req.body.customerName || "",
+      ).trim();
+      const customerPhone = String(
+        req.body.customer?.phone || req.body.customer_phone || req.body.customerPhone || "",
+      ).trim();
+      const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
+
+      if (!externalOrderId) {
+        return res.status(400).json({ error: "externalOrderId مطلوب" });
+      }
+
+      if (!["retail", "wholesale"].includes(invoiceType)) {
+        return res.status(400).json({
+          error: "invoiceType لازم يكون retail أو wholesale",
+        });
+      }
+
+      if (!customerName) {
+        return res.status(400).json({ error: "اسم العميل مطلوب" });
+      }
+
+      if (!rawItems.length) {
+        return res.status(400).json({ error: "لازم ترسل items" });
+      }
+
+      await client.query("BEGIN");
+
+      const existingInvoice = await client.query(
+        `
+        SELECT id, invoice_type, total, paid_amount, remaining_amount
+        FROM invoices
+        WHERE invoice_source = $1 AND external_order_id = $2
+        LIMIT 1
+        `,
+        [source, externalOrderId],
+      );
+
+      if (existingInvoice.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.json({
+          success: true,
+          duplicate: true,
+          invoice_id: existingInvoice.rows[0].id,
+          invoice_type: existingInvoice.rows[0].invoice_type,
+          total: Number(existingInvoice.rows[0].total || 0),
+          paid_amount: Number(existingInvoice.rows[0].paid_amount || 0),
+          remaining_amount: Number(existingInvoice.rows[0].remaining_amount || 0),
+        });
+      }
+
+      const normalizedItems = await buildOnlineInvoiceItems(
+        rawItems,
+        invoiceType,
+        client,
+      );
+
+      const subtotal = roundMoney(
+        normalizedItems.reduce((sum, item) => sum + item.itemTotal, 0),
+      );
+      const discountTotal = 0;
+      const total = subtotal;
+      const totalWithPrevious = roundMoney(total + previousBalance);
+      const remainingAmount = roundMoney(totalWithPrevious - paidAmount);
+      const paymentStatus =
+        remainingAmount <= 0 ? "paid" : paidAmount > 0 ? "partial" : "unpaid";
+      const invoiceNotes = buildOnlineInvoiceReferenceNote(
+        req.body.notes,
+        source,
+        externalOrderId,
+      );
+
+      const customerId = await upsertOnlineInvoiceCustomer(
+        customerName,
+        customerPhone,
+        invoiceType,
+        false,
+        client,
+      );
+
+      const invoiceRes = await client.query(
+        `
+        INSERT INTO invoices (
+          branch_id,
+          invoice_type,
+          movement_type,
+          invoice_date,
+          customer_id,
+          customer_name,
+          customer_phone,
+          previous_balance,
+          subtotal,
+          manual_discount,
+          discount_total,
+          total,
+          paid_amount,
+          remaining_amount,
+          payment_status,
+          apply_items_discount,
+          is_return,
+          created_by,
+          created_by_name,
+          supplier_id,
+          supplier_name,
+          supplier_phone,
+          notes,
+          invoice_source,
+          external_order_id
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25
+        )
+        RETURNING id
+        `,
+        [
+          branchId,
+          invoiceType,
+          movementType,
+          invoiceDate || getCairoDate(),
+          customerId,
+          customerName,
+          customerPhone || null,
+          previousBalance,
+          subtotal,
+          0,
+          discountTotal,
+          total,
+          paidAmount,
+          remainingAmount,
+          paymentStatus,
+          false,
+          false,
+          null,
+          "Online Integration",
+          null,
+          null,
+          null,
+          invoiceNotes,
+          source,
+          externalOrderId,
+        ],
+      );
+
+      const invoiceId = invoiceRes.rows[0].id;
+      const warehouseId = getWarehouseIdByInvoiceType(invoiceType);
+
+      if (normalizedItems.length > 0) {
+        const itemValues = [];
+        const itemParams = [];
+        let paramIdx = 1;
+
+        for (const item of normalizedItems) {
+          itemValues.push(
+            `($${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++},$${paramIdx++})`,
+          );
+          itemParams.push(
+            invoiceId,
+            item.product_id,
+            item.product_name,
+            item.package || "",
+            item.price,
+            item.quantity,
+            0,
+            item.itemTotal,
+            item.variant_id || 0,
+            false,
+            item.costPrice,
+          );
+        }
+
+        await client.query(
+          `
+          INSERT INTO invoice_items
+            (invoice_id, product_id, product_name, package, price, quantity, discount, total, variant_id, is_return, cost_price)
+          VALUES ${itemValues.join(",")}
+          `,
+          itemParams,
+        );
+      }
+
+      for (const item of normalizedItems) {
+        await client.query(
+          `
+          UPDATE stock
+          SET quantity = quantity - $1
+          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
+          `,
+          [item.quantity, warehouseId, item.product_id, item.variant_id || 0],
+        );
+
+        await client.query(
+          `
+          INSERT INTO stock_movements
+            (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+          VALUES ($1,$2,$3,$4,$5,'sale')
+          `,
+          [
+            invoiceId,
+            warehouseId,
+            item.product_id,
+            item.variant_id || 0,
+            item.quantity,
+          ],
+        );
+      }
+
+      let journalPosted = false;
+      if (invoiceType === "retail" && paidAmount > 0) {
+        await client.query(
+          `
+          INSERT INTO cash_in
+            (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'invoice', $8)
+          `,
+          [
+            branchId,
+            invoiceId,
+            customerName || "عميل نقدي",
+            total,
+            paidAmount,
+            remainingAmount,
+            `فاتورة قطاعي رقم #${invoiceId}`,
+            invoiceDate || getCairoDate(),
+          ],
+        );
+        journalPosted = true;
+      }
+
+      if (invoiceType === "wholesale" && paidAmount > 0 && Number(branchId) === 2) {
+        await client.query(
+          `
+          INSERT INTO cash_in
+            (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'invoice', $8)
+          `,
+          [
+            branchId,
+            invoiceId,
+            customerName || "عميل نقدي",
+            total,
+            paidAmount,
+            remainingAmount,
+            `فاتورة جملة رقم #${invoiceId}`,
+            invoiceDate || getCairoDate(),
+          ],
+        );
+        journalPosted = true;
+      }
+
+      await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
+      await client.query("COMMIT");
+
+      res.status(201).json({
+        success: true,
+        invoice_id: invoiceId,
+        external_order_id: externalOrderId,
+        invoice_type: invoiceType,
+        total,
+        paid_amount: paidAmount,
+        remaining_amount: remainingAmount,
+        journal_posted: journalPosted,
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("ONLINE INVOICE INTEGRATION ERROR:", err);
+      res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
+    }
+  },
+);
 
 app.post("/invoices", authMiddleware, async (req, res) => {
   console.log("USER FROM TOKEN:", req.user);
@@ -4020,7 +4576,9 @@ WHERE id = $14
     res.json({
       success: true,
       invoice_id: invoiceId,
-      invoice_revision: Number(updatedInvoiceRes.rows[0]?.invoice_revision || 0),
+      invoice_revision: Number(
+        updatedInvoiceRes.rows[0]?.invoice_revision || 0,
+      ),
       remaining,
       payment_status,
     });
