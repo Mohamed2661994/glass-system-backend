@@ -78,6 +78,7 @@ function getSyncLogs(limit = 100) {
 let realtimeSyncTimer = null;
 let realtimeSyncRequested = false;
 let pendingRealtimeOps = [];
+const OUTBOX_BATCH_LIMIT = 25;
 
 function mapTableLabel(table) {
   const labels = {
@@ -334,6 +335,231 @@ function pushRealtimeOperations(ops) {
   for (const op of ops) {
     pushRealtimeOperation(op);
   }
+}
+
+async function enqueueSyncOutbox(target, entityType, entityId, operation = "upsert") {
+  const normalizedEntityId = Number(entityId);
+
+  if (!entityType || !Number.isInteger(normalizedEntityId) || normalizedEntityId <= 0) {
+    return;
+  }
+
+  await target.query(
+    `
+    INSERT INTO sync_outbox
+      (entity_type, entity_id, operation, requested_at, available_at, attempts, last_error, processed_at)
+    VALUES
+      ($1, $2, $3, NOW(), NOW(), 0, NULL, NULL)
+    ON CONFLICT (entity_type, entity_id) WHERE processed_at IS NULL
+    DO UPDATE
+      SET operation = EXCLUDED.operation,
+          requested_at = NOW(),
+          available_at = NOW(),
+          attempts = 0,
+          last_error = NULL
+    `,
+    [entityType, normalizedEntityId, operation === "delete" ? "delete" : "upsert"],
+  );
+}
+
+async function enqueueInvoiceAggregateSync(target, invoiceId, operation = "upsert") {
+  return enqueueSyncOutbox(target, "invoice", invoiceId, operation);
+}
+
+async function replaceInvoiceScopedRows(targetClient, meta, invoiceId, rows) {
+  await targetClient.query(
+    `DELETE FROM "${meta.table}" WHERE "invoice_id" = $1`,
+    [invoiceId],
+  );
+
+  for (const row of rows) {
+    await upsertRow(targetClient, meta.table, meta.columns, meta.pk, row);
+  }
+}
+
+async function syncInvoiceAggregateFromSource(
+  sourcePool,
+  targetPool,
+  invoiceId,
+  operation = "upsert",
+) {
+  const normalizedInvoiceId = Number(invoiceId);
+  if (!Number.isInteger(normalizedInvoiceId) || normalizedInvoiceId <= 0) {
+    return 0;
+  }
+
+  const invoiceMeta = await getTableMeta("invoices");
+  const invoiceItemsMeta = await getTableMeta("invoice_items");
+  const stockMovementsMeta = await getTableMeta("stock_movements");
+  const cashInMeta = await getTableMeta("cash_in");
+  const stockMeta = await getTableMeta("stock");
+
+  const invoiceRes = await sourcePool.query(
+    `SELECT * FROM invoices WHERE id = $1 LIMIT 1`,
+    [normalizedInvoiceId],
+  );
+  const invoiceRow = invoiceRes.rows[0] || null;
+  const shouldDelete = operation === "delete" || !invoiceRow;
+
+  const targetClient = await targetPool.connect();
+  try {
+    await targetClient.query("BEGIN");
+
+    if (shouldDelete) {
+      await targetClient.query(`DELETE FROM cash_in WHERE invoice_id = $1`, [
+        normalizedInvoiceId,
+      ]);
+      await targetClient.query(
+        `DELETE FROM stock_movements WHERE invoice_id = $1`,
+        [normalizedInvoiceId],
+      );
+      await targetClient.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [
+        normalizedInvoiceId,
+      ]);
+      await targetClient.query(`DELETE FROM invoices WHERE id = $1`, [
+        normalizedInvoiceId,
+      ]);
+      await targetClient.query("COMMIT");
+      return 1;
+    }
+
+    const [invoiceItemsRes, stockMovementsRes, cashInRes] = await Promise.all([
+      sourcePool.query(
+        `SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY id ASC`,
+        [normalizedInvoiceId],
+      ),
+      sourcePool.query(
+        `SELECT * FROM stock_movements WHERE invoice_id = $1 ORDER BY id ASC`,
+        [normalizedInvoiceId],
+      ),
+      sourcePool.query(
+        `SELECT * FROM cash_in WHERE invoice_id = $1 ORDER BY id ASC`,
+        [normalizedInvoiceId],
+      ),
+    ]);
+
+    await upsertRow(
+      targetClient,
+      invoiceMeta.table,
+      invoiceMeta.columns,
+      invoiceMeta.pk,
+      invoiceRow,
+    );
+
+    await replaceInvoiceScopedRows(
+      targetClient,
+      invoiceItemsMeta,
+      normalizedInvoiceId,
+      invoiceItemsRes.rows,
+    );
+    await replaceInvoiceScopedRows(
+      targetClient,
+      stockMovementsMeta,
+      normalizedInvoiceId,
+      stockMovementsRes.rows,
+    );
+    await replaceInvoiceScopedRows(
+      targetClient,
+      cashInMeta,
+      normalizedInvoiceId,
+      cashInRes.rows,
+    );
+
+    const stockKeys = new Map();
+    for (const movement of stockMovementsRes.rows) {
+      const warehouseId = Number(movement.warehouse_id || 0);
+      const productId = Number(movement.product_id || 0);
+      const variantId = Number(movement.variant_id || 0);
+      if (!warehouseId || !productId) continue;
+      stockKeys.set(
+        `${warehouseId}|${productId}|${variantId}`,
+        { warehouseId, productId, variantId },
+      );
+    }
+
+    for (const stockKey of stockKeys.values()) {
+      const stockRes = await sourcePool.query(
+        `
+        SELECT *
+        FROM stock
+        WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = $3
+        LIMIT 1
+        `,
+        [stockKey.warehouseId, stockKey.productId, stockKey.variantId],
+      );
+      const stockRow = stockRes.rows[0];
+      if (!stockRow) continue;
+
+      await upsertRow(
+        targetClient,
+        stockMeta.table,
+        stockMeta.columns,
+        stockMeta.pk,
+        stockRow,
+      );
+    }
+
+    await targetClient.query("COMMIT");
+    return 1;
+  } catch (err) {
+    try {
+      await targetClient.query("ROLLBACK");
+    } catch {
+      // ignore rollback failure
+    }
+    throw err;
+  } finally {
+    targetClient.release();
+  }
+}
+
+async function processSyncOutbox(sourcePool, targetPool, label) {
+  const pendingRes = await sourcePool.query(
+    `
+    SELECT id, entity_type, entity_id, operation
+    FROM sync_outbox
+    WHERE processed_at IS NULL
+      AND available_at <= NOW()
+    ORDER BY requested_at ASC, id ASC
+    LIMIT $1
+    `,
+    [OUTBOX_BATCH_LIMIT],
+  );
+
+  let processedCount = 0;
+
+  for (const entry of pendingRes.rows) {
+    try {
+      if (entry.entity_type === "invoice") {
+        await syncInvoiceAggregateFromSource(
+          sourcePool,
+          targetPool,
+          entry.entity_id,
+          entry.operation,
+        );
+      }
+
+      await sourcePool.query(`DELETE FROM sync_outbox WHERE id = $1`, [entry.id]);
+      processedCount++;
+    } catch (err) {
+      await sourcePool.query(
+        `
+        UPDATE sync_outbox
+        SET attempts = attempts + 1,
+            last_error = LEFT($2, 500),
+            available_at = NOW() + INTERVAL '30 seconds'
+        WHERE id = $1
+        `,
+        [entry.id, err.message || `${label} outbox sync failed`],
+      );
+      console.error(
+        `❌ ${label} outbox sync failed for ${entry.entity_type} ${entry.entity_id}:`,
+        err.message,
+      );
+    }
+  }
+
+  return processedCount;
 }
 
 function scheduleRealtimeSync(reason = "write") {
@@ -729,6 +955,24 @@ async function syncBetweenPools(options = {}) {
   console.log("🔄 Starting bi-directional sync...");
 
   try {
+    try {
+      const localToCloudOutbox = await processSyncOutbox(
+        localPool,
+        cloudPool,
+        "Local→Cloud",
+      );
+      const cloudToLocalOutbox = await processSyncOutbox(
+        cloudPool,
+        localPool,
+        "Cloud→Local",
+      );
+      totalSynced += localToCloudOutbox + cloudToLocalOutbox;
+    } catch (err) {
+      totalErrors++;
+      errorDetails.push(`outbox: ${err.message}`);
+      console.error("❌ Outbox sync error:", err.message);
+    }
+
     if (trigger === "realtime" && selectiveOnly) {
       const sourcePool = getActivePool();
       const targetPool = getRealtimeTargetPool();
@@ -1151,6 +1395,26 @@ async function ensureSyncSchema() {
     END $$;
   `;
 
+  const ensureSyncOutboxSql = `
+    CREATE TABLE IF NOT EXISTS sync_outbox (
+      id BIGSERIAL PRIMARY KEY,
+      entity_type TEXT NOT NULL,
+      entity_id BIGINT NOT NULL,
+      operation TEXT NOT NULL DEFAULT 'upsert',
+      requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      processed_at TIMESTAMPTZ,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT
+    )
+  `;
+
+  const ensureSyncOutboxIndexSql = `
+    CREATE UNIQUE INDEX IF NOT EXISTS sync_outbox_pending_entity_unique
+    ON sync_outbox (entity_type, entity_id)
+    WHERE processed_at IS NULL
+  `;
+
   for (const [poolRef, label] of [
     [localPool, "Local"],
     [cloudPool, "Cloud"],
@@ -1183,6 +1447,14 @@ async function ensureSyncSchema() {
         `❌ ${label}: users.role constraint ensure failed:`,
         err.message,
       );
+    }
+
+    try {
+      await poolRef.query(ensureSyncOutboxSql);
+      await poolRef.query(ensureSyncOutboxIndexSql);
+      console.log(`✅ ${label}: sync_outbox ready`);
+    } catch (err) {
+      console.error(`❌ ${label}: sync_outbox ensure failed:`, err.message);
     }
   }
 
@@ -1306,3 +1578,4 @@ module.exports.syncBetweenPools = syncBetweenPools;
 module.exports.checkPool = checkPool;
 module.exports.getActivePool = getActivePool;
 module.exports.getSyncLogs = getSyncLogs;
+module.exports.enqueueInvoiceAggregateSync = enqueueInvoiceAggregateSync;
