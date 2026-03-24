@@ -1150,35 +1150,47 @@ pool
 // � جدول الموردين
 (async () => {
   try {
-    await runStartupSqlOnAllPools("suppliers table ready", `
+    await runStartupSqlOnAllPools(
+      "suppliers table ready",
+      `
       CREATE TABLE IF NOT EXISTS suppliers (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
       )
-    `);
+    `,
+    );
 
-    await runStartupSqlOnAllPools("supplier_phones table ready", `
+    await runStartupSqlOnAllPools(
+      "supplier_phones table ready",
+      `
       CREATE TABLE IF NOT EXISTS supplier_phones (
         id SERIAL PRIMARY KEY,
         supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
         phone VARCHAR(50) UNIQUE NOT NULL
       )
-    `);
+    `,
+    );
 
     // أعمدة المورد في الفواتير
-    await runStartupSqlOnAllPools("invoices supplier columns ready", `
+    await runStartupSqlOnAllPools(
+      "invoices supplier columns ready",
+      `
       ALTER TABLE invoices
         ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id),
         ADD COLUMN IF NOT EXISTS supplier_name VARCHAR(255),
         ADD COLUMN IF NOT EXISTS supplier_phone VARCHAR(50)
-    `);
+    `,
+    );
 
     // عمود المورد في المنصرفات (لدفعات الموردين)
-    await runStartupSqlOnAllPools("cash_out supplier_id column ready", `
+    await runStartupSqlOnAllPools(
+      "cash_out supplier_id column ready",
+      `
       ALTER TABLE cash_out
         ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id)
-    `);
+    `,
+    );
   } catch (e) {
     console.error("❌ suppliers migration error:", e.message);
   }
@@ -1187,7 +1199,9 @@ pool
 // 📊 Database indexes for performance
 (async () => {
   try {
-    await runStartupSqlOnAllPools("database indexes ready", `
+    await runStartupSqlOnAllPools(
+      "database indexes ready",
+      `
       ALTER TABLE invoices
       ADD COLUMN IF NOT EXISTS invoice_source TEXT;
       ALTER TABLE invoices
@@ -1206,7 +1220,8 @@ pool
       CREATE INDEX IF NOT EXISTS idx_stock_movements_warehouse ON stock_movements (warehouse_id);
       CREATE INDEX IF NOT EXISTS idx_cash_in_invoice ON cash_in (invoice_id);
       CREATE INDEX IF NOT EXISTS idx_invoices_supplier ON invoices (supplier_id);
-    `);
+    `,
+    );
   } catch (e) {
     console.error("❌ database indexes error:", e.message);
   }
@@ -4256,6 +4271,9 @@ app.get("/invoices/:id/edit", async (req, res) => {
       apply_items_discount: invoice.apply_items_discount,
       is_return: invoice.is_return || false,
       invoice_revision: Number(invoice.invoice_revision || 0),
+      hidden_from_list: Boolean(invoice.hidden_from_list),
+      hidden_from_list_at: invoice.hidden_from_list_at || null,
+      hidden_from_list_by: invoice.hidden_from_list_by || null,
       invoice_source: invoice.invoice_source || null,
       external_order_id: invoice.external_order_id || null,
 
@@ -4331,6 +4349,56 @@ app.get("/invoices/:id", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.patch("/invoices/:id/list-visibility", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
+    const invoiceId = Number(req.params.id);
+    if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+      return res.status(400).json({ error: "رقم الفاتورة غير صحيح" });
+    }
+
+    const hideFromList = Boolean(req.body?.hidden_from_list);
+    const hiddenByName =
+      currentUser.full_name || currentUser.username || "Admin";
+
+    const result = await client.query(
+      `
+      UPDATE invoices
+      SET
+        hidden_from_list = $2,
+        hidden_from_list_at = CASE WHEN $2 THEN NOW() ELSE NULL END,
+        hidden_from_list_by = CASE WHEN $2 THEN $3 ELSE NULL END
+      WHERE id = $1
+      RETURNING id, hidden_from_list, hidden_from_list_at, hidden_from_list_by
+      `,
+      [invoiceId, hideFromList, hiddenByName],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: "الفاتورة غير موجودة" });
+    }
+
+    const io = req.app.get("io");
+    if (io) {
+      io.emit("data:invoices", {
+        action: "update",
+        invoice_id: invoiceId,
+      });
+    }
+
+    res.json({ success: true, invoice: result.rows[0] });
+  } catch (err) {
+    console.error("TOGGLE INVOICE LIST VISIBILITY ERROR:", err);
+    res.status(500).json({ error: "فشل تحديث ظهور الفاتورة" });
+  } finally {
+    client.release();
   }
 });
 
@@ -5392,6 +5460,8 @@ app.get("/invoices", async (req, res) => {
     let values = [];
     let idx = 1;
 
+    conditions.push(`COALESCE(hidden_from_list, false) = false`);
+
     if (invoice_id) {
       conditions.push(`id = $${idx++}`);
       values.push(Number(invoice_id));
@@ -5480,6 +5550,9 @@ app.get("/invoices", async (req, res) => {
         invoice_date,
         created_at,
         created_by_name,
+        hidden_from_list,
+        hidden_from_list_at,
+        hidden_from_list_by,
         invoice_source,
         external_order_id,
         notes
@@ -10911,6 +10984,15 @@ async function runStartupMigrations() {
       sql: `
         ALTER TABLE invoices
         ADD COLUMN IF NOT EXISTS invoice_revision INTEGER NOT NULL DEFAULT 0
+      `,
+    },
+    {
+      name: "invoices.hidden_from_list",
+      sql: `
+        ALTER TABLE invoices
+        ADD COLUMN IF NOT EXISTS hidden_from_list BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS hidden_from_list_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS hidden_from_list_by TEXT
       `,
     },
   ];
