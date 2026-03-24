@@ -34,6 +34,30 @@ const {
 const {
   convertWholesaleToRetail,
 } = require("./services/wholesaleToRetailConverter");
+
+const STARTUP_DB_TARGETS = [
+  [localPool, "Local"],
+  [cloudPool, "Cloud"],
+];
+
+async function runStartupSqlOnAllPools(label, sql) {
+  await Promise.allSettled(
+    STARTUP_DB_TARGETS.map(async ([targetPool, targetLabel]) => {
+      await targetPool.query(sql);
+      console.log(`✅ ${targetLabel}: ${label}`);
+    }),
+  ).then((results) => {
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        console.error(
+          `❌ ${STARTUP_DB_TARGETS[index][1]}: ${label} failed:`,
+          result.reason?.message || result.reason,
+        );
+      }
+    });
+  });
+}
+
 function normalizeNumbers(text) {
   if (!text) return text;
 
@@ -1126,39 +1150,35 @@ pool
 // � جدول الموردين
 (async () => {
   try {
-    await pool.query(`
+    await runStartupSqlOnAllPools("suppliers table ready", `
       CREATE TABLE IF NOT EXISTS suppliers (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
-    console.log("✅ suppliers table ready");
 
-    await pool.query(`
+    await runStartupSqlOnAllPools("supplier_phones table ready", `
       CREATE TABLE IF NOT EXISTS supplier_phones (
         id SERIAL PRIMARY KEY,
         supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
         phone VARCHAR(50) UNIQUE NOT NULL
       )
     `);
-    console.log("✅ supplier_phones table ready");
 
     // أعمدة المورد في الفواتير
-    await pool.query(`
+    await runStartupSqlOnAllPools("invoices supplier columns ready", `
       ALTER TABLE invoices
         ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id),
         ADD COLUMN IF NOT EXISTS supplier_name VARCHAR(255),
         ADD COLUMN IF NOT EXISTS supplier_phone VARCHAR(50)
     `);
-    console.log("✅ invoices supplier columns ready");
 
     // عمود المورد في المنصرفات (لدفعات الموردين)
-    await pool.query(`
+    await runStartupSqlOnAllPools("cash_out supplier_id column ready", `
       ALTER TABLE cash_out
         ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id)
     `);
-    console.log("✅ cash_out supplier_id column ready");
   } catch (e) {
     console.error("❌ suppliers migration error:", e.message);
   }
@@ -1167,7 +1187,7 @@ pool
 // 📊 Database indexes for performance
 (async () => {
   try {
-    await pool.query(`
+    await runStartupSqlOnAllPools("database indexes ready", `
       ALTER TABLE invoices
       ADD COLUMN IF NOT EXISTS invoice_source TEXT;
       ALTER TABLE invoices
@@ -1187,7 +1207,6 @@ pool
       CREATE INDEX IF NOT EXISTS idx_cash_in_invoice ON cash_in (invoice_id);
       CREATE INDEX IF NOT EXISTS idx_invoices_supplier ON invoices (supplier_id);
     `);
-    console.log("✅ database indexes ready");
   } catch (e) {
     console.error("❌ database indexes error:", e.message);
   }
@@ -2728,7 +2747,8 @@ app.post(
 
       const subtotal = roundMoney(
         normalizedItems.reduce(
-          (sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 0),
+          (sum, item) =>
+            sum + Number(item.price || 0) * Number(item.quantity || 0),
           0,
         ),
       );
@@ -10895,18 +10915,9 @@ async function runStartupMigrations() {
     },
   ];
 
-  const results = await Promise.allSettled(
-    migrations.map((migration) => pool.query(migration.sql)),
-  );
-
-  results.forEach((result, index) => {
-    if (result.status === "rejected") {
-      console.error(
-        `Startup migration failed: ${migrations[index].name}`,
-        result.reason,
-      );
-    }
-  });
+  for (const migration of migrations) {
+    await runStartupSqlOnAllPools(migration.name, migration.sql);
+  }
 }
 
 runStartupMigrations().finally(() => {
