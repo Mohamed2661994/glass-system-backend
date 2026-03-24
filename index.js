@@ -4356,8 +4356,10 @@ app.patch("/invoices/:id/list-visibility", authMiddleware, async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const currentUser = await requireAdminUser(req, res);
-    if (!currentUser) return;
+    const currentUser = await loadCurrentUserAccess(req);
+    if (!isSuperAdmin(currentUser)) {
+      return res.status(403).json({ error: "غير مصرح" });
+    }
 
     const invoiceId = Number(req.params.id);
     if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
@@ -5450,6 +5452,7 @@ app.get("/invoices", async (req, res) => {
       invoice_source,
       external_order_id,
       online_only,
+      list_visibility,
       date_from,
       date_to,
       limit = 50,
@@ -5460,7 +5463,24 @@ app.get("/invoices", async (req, res) => {
     let values = [];
     let idx = 1;
 
-    conditions.push(`COALESCE(hidden_from_list, false) = false`);
+    const normalizedListVisibility = String(list_visibility || "visible")
+      .trim()
+      .toLowerCase();
+
+    if (normalizedListVisibility === "hidden") {
+      const currentUser = await loadCurrentUserAccess(req);
+      if (!isSuperAdmin(currentUser)) {
+        return res.status(403).json({ error: "غير مصرح" });
+      }
+      conditions.push(`COALESCE(hidden_from_list, false) = true`);
+    } else if (normalizedListVisibility === "all") {
+      const currentUser = await loadCurrentUserAccess(req);
+      if (!isSuperAdmin(currentUser)) {
+        return res.status(403).json({ error: "غير مصرح" });
+      }
+    } else {
+      conditions.push(`COALESCE(hidden_from_list, false) = false`);
+    }
 
     if (invoice_id) {
       conditions.push(`id = $${idx++}`);
