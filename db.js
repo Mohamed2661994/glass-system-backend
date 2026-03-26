@@ -391,7 +391,14 @@ async function replaceInvoiceScopedRows(targetClient, meta, invoiceId, rows) {
   );
 
   for (const row of rows) {
-    await upsertRow(targetClient, meta.table, meta.columns, meta.pk, row);
+    await upsertRow(
+      targetClient,
+      meta.table,
+      meta.columns,
+      meta.pk,
+      row,
+      meta.columnTypes,
+    );
   }
 }
 
@@ -468,6 +475,7 @@ async function syncInvoiceAggregateFromSource(
       invoiceMeta.columns,
       invoiceMeta.pk,
       invoiceRow,
+      invoiceMeta.columnTypes,
     );
 
     await replaceInvoiceScopedRows(
@@ -521,6 +529,7 @@ async function syncInvoiceAggregateFromSource(
         stockMeta.columns,
         stockMeta.pk,
         stockRow,
+        stockMeta.columnTypes,
       );
     }
 
@@ -769,17 +778,23 @@ async function getTableMeta(table) {
 
   const [localColsResult, cloudColsResult] = await Promise.all([
     localPool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+      `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
       [table],
     ),
     cloudPool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
+      `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1 ORDER BY ordinal_position`,
       [table],
     ),
   ]);
 
   const localColumns = localColsResult.rows.map((r) => r.column_name);
   const cloudColumns = cloudColsResult.rows.map((r) => r.column_name);
+  const localTypes = new Map(
+    localColsResult.rows.map((r) => [r.column_name, r.data_type]),
+  );
+  const cloudTypes = new Map(
+    cloudColsResult.rows.map((r) => [r.column_name, r.data_type]),
+  );
 
   const localSet = new Set(localColumns);
   const cloudSet = new Set(cloudColumns);
@@ -810,10 +825,18 @@ async function getTableMeta(table) {
     return null;
   }
 
+  const columnTypes = Object.fromEntries(
+    columns.map((column) => [
+      column,
+      cloudTypes.get(column) || localTypes.get(column) || null,
+    ]),
+  );
+
   const meta = {
     table,
     pk: tableCfg.pk,
     columns,
+    columnTypes,
     hasUpdatedAt: columns.includes("updated_at"),
   };
 
@@ -849,11 +872,11 @@ async function syncRowFromSourceToTarget(
   meta,
   sourceRow,
 ) {
-  const { table, pk, columns, hasUpdatedAt } = meta;
+  const { table, pk, columns, columnTypes, hasUpdatedAt } = meta;
 
   const targetRow = await getRowByPk(targetPool, table, pk, sourceRow);
   if (!targetRow) {
-    return upsertRow(targetPool, table, columns, pk, sourceRow);
+    return upsertRow(targetPool, table, columns, pk, sourceRow, columnTypes);
   }
 
   if (hasUpdatedAt && sourceRow.updated_at && targetRow.updated_at) {
@@ -866,7 +889,7 @@ async function syncRowFromSourceToTarget(
     return 0;
   }
 
-  return upsertRow(targetPool, table, columns, pk, sourceRow);
+  return upsertRow(targetPool, table, columns, pk, sourceRow, columnTypes);
 }
 
 async function syncRecentRowsForTable(table, sinceIso, sourcePool, targetPool) {
@@ -1220,7 +1243,14 @@ async function syncTable(table, pk) {
     const failed = [];
     for (const op of remaining) {
       try {
-        const changed = await upsertRow(op.pool, table, columns, pk, op.row);
+        const changed = await upsertRow(
+          op.pool,
+          table,
+          columns,
+          pk,
+          op.row,
+          meta.columnTypes,
+        );
         if (changed > 0) synced++;
       } catch (err) {
         // Only retry FK violations, re-throw others
@@ -1400,8 +1430,23 @@ async function syncSequences() {
   }
 }
 
-async function upsertRow(targetPool, table, columns, pk, row) {
-  const vals = columns.map((c) => row[c]);
+function prepareColumnValue(value, dataType) {
+  if (value == null) return value;
+  if (dataType === "json" || dataType === "jsonb") {
+    return JSON.stringify(value);
+  }
+  return value;
+}
+
+async function upsertRow(
+  targetPool,
+  table,
+  columns,
+  pk,
+  row,
+  columnTypes = {},
+) {
+  const vals = columns.map((c) => prepareColumnValue(row[c], columnTypes?.[c]));
   const placeholders = columns.map((_, i) => `$${i + 1}`).join(", ");
   const colList = columns.map((c) => `"${c}"`).join(", ");
   const pkList = pk.map((k) => `"${k}"`).join(", ");
