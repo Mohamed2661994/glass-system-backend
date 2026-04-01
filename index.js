@@ -1000,6 +1000,20 @@ pool
     console.error("❌ products.has_wholesale column error:", e.message),
   );
 
+pool
+  .query(
+    `ALTER TABLE products
+      ADD COLUMN IF NOT EXISTS purchase_price_adjustment NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS purchase_price_adjustment_is_percentage BOOLEAN DEFAULT false`,
+  )
+  .then(() => console.log("✅ products.purchase adjustment columns ready"))
+  .catch((e) =>
+    console.error(
+      "❌ products.purchase adjustment columns error:",
+      e.message,
+    ),
+  );
+
 // إضافة عمود المرتجع للفواتير
 pool
   .query(
@@ -6026,6 +6040,8 @@ app.get("/admin/products", async (req, res) => {
   p.retail_package,
   p.manufacturer,
   p.purchase_price,
+  p.purchase_price_adjustment,
+  p.purchase_price_adjustment_is_percentage,
   p.retail_purchase_price,
   p.wholesale_price,
   p.retail_price,
@@ -6338,6 +6354,8 @@ app.post("/admin/products", async (req, res) => {
       retail_package,
       manufacturer,
       purchase_price,
+      purchase_price_adjustment = 0,
+      purchase_price_adjustment_is_percentage = false,
       retail_purchase_price,
       wholesale_price,
       retail_price,
@@ -6372,13 +6390,15 @@ app.post("/admin/products", async (req, res) => {
   retail_purchase_price,
   barcode,
   purchase_price,
+  purchase_price_adjustment,
+  purchase_price_adjustment_is_percentage,
   wholesale_price,
   retail_price,
   discount_amount,
   description,
   has_wholesale
 )
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 RETURNING *
 
       `,
@@ -6390,6 +6410,8 @@ RETURNING *
         retail_purchase_price,
         barcode || null,
         purchase_price || 0,
+        purchase_price_adjustment || 0,
+        Boolean(purchase_price_adjustment_is_percentage),
         wholesale_price || 0,
         retail_price,
         discount_amount,
@@ -6435,6 +6457,8 @@ app.put("/admin/products/:id", async (req, res) => {
       manufacturer,
       barcode,
       purchase_price,
+      purchase_price_adjustment = 0,
+      purchase_price_adjustment_is_percentage = false,
       retail_purchase_price,
       wholesale_price,
       retail_price,
@@ -6467,13 +6491,15 @@ SET
   manufacturer = $4,
   barcode = $5,
   purchase_price = $6,
-  retail_purchase_price = $7,
-  wholesale_price = $8,
-  retail_price = $9,
-  discount_amount = $10,
-  description = $11,
-  has_wholesale = $12
-WHERE id = $13
+  purchase_price_adjustment = $7,
+  purchase_price_adjustment_is_percentage = $8,
+  retail_purchase_price = $9,
+  wholesale_price = $10,
+  retail_price = $11,
+  discount_amount = $12,
+  description = $13,
+  has_wholesale = $14
+WHERE id = $15
 RETURNING *
       `,
       [
@@ -6483,6 +6509,8 @@ RETURNING *
         manufacturer,
         barcode || null,
         purchase_price || 0,
+        purchase_price_adjustment || 0,
+        Boolean(purchase_price_adjustment_is_percentage),
         retail_purchase_price,
         wholesale_price || 0,
         retail_price,
