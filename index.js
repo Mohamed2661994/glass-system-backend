@@ -4789,7 +4789,7 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
       `
  UPDATE invoices
 SET
-  customer_id = $20,
+  customer_id = $21,
   customer_name = $1,
   customer_phone = $2,
   previous_balance = $3,
