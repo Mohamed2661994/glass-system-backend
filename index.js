@@ -1008,10 +1008,7 @@ pool
   )
   .then(() => console.log("✅ products.purchase adjustment columns ready"))
   .catch((e) =>
-    console.error(
-      "❌ products.purchase adjustment columns error:",
-      e.message,
-    ),
+    console.error("❌ products.purchase adjustment columns error:", e.message),
   );
 
 // إضافة عمود المرتجع للفواتير
@@ -3068,6 +3065,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       customer_name,
       customer_phone,
       previous_balance = 0,
+      additional_amount = 0,
       paid_amount = 0,
       created_by,
       notes,
@@ -3114,7 +3112,10 @@ app.post("/invoices", authMiddleware, async (req, res) => {
 
     const total = subtotal - discount_total;
 
-    const totalWithPrevious = total + Number(previous_balance || 0);
+    const totalWithPrevious =
+      total +
+      Number(previous_balance || 0) +
+      Number(additional_amount || 0);
 
     const remaining_amount = totalWithPrevious - paid_amount;
 
@@ -3207,6 +3208,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
   customer_name,
   customer_phone,
   previous_balance,
+  additional_amount,
   subtotal,
   manual_discount,
   discount_total,
@@ -3224,7 +3226,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
   notes
 )
 VALUES
-($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
       RETURNING id
       `,
       [
@@ -3236,6 +3238,7 @@ VALUES
         customer_name,
         customer_phone,
         Number(previous_balance) || 0,
+        Number(additional_amount) || 0,
         subtotal,
         extra_discount,
         discount_total,
@@ -3489,6 +3492,7 @@ app.post("/invoices/retail", async (req, res) => {
       items,
       paid_amount = 0,
       previous_balance = 0,
+      additional_amount = 0,
       apply_items_discount = false,
       is_return = false,
     } = req.body;
@@ -3514,8 +3518,12 @@ app.post("/invoices/retail", async (req, res) => {
     await client.query("BEGIN");
 
     const totalWithPrevious =
-      Math.round((Number(final_total) + Number(previous_balance || 0)) * 100) /
-      100;
+      Math.round(
+        (Number(final_total) +
+          Number(previous_balance || 0) +
+          Number(additional_amount || 0)) *
+          100,
+      ) / 100;
 
     const remaining_amount =
       Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
@@ -3595,6 +3603,7 @@ app.post("/invoices/retail", async (req, res) => {
         customer_name,
         customer_phone,
         previous_balance,
+        additional_amount,
         subtotal,
         manual_discount,  
         discount_total,
@@ -3612,7 +3621,7 @@ app.post("/invoices/retail", async (req, res) => {
         notes
       )
       VALUES
-      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
       RETURNING id
       `,
       [
@@ -3623,6 +3632,7 @@ app.post("/invoices/retail", async (req, res) => {
         customer_name,
         customer_phone,
         Number(previous_balance) || 0,
+        Number(additional_amount) || 0,
         Number(total_before_discount),
         Number(extra_discount || 0),
         Number(items_discount) + Number(extra_discount),
@@ -3830,6 +3840,7 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
       items,
       paid_amount = 0,
       previous_balance: bodyPrevBalance,
+      additional_amount = 0,
       apply_items_discount = false,
       invoice_revision,
     } = req.body;
@@ -4013,7 +4024,12 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
     const total = Math.round(Number(final_total) * 100) / 100;
 
     const totalWithPrevious =
-      Math.round((total + Number(prevBalance || 0)) * 100) / 100;
+      Math.round(
+        (total +
+          Number(prevBalance || 0) +
+          Number(additional_amount || 0)) *
+          100,
+      ) / 100;
     const remaining_amount =
       Math.round((totalWithPrevious - Number(paid_amount || 0)) * 100) / 100;
 
@@ -4085,29 +4101,31 @@ SET
   customer_name = $1,
   customer_phone = $2,
   previous_balance = $3,
-  subtotal = $4,
-  manual_discount = $5,
-  discount_total = $6,
-  total = $7,
-  paid_amount = $8,
-  remaining_amount = $9,
-  payment_status = $10,
-  apply_items_discount = $11,
-  updated_by = $12,
-  updated_by_name = $13,
-  supplier_id = $15,
-  supplier_name = $16,
-  supplier_phone = $17,
-  invoice_date = COALESCE($18::date, invoice_date),
-  notes = $19,
-  invoice_revision = $21
-WHERE id = $14
+  additional_amount = $4,
+  subtotal = $5,
+  manual_discount = $6,
+  discount_total = $7,
+  total = $8,
+  paid_amount = $9,
+  remaining_amount = $10,
+  payment_status = $11,
+  apply_items_discount = $12,
+  updated_by = $13,
+  updated_by_name = $14,
+  supplier_id = $16,
+  supplier_name = $17,
+  supplier_phone = $18,
+  invoice_date = COALESCE($19::date, invoice_date),
+  notes = $20,
+  invoice_revision = $22
+WHERE id = $15
 RETURNING invoice_revision
       `,
       [
         customer_name,
         customer_phone || null,
         prevBalance,
+        Number(additional_amount) || 0,
         subtotal,
         manualDiscount,
         discountTotal,
@@ -4280,6 +4298,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
 
       paid_amount: invoice.paid_amount,
       previous_balance: invoice.previous_balance,
+      additional_amount: invoice.additional_amount,
       remaining_amount: invoice.remaining_amount,
       payment_status: invoice.payment_status,
       apply_items_discount: invoice.apply_items_discount,
@@ -4352,7 +4371,9 @@ app.get("/invoices/:id", async (req, res) => {
     );
 
     const total_due =
-      Number(invoice.total || 0) + Number(invoice.previous_balance || 0);
+      Number(invoice.total || 0) +
+      Number(invoice.previous_balance || 0) +
+      Number(invoice.additional_amount || 0);
 
     res.json({
       ...invoice,
@@ -4499,6 +4520,7 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
       customer_name,
       customer_phone,
       previous_balance = 0,
+      additional_amount = 0,
       paid_amount = 0,
       apply_items_discount = false,
       manual_discount = 0,
@@ -4707,7 +4729,10 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
       : extraDiscount;
 
     const total = subtotal - discountTotal;
-    const totalWithPrevious = total + Number(previous_balance || 0);
+    const totalWithPrevious =
+      total +
+      Number(previous_balance || 0) +
+      Number(additional_amount || 0);
     const remaining = totalWithPrevious - Number(paid_amount || 0);
 
     const payment_status =
@@ -4783,29 +4808,31 @@ SET
   customer_name = $1,
   customer_phone = $2,
   previous_balance = $3,
-  subtotal = $4,
-  manual_discount = $5,
-  discount_total = $6,
-  total = $7,
-  paid_amount = $8,
-  remaining_amount = $9,
-  payment_status = $10,
-  apply_items_discount = $11,
-  updated_by = $12,
-  updated_by_name = $13,
-  supplier_id = $15,
-  supplier_name = $16,
-  supplier_phone = $17,
-  invoice_date = COALESCE($18::date, invoice_date),
-        notes = $19,
-        invoice_revision = $21
-WHERE id = $14
+    additional_amount = $4,
+    subtotal = $5,
+    manual_discount = $6,
+    discount_total = $7,
+    total = $8,
+    paid_amount = $9,
+    remaining_amount = $10,
+    payment_status = $11,
+    apply_items_discount = $12,
+    updated_by = $13,
+    updated_by_name = $14,
+    supplier_id = $16,
+    supplier_name = $17,
+    supplier_phone = $18,
+    invoice_date = COALESCE($19::date, invoice_date),
+      notes = $20,
+      invoice_revision = $22
+  WHERE id = $15
       RETURNING invoice_revision
   `,
       [
         customer_name,
         customer_phone || null,
         Number(previous_balance || 0),
+      Number(additional_amount || 0),
         subtotal,
         extraDiscount,
         discountTotal,
@@ -4922,10 +4949,12 @@ app.get("/invoices/:id/pdf", async (req, res) => {
     );
 
     const previousBalance = Number(invoice.previous_balance) || 0;
+    const additionalAmount = Number(invoice.additional_amount) || 0;
     const paidAmount = Number(invoice.paid_amount) || 0;
     const extraDiscount = Number(invoice.manual_discount) || 0;
 
-    const totalWithPrevious = itemsSubtotal + previousBalance;
+    const totalWithPrevious =
+      itemsSubtotal + previousBalance + additionalAmount;
     const netTotal = totalWithPrevious - extraDiscount;
     const remaining = netTotal - paidAmount;
 
@@ -5017,6 +5046,7 @@ ${items
   <div>إجمالي الكمية: ${totalQty}</div>
   <div>الإجمالي: ${itemsSubtotal.toFixed(2)}</div>
   ${previousBalance ? `<div>حساب سابق: ${previousBalance.toFixed(2)}</div>` : ""}
+  ${additionalAmount ? `<div>إضافة: ${additionalAmount.toFixed(2)}</div>` : ""}
   ${extraDiscount ? `<div>خصم: ${extraDiscount.toFixed(2)}</div>` : ""}
   <div><strong>الصافي: ${netTotal.toFixed(2)}</strong></div>
   ${paidAmount ? `<div>المدفوع: ${paidAmount.toFixed(2)}</div>` : ""}
@@ -5101,10 +5131,11 @@ app.get("/invoices/:id/print", async (req, res) => {
     const totalQty = items.reduce((s, it) => s + Number(it.quantity || 0), 0);
 
     const previousBalance = Number(invoice.previous_balance) || 0;
+    const additionalAmount = Number(invoice.additional_amount) || 0;
     const discount = Number(invoice.manual_discount) || 0;
     const paid = Number(invoice.paid_amount) || 0;
 
-    const netTotal = subtotal + previousBalance - discount;
+    const netTotal = subtotal + previousBalance + additionalAmount - discount;
     const remaining = netTotal - paid;
 
     const rowsHtml = items
@@ -5578,6 +5609,7 @@ app.get("/invoices", async (req, res) => {
         discount_total,
         total,
         previous_balance,
+        additional_amount,
         paid_amount,
         remaining_amount,
         payment_status,
@@ -8019,6 +8051,7 @@ app.post("/cash/in/from-invoice", authMiddleware, async (req, res) => {
   paid_amount,
   total,
   previous_balance,
+  additional_amount,
   movement_type,
   invoice_type,
   invoice_date
@@ -8047,7 +8080,9 @@ WHERE id = $1
     }
 
     const totalWithPrevious =
-      Number(invoice.total || 0) + Number(invoice.previous_balance || 0);
+      Number(invoice.total || 0) +
+      Number(invoice.previous_balance || 0) +
+      Number(invoice.additional_amount || 0);
 
     const remainingCash = totalWithPrevious - Number(invoice.paid_amount || 0);
 
@@ -11044,6 +11079,13 @@ async function runStartupMigrations() {
         ADD COLUMN IF NOT EXISTS hidden_from_list BOOLEAN NOT NULL DEFAULT false,
         ADD COLUMN IF NOT EXISTS hidden_from_list_at TIMESTAMPTZ,
         ADD COLUMN IF NOT EXISTS hidden_from_list_by TEXT
+      `,
+    },
+    {
+      name: "invoices.additional_amount",
+      sql: `
+        ALTER TABLE invoices
+        ADD COLUMN IF NOT EXISTS additional_amount NUMERIC NOT NULL DEFAULT 0
       `,
     },
   ];
