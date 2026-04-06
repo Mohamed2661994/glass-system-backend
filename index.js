@@ -1250,6 +1250,33 @@ function getWarehouseIdByInvoiceType(invoice_type) {
   throw new Error("invoice_type غير معروف");
 }
 
+async function decrementStockOrThrow(
+  client,
+  { warehouseId, productId, variantId = 0, quantity, reason },
+) {
+  const normalizedQuantity = Number(quantity || 0);
+  const normalizedVariantId = Number(variantId || 0);
+
+  const result = await client.query(
+    `
+    UPDATE stock
+    SET quantity = quantity - $1
+    WHERE warehouse_id = $2
+      AND product_id = $3
+      AND variant_id = $4
+      AND quantity >= $1
+    `,
+    [normalizedQuantity, warehouseId, productId, normalizedVariantId],
+  );
+
+  if (!result.rowCount) {
+    throw new Error(
+      reason ||
+        `STOCK_DECREMENT_FAILED:${warehouseId}:${productId}:${normalizedVariantId}`,
+    );
+  }
+}
+
 async function getWholesaleWarehouseByBranch(branch_id, client = pool) {
   const res = await client.query(
     `
@@ -1760,6 +1787,7 @@ async function getProductVariantPackageMeta(
 
 async function resolveInvoiceItemVariantId(
   item,
+  invoiceType,
   client = pool,
   cache = new Map(),
 ) {
@@ -1777,6 +1805,10 @@ async function resolveInvoiceItemVariantId(
   const matchedVariantId = packageName
     ? Number(variantPackageMap.get(packageName) || 0)
     : 0;
+
+  if (invoiceType === "retail" && packageName && basePackages.has(packageName)) {
+    return 0;
+  }
 
   if (matchedVariantId) {
     return matchedVariantId;
@@ -1807,6 +1839,7 @@ async function normalizeInvoiceItemsForStorage(
     const discount = Number(item.discount || 0);
     const variantId = await resolveInvoiceItemVariantId(
       item,
+      invoiceType,
       client,
       variantMetaCache,
     );
@@ -2935,14 +2968,13 @@ app.post(
       }
 
       for (const item of normalizedItems) {
-        await client.query(
-          `
-          UPDATE stock
-          SET quantity = quantity - $1
-          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
-          `,
-          [item.quantity, warehouseId, item.product_id, item.variant_id || 0],
-        );
+        await decrementStockOrThrow(client, {
+          warehouseId,
+          productId: item.product_id,
+          variantId: item.variant_id || 0,
+          quantity: item.quantity,
+          reason: `رصيد غير كافٍ أو الصنف غير موجود للمخزن: ${item.product_name}`,
+        });
 
         await client.query(
           `
@@ -3113,9 +3145,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
     const total = subtotal - discount_total;
 
     const totalWithPrevious =
-      total +
-      Number(previous_balance || 0) +
-      Number(additional_amount || 0);
+      total + Number(previous_balance || 0) + Number(additional_amount || 0);
 
     const remaining_amount = totalWithPrevious - paid_amount;
 
@@ -3313,14 +3343,13 @@ VALUES
       if (movement_type === "purchase") {
         if (itemIsReturn) {
           // 🔴 مرتجع شراء → خصم من المخزون (إرجاع للمورد)
-          await client.query(
-            `
-            UPDATE stock
-            SET quantity = quantity - $1
-            WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
-            `,
-            [item.quantity, warehouseId, item.product_id, variantId],
-          );
+          await decrementStockOrThrow(client, {
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            reason: `لا يمكن تسجيل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
+          });
           await client.query(
             `INSERT INTO stock_movements
              (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
@@ -3367,14 +3396,13 @@ VALUES
           );
         } else {
           // 🔴 بيع → خصم من المخزون
-          await client.query(
-            `
-            UPDATE stock
-            SET quantity = quantity - $1
-            WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
-            `,
-            [item.quantity, warehouseId, item.product_id, variantId],
-          );
+          await decrementStockOrThrow(client, {
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            reason: `رصيد غير كافٍ للبيع: ${item.product_name}`,
+          });
           await client.query(
             `INSERT INTO stock_movements
              (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
@@ -3707,20 +3735,24 @@ app.post("/invoices/retail", async (req, res) => {
           );
         } else {
           // 🔴 بيع → خصم من المخزون
-          await client.query(
-            `UPDATE stock SET quantity = quantity - $1
-             WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-            [item.quantity, warehouseId, item.product_id, variantId],
-          );
+          await decrementStockOrThrow(client, {
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            reason: `رصيد غير كافٍ للبيع: ${item.product_name}`,
+          });
         }
       } else {
         if (itemIsReturn) {
           // 🔴 مرتجع شراء → خصم من المخزون
-          await client.query(
-            `UPDATE stock SET quantity = quantity - $1
-             WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-            [item.quantity, warehouseId, item.product_id, variantId],
-          );
+          await decrementStockOrThrow(client, {
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            reason: `لا يمكن تسجيل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
+          });
         } else {
           // 🟢 شراء → زيادة المخزون
           await client.query(
@@ -3887,11 +3919,13 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
           m.movement_type === "return_sale"
         ) {
           // كان فيه زيادة → نعكسها بخصم
-          await client.query(
-            `UPDATE stock SET quantity = quantity - $1
-             WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-            [m.quantity, warehouseId, m.product_id, m.variant_id],
-          );
+          await decrementStockOrThrow(client, {
+            warehouseId,
+            productId: m.product_id,
+            variantId: m.variant_id,
+            quantity: m.quantity,
+            reason: `تعذر عكس حركة المخزون القديمة للفواتير: ${m.product_id}`,
+          });
         }
         if (
           m.movement_type === "sale" ||
@@ -3967,19 +4001,23 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
               [warehouseId, item.product_id, variantId, item.quantity],
             );
           } else {
-            await client.query(
-              `UPDATE stock SET quantity = quantity - $1
-               WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-              [item.quantity, warehouseId, item.product_id, variantId],
-            );
+            await decrementStockOrThrow(client, {
+              warehouseId,
+              productId: item.product_id,
+              variantId,
+              quantity: item.quantity,
+              reason: `رصيد غير كافٍ لتعديل الفاتورة: ${item.product_name}`,
+            });
           }
         } else {
           if (itemIsReturn) {
-            await client.query(
-              `UPDATE stock SET quantity = quantity - $1
-               WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-              [item.quantity, warehouseId, item.product_id, variantId],
-            );
+            await decrementStockOrThrow(client, {
+              warehouseId,
+              productId: item.product_id,
+              variantId,
+              quantity: item.quantity,
+              reason: `لا يمكن تعديل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
+            });
           } else {
             await client.query(
               `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
@@ -4561,14 +4599,13 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
           m.movement_type === "return_sale"
         ) {
           // كان فيه زيادة → نعكسها بخصم
-          await client.query(
-            `
-        UPDATE stock
-        SET quantity = quantity - $1
-        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
-      `,
-            [m.quantity, warehouseId, m.product_id, m.variant_id],
-          );
+          await decrementStockOrThrow(client, {
+            warehouseId,
+            productId: m.product_id,
+            variantId: m.variant_id,
+            quantity: m.quantity,
+            reason: `تعذر عكس حركة المخزون القديمة للفواتير: ${m.product_id}`,
+          });
         }
 
         if (
@@ -4654,19 +4691,23 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
               [warehouseId, item.product_id, variantId, item.quantity],
             );
           } else {
-            await client.query(
-              `UPDATE stock SET quantity = quantity - $1
-               WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-              [item.quantity, warehouseId, item.product_id, variantId],
-            );
+            await decrementStockOrThrow(client, {
+              warehouseId,
+              productId: item.product_id,
+              variantId,
+              quantity: item.quantity,
+              reason: `رصيد غير كافٍ لتعديل الفاتورة: ${item.product_name}`,
+            });
           }
         } else {
           if (itemIsReturn) {
-            await client.query(
-              `UPDATE stock SET quantity = quantity - $1
-               WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-              [item.quantity, warehouseId, item.product_id, variantId],
-            );
+            await decrementStockOrThrow(client, {
+              warehouseId,
+              productId: item.product_id,
+              variantId,
+              quantity: item.quantity,
+              reason: `لا يمكن تعديل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
+            });
           } else {
             await client.query(
               `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
@@ -4715,9 +4756,7 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
 
     const total = subtotal - discountTotal;
     const totalWithPrevious =
-      total +
-      Number(previous_balance || 0) +
-      Number(additional_amount || 0);
+      total + Number(previous_balance || 0) + Number(additional_amount || 0);
     const remaining = totalWithPrevious - Number(paid_amount || 0);
 
     const payment_status =
@@ -4817,7 +4856,7 @@ SET
         customer_name,
         customer_phone || null,
         Number(previous_balance || 0),
-      Number(additional_amount || 0),
+        Number(additional_amount || 0),
         subtotal,
         extraDiscount,
         discountTotal,
@@ -5957,14 +5996,13 @@ app.delete("/invoices/:id", authMiddleware, async (req, res) => {
     for (const m of movementsRes.rows) {
       if (m.movement_type === "purchase" || m.movement_type === "return_sale") {
         // كان فيه زيادة → نعكسها بخصم
-        await client.query(
-          `
-          UPDATE stock
-          SET quantity = quantity - $1
-          WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
-        `,
-          [m.quantity, m.warehouse_id, m.product_id, m.variant_id],
-        );
+        await decrementStockOrThrow(client, {
+          warehouseId: m.warehouse_id,
+          productId: m.product_id,
+          variantId: m.variant_id,
+          quantity: m.quantity,
+          reason: `تعذر حذف الفاتورة بسبب عدم تطابق رصيد المخزون: ${m.product_id}`,
+        });
       } else if (
         m.movement_type === "sale" ||
         m.movement_type === "return_purchase"
