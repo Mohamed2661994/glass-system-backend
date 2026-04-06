@@ -1806,7 +1806,11 @@ async function resolveInvoiceItemVariantId(
     ? Number(variantPackageMap.get(packageName) || 0)
     : 0;
 
-  if (invoiceType === "retail" && packageName && basePackages.has(packageName)) {
+  if (
+    invoiceType === "retail" &&
+    packageName &&
+    basePackages.has(packageName)
+  ) {
     return 0;
   }
 
@@ -10584,10 +10588,13 @@ app.post(
       const fileUrl = `/uploads/chat/${req.file.filename}`;
       const isImage = req.file.mimetype.startsWith("image/");
       const msgType = isImage ? "image" : "file";
+      const caption = String(req.body?.content || "").trim();
+      const replyToId = Number(req.body?.reply_to_id || 0) || null;
+      const storedContent = isImage ? caption : caption || req.file.originalname;
 
       const msgResult = await pool.query(
-        "INSERT INTO messages (conversation_id, sender_id, content, type, file_url) VALUES ($1, $2, $3, $4, $5) RETURNING *",
-        [convId, userId, req.file.originalname, msgType, fileUrl],
+        "INSERT INTO messages (conversation_id, sender_id, content, type, file_url, reply_to_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+        [convId, userId, storedContent, msgType, fileUrl, replyToId],
       );
 
       await pool.query(
@@ -10605,6 +10612,19 @@ app.post(
         username: senderResult.rows[0].username,
         full_name: senderResult.rows[0].full_name,
       };
+
+      if (replyToId) {
+        const replyResult = await pool.query(
+          "SELECT m.content, m.sender_id, m.type, u.full_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.id = $1",
+          [replyToId],
+        );
+        if (replyResult.rows.length) {
+          message.reply_content = replyResult.rows[0].content;
+          message.reply_sender_id = replyResult.rows[0].sender_id;
+          message.reply_sender_name = replyResult.rows[0].full_name;
+          message.reply_type = replyResult.rows[0].type;
+        }
+      }
 
       const otherUser = await pool.query(
         "SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2",
@@ -10625,7 +10645,7 @@ app.post(
         sendPushToUser(
           otherUser.rows[0].user_id,
           message.full_name || message.username,
-          req.file.mimetype.startsWith("image/") ? "📷 صورة" : "📄 ملف",
+          isImage ? (caption ? `📷 ${caption}` : "📷 صورة") : "📄 ملف",
           convId,
         );
       }
