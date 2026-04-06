@@ -101,6 +101,7 @@ const PUBLIC_PATHS = [
   "/public",
   "/admin",
   "/integrations",
+  "/chat/media",
 ];
 const jwt_auth = require("jsonwebtoken");
 app.use((req, res, next) => {
@@ -790,22 +791,8 @@ app.post("/admin/restore", async (req, res) => {
   }
 });
 
-// Chat uploads
-const uploadsDir = path.join(__dirname, "uploads", "chat");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
 const chatUpload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadsDir),
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname) || ".jpg";
-      cb(
-        null,
-        `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`,
-      );
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
@@ -10400,6 +10387,20 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
     );
     console.log("✅ messages columns updated (type, file_url, reply_to_id)");
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_attachments (
+        id SERIAL PRIMARY KEY,
+        message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+        storage_key TEXT NOT NULL UNIQUE,
+        original_name TEXT,
+        mime_type TEXT NOT NULL,
+        file_size INTEGER NOT NULL DEFAULT 0,
+        file_data BYTEA NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ chat_attachments table ready");
+
     // Push subscriptions table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -10560,6 +10561,45 @@ app.get(
   },
 );
 
+app.get("/chat/media/:storageKey", async (req, res) => {
+  try {
+    const storageKey = String(req.params.storageKey || "").trim();
+    if (!storageKey) {
+      return res.status(400).send("Invalid media key");
+    }
+
+    const attachmentRes = await pool.query(
+      `
+      SELECT mime_type, original_name, file_data
+      FROM chat_attachments
+      WHERE storage_key = $1
+      LIMIT 1
+      `,
+      [storageKey],
+    );
+
+    if (!attachmentRes.rows.length) {
+      return res.status(404).send("Media not found");
+    }
+
+    const attachment = attachmentRes.rows[0];
+    const mimeType = attachment.mime_type || "application/octet-stream";
+    const originalName = attachment.original_name || "file";
+    const disposition = mimeType.startsWith("image/") ? "inline" : "attachment";
+
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader(
+      "Content-Disposition",
+      `${disposition}; filename*=UTF-8''${encodeURIComponent(originalName)}`,
+    );
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.send(attachment.file_data);
+  } catch (err) {
+    console.error("CHAT MEDIA ERROR:", err);
+    res.status(500).send("Failed to load media");
+  }
+});
+
 /* ===============================
    💬 CHAT - Upload file/image for chat
 ================================ */
@@ -10585,7 +10625,8 @@ app.post(
         return res.status(403).json({ error: "غير مصرح" });
       }
 
-      const fileUrl = `/uploads/chat/${req.file.filename}`;
+      const storageKey = crypto.randomBytes(24).toString("hex");
+      const fileUrl = `/chat/media/${storageKey}`;
       const isImage = req.file.mimetype.startsWith("image/");
       const msgType = isImage ? "image" : "file";
       const caption = String(req.body?.content || "").trim();
@@ -10595,6 +10636,22 @@ app.post(
       const msgResult = await pool.query(
         "INSERT INTO messages (conversation_id, sender_id, content, type, file_url, reply_to_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
         [convId, userId, storedContent, msgType, fileUrl, replyToId],
+      );
+
+      await pool.query(
+        `
+        INSERT INTO chat_attachments
+          (message_id, storage_key, original_name, mime_type, file_size, file_data)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        `,
+        [
+          msgResult.rows[0].id,
+          storageKey,
+          req.file.originalname,
+          req.file.mimetype,
+          Number(req.file.size || 0),
+          req.file.buffer,
+        ],
       );
 
       await pool.query(
