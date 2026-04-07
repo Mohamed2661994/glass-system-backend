@@ -1868,6 +1868,15 @@ function buildInvoiceItemStructureSnapshot(item) {
   };
 }
 
+function buildInvoiceItemStockImpactSnapshot(item) {
+  return {
+    product_id: Number(item?.product_id || 0),
+    variant_id: Number(item?.variant_id || 0),
+    quantity: Number(item?.quantity || 0),
+    is_return: Boolean(item?.itemIsReturn ?? item?.is_return),
+  };
+}
+
 function compareInvoiceItemStructure(a, b) {
   return (
     a.product_id - b.product_id ||
@@ -1876,6 +1885,15 @@ function compareInvoiceItemStructure(a, b) {
     a.price - b.price ||
     a.quantity - b.quantity ||
     a.discount - b.discount ||
+    Number(a.is_return) - Number(b.is_return)
+  );
+}
+
+function compareInvoiceItemStockImpact(a, b) {
+  return (
+    a.product_id - b.product_id ||
+    a.variant_id - b.variant_id ||
+    a.quantity - b.quantity ||
     Number(a.is_return) - Number(b.is_return)
   );
 }
@@ -1931,6 +1949,124 @@ async function invoiceItemsHaveStructuralChanges(
   }
 
   return false;
+}
+
+async function invoiceItemsRequireStockRebuild(
+  invoiceId,
+  normalizedItems,
+  client = pool,
+) {
+  const currentItemsRes = await client.query(
+    `
+    SELECT
+      product_id,
+      COALESCE(variant_id, 0) AS variant_id,
+      quantity,
+      is_return
+    FROM invoice_items
+    WHERE invoice_id = $1
+    `,
+    [invoiceId],
+  );
+
+  const currentItems = currentItemsRes.rows
+    .map(buildInvoiceItemStockImpactSnapshot)
+    .sort(compareInvoiceItemStockImpact);
+
+  const incomingItems = normalizedItems
+    .map(buildInvoiceItemStockImpactSnapshot)
+    .sort(compareInvoiceItemStockImpact);
+
+  if (currentItems.length !== incomingItems.length) {
+    return true;
+  }
+
+  for (let index = 0; index < currentItems.length; index++) {
+    const currentItem = currentItems[index];
+    const incomingItem = incomingItems[index];
+
+    if (
+      currentItem.product_id !== incomingItem.product_id ||
+      currentItem.variant_id !== incomingItem.variant_id ||
+      currentItem.quantity !== incomingItem.quantity ||
+      currentItem.is_return !== incomingItem.is_return
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildStockDeltaKey(productId, variantId) {
+  return `${Number(productId || 0)}:${Number(variantId || 0)}`;
+}
+
+function getInvoiceItemStockEffect(item, movementType) {
+  const quantity = Number(item?.quantity || 0);
+  const isReturn = Boolean(item?.itemIsReturn ?? item?.is_return);
+
+  if (movementType === "purchase") {
+    return isReturn ? -quantity : quantity;
+  }
+
+  return isReturn ? quantity : -quantity;
+}
+
+async function computeInvoiceStockDeltas(
+  invoiceId,
+  normalizedItems,
+  movementType,
+  client = pool,
+) {
+  const currentItemsRes = await client.query(
+    `
+    SELECT
+      product_id,
+      COALESCE(variant_id, 0) AS variant_id,
+      quantity,
+      is_return
+    FROM invoice_items
+    WHERE invoice_id = $1
+    `,
+    [invoiceId],
+  );
+
+  const currentEffects = new Map();
+  for (const item of currentItemsRes.rows) {
+    const key = buildStockDeltaKey(item.product_id, item.variant_id);
+    currentEffects.set(
+      key,
+      (currentEffects.get(key) || 0) + getInvoiceItemStockEffect(item, movementType),
+    );
+  }
+
+  const incomingEffects = new Map();
+  for (const item of normalizedItems) {
+    const key = buildStockDeltaKey(item.product_id, item.variant_id);
+    incomingEffects.set(
+      key,
+      (incomingEffects.get(key) || 0) + getInvoiceItemStockEffect(item, movementType),
+    );
+  }
+
+  const allKeys = new Set([...currentEffects.keys(), ...incomingEffects.keys()]);
+  const deltas = [];
+
+  for (const key of allKeys) {
+    const [productId, variantId] = key.split(":").map(Number);
+    const delta = Number((incomingEffects.get(key) || 0) - (currentEffects.get(key) || 0));
+
+    if (!delta) continue;
+
+    deltas.push({
+      productId,
+      variantId,
+      delta,
+    });
+  }
+
+  return deltas;
 }
 
 class InvoiceRevisionConflictError extends Error {
@@ -3888,6 +4024,14 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
       normalizedItems,
       client,
     );
+    const stockDeltas = itemsChanged
+      ? await computeInvoiceStockDeltas(
+          invoiceId,
+          normalizedItems,
+          movement_type,
+          client,
+        )
+      : [];
 
     const prevBalance =
       bodyPrevBalance !== undefined
@@ -3895,39 +4039,25 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
         : Number(previous_balance || 0);
 
     if (itemsChanged) {
-      /* ================================
-         1️⃣ رجّع المخزن (الأصناف القديمة) - بناءً على حركات المخزن
-      ================================= */
-      const oldMovementsRes = await client.query(
-        `SELECT product_id, quantity, movement_type, COALESCE(variant_id, 0) AS variant_id
-         FROM stock_movements WHERE invoice_id = $1 FOR UPDATE`,
-        [invoiceId],
-      );
-
-      for (const m of oldMovementsRes.rows) {
-        if (
-          m.movement_type === "purchase" ||
-          m.movement_type === "return_sale"
-        ) {
-          // كان فيه زيادة → نعكسها بخصم
+      for (const entry of stockDeltas) {
+        if (entry.delta > 0) {
+          await client.query(
+            `
+            INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (warehouse_id, product_id, variant_id)
+            DO UPDATE SET quantity = stock.quantity + $4
+            `,
+            [warehouseId, entry.productId, entry.variantId, entry.delta],
+          );
+        } else {
           await decrementStockOrThrow(client, {
             warehouseId,
-            productId: m.product_id,
-            variantId: m.variant_id,
-            quantity: m.quantity,
-            reason: `تعذر عكس حركة المخزون القديمة للفواتير: ${m.product_id}`,
+            productId: entry.productId,
+            variantId: entry.variantId,
+            quantity: Math.abs(entry.delta),
+            reason: `تعذر تعديل حركة مخزون الفاتورة: ${entry.productId}`,
           });
-        }
-        if (
-          m.movement_type === "sale" ||
-          m.movement_type === "return_purchase"
-        ) {
-          // كان فيه خصم → نعكسه بإضافة
-          await client.query(
-            `UPDATE stock SET quantity = quantity + $1
-             WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4`,
-            [m.quantity, warehouseId, m.product_id, m.variant_id],
-          );
         }
       }
 
@@ -4568,51 +4698,35 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
       normalizedItems,
       client,
     );
+    const stockDeltas = itemsChanged
+      ? await computeInvoiceStockDeltas(
+          invoiceId,
+          normalizedItems,
+          movement_type,
+          client,
+        )
+      : [];
 
     if (itemsChanged) {
-      /* =========================================
-         1️⃣ رجّع المخزن (الأصناف القديمة)
-      ========================================= */
-      const movementsRes = await client.query(
-        `
-    SELECT product_id, quantity, movement_type, COALESCE(variant_id, 0) AS variant_id
-    FROM stock_movements
-    WHERE invoice_id = $1
-    FOR UPDATE
-  `,
-        [invoiceId],
-      );
-
-      for (const m of movementsRes.rows) {
-        if (
-          m.movement_type === "purchase" ||
-          m.movement_type === "transfer_in" ||
-          m.movement_type === "return_sale"
-        ) {
-          // كان فيه زيادة → نعكسها بخصم
-          await decrementStockOrThrow(client, {
-            warehouseId,
-            productId: m.product_id,
-            variantId: m.variant_id,
-            quantity: m.quantity,
-            reason: `تعذر عكس حركة المخزون القديمة للفواتير: ${m.product_id}`,
-          });
-        }
-
-        if (
-          m.movement_type === "sale" ||
-          m.movement_type === "transfer_out" ||
-          m.movement_type === "return_purchase"
-        ) {
-          // كان فيه خصم → نعكسه بإضافة
+      for (const entry of stockDeltas) {
+        if (entry.delta > 0) {
           await client.query(
             `
-        UPDATE stock
-        SET quantity = quantity + $1
-        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
-      `,
-            [m.quantity, warehouseId, m.product_id, m.variant_id],
+            INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (warehouse_id, product_id, variant_id)
+            DO UPDATE SET quantity = stock.quantity + $4
+            `,
+            [warehouseId, entry.productId, entry.variantId, entry.delta],
           );
+        } else {
+          await decrementStockOrThrow(client, {
+            warehouseId,
+            productId: entry.productId,
+            variantId: entry.variantId,
+            quantity: Math.abs(entry.delta),
+            reason: `تعذر تعديل حركة مخزون الفاتورة: ${entry.productId}`,
+          });
         }
       }
 
@@ -4623,21 +4737,14 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
         invoiceId,
       ]);
 
-      /* ================================
-         3️⃣ امسح أصناف الفاتورة القديمة
-      ================================= */
       await client.query(`DELETE FROM invoice_items WHERE invoice_id = $1`, [
         invoiceId,
       ]);
 
-      /* =========================================
-         4️⃣ إدخال الأصناف الجديدة وتحديث المخزن
-      ========================================= */
       for (const item of normalizedItems) {
         const variantId = item.variant_id || 0;
         const itemIsReturn = item.itemIsReturn;
 
-        // ➕ invoice_items
         await client.query(
           `
           INSERT INTO invoice_items
@@ -4668,60 +4775,6 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
             variantId,
             itemIsReturn,
             item.costPrice,
-          ],
-        );
-
-        // 🔄 المخزن
-        if (movement_type === "sale") {
-          if (itemIsReturn) {
-            await client.query(
-              `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-               VALUES ($1,$2,$3,$4)
-               ON CONFLICT (warehouse_id, product_id, variant_id)
-               DO UPDATE SET quantity = stock.quantity + $4`,
-              [warehouseId, item.product_id, variantId, item.quantity],
-            );
-          } else {
-            await decrementStockOrThrow(client, {
-              warehouseId,
-              productId: item.product_id,
-              variantId,
-              quantity: item.quantity,
-              reason: `رصيد غير كافٍ لتعديل الفاتورة: ${item.product_name}`,
-            });
-          }
-        } else {
-          if (itemIsReturn) {
-            await decrementStockOrThrow(client, {
-              warehouseId,
-              productId: item.product_id,
-              variantId,
-              quantity: item.quantity,
-              reason: `لا يمكن تعديل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
-            });
-          } else {
-            await client.query(
-              `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-               VALUES ($1,$2,$3,$4)
-               ON CONFLICT (warehouse_id, product_id, variant_id)
-               DO UPDATE SET quantity = stock.quantity + $4`,
-              [warehouseId, item.product_id, variantId, item.quantity],
-            );
-          }
-        }
-
-        // 🧾 stock_movements
-        await client.query(
-          `INSERT INTO stock_movements
-           (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [
-            invoiceId,
-            warehouseId,
-            item.product_id,
-            variantId,
-            item.quantity,
-            itemIsReturn ? `return_${movement_type}` : movement_type,
           ],
         );
       }
@@ -10631,7 +10684,9 @@ app.post(
       const msgType = isImage ? "image" : "file";
       const caption = String(req.body?.content || "").trim();
       const replyToId = Number(req.body?.reply_to_id || 0) || null;
-      const storedContent = isImage ? caption : caption || req.file.originalname;
+      const storedContent = isImage
+        ? caption
+        : caption || req.file.originalname;
 
       const msgResult = await pool.query(
         "INSERT INTO messages (conversation_id, sender_id, content, type, file_url, reply_to_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
