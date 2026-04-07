@@ -4112,44 +4112,6 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
           ],
         );
 
-        if (movement_type === "sale") {
-          if (itemIsReturn) {
-            await client.query(
-              `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-               VALUES ($1,$2,$3,$4)
-               ON CONFLICT (warehouse_id, product_id, variant_id)
-               DO UPDATE SET quantity = stock.quantity + $4`,
-              [warehouseId, item.product_id, variantId, item.quantity],
-            );
-          } else {
-            await decrementStockOrThrow(client, {
-              warehouseId,
-              productId: item.product_id,
-              variantId,
-              quantity: item.quantity,
-              reason: `رصيد غير كافٍ لتعديل الفاتورة: ${item.product_name}`,
-            });
-          }
-        } else {
-          if (itemIsReturn) {
-            await decrementStockOrThrow(client, {
-              warehouseId,
-              productId: item.product_id,
-              variantId,
-              quantity: item.quantity,
-              reason: `لا يمكن تعديل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
-            });
-          } else {
-            await client.query(
-              `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-               VALUES ($1,$2,$3,$4)
-               ON CONFLICT (warehouse_id, product_id, variant_id)
-               DO UPDATE SET quantity = stock.quantity + $4`,
-              [warehouseId, item.product_id, variantId, item.quantity],
-            );
-          }
-        }
-
         await client.query(
           `INSERT INTO stock_movements
            (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
