@@ -4739,6 +4739,20 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
             item.costPrice,
           ],
         );
+
+        await client.query(
+          `INSERT INTO stock_movements
+           (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [
+            invoiceId,
+            warehouseId,
+            item.product_id,
+            variantId,
+            item.quantity,
+            itemIsReturn ? `return_${movement_type}` : movement_type,
+          ],
+        );
       }
     }
 
