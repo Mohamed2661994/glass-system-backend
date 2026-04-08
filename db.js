@@ -406,6 +406,83 @@ async function enableSyncDeleteContext(client) {
   await client.query(`SELECT set_config('app.sync_origin', 'sync', true)`);
 }
 
+async function syncInvoiceReferenceRows(sourcePool, targetClient, invoiceRow) {
+  if (!invoiceRow) return;
+
+  const customerId = Number(invoiceRow.customer_id || 0);
+  const supplierId = Number(invoiceRow.supplier_id || 0);
+
+  if (customerId > 0) {
+    const customerMeta = await getTableMeta("customers");
+    const customerPhonesMeta = await getTableMeta("customer_phones");
+    const customerRes = await sourcePool.query(
+      `SELECT * FROM customers WHERE id = $1 LIMIT 1`,
+      [customerId],
+    );
+    const customerRow = customerRes.rows[0] || null;
+    if (customerRow) {
+      await upsertRow(
+        targetClient,
+        customerMeta.table,
+        customerMeta.columns,
+        customerMeta.pk,
+        customerRow,
+        customerMeta.columnTypes,
+      );
+
+      const customerPhonesRes = await sourcePool.query(
+        `SELECT * FROM customer_phones WHERE customer_id = $1 ORDER BY id ASC`,
+        [customerId],
+      );
+      for (const phoneRow of customerPhonesRes.rows) {
+        await upsertRow(
+          targetClient,
+          customerPhonesMeta.table,
+          customerPhonesMeta.columns,
+          customerPhonesMeta.pk,
+          phoneRow,
+          customerPhonesMeta.columnTypes,
+        );
+      }
+    }
+  }
+
+  if (supplierId > 0) {
+    const supplierMeta = await getTableMeta("suppliers");
+    const supplierPhonesMeta = await getTableMeta("supplier_phones");
+    const supplierRes = await sourcePool.query(
+      `SELECT * FROM suppliers WHERE id = $1 LIMIT 1`,
+      [supplierId],
+    );
+    const supplierRow = supplierRes.rows[0] || null;
+    if (supplierRow) {
+      await upsertRow(
+        targetClient,
+        supplierMeta.table,
+        supplierMeta.columns,
+        supplierMeta.pk,
+        supplierRow,
+        supplierMeta.columnTypes,
+      );
+
+      const supplierPhonesRes = await sourcePool.query(
+        `SELECT * FROM supplier_phones WHERE supplier_id = $1 ORDER BY id ASC`,
+        [supplierId],
+      );
+      for (const phoneRow of supplierPhonesRes.rows) {
+        await upsertRow(
+          targetClient,
+          supplierPhonesMeta.table,
+          supplierPhonesMeta.columns,
+          supplierPhonesMeta.pk,
+          phoneRow,
+          supplierPhonesMeta.columnTypes,
+        );
+      }
+    }
+  }
+}
+
 async function syncInvoiceAggregateFromSource(
   sourcePool,
   targetPool,
@@ -468,6 +545,8 @@ async function syncInvoiceAggregateFromSource(
         [normalizedInvoiceId],
       ),
     ]);
+
+    await syncInvoiceReferenceRows(sourcePool, targetClient, invoiceRow);
 
     await upsertRow(
       targetClient,
