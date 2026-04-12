@@ -61,7 +61,8 @@ exports.getInventorySummary = async (req, res) => {
       AND sm.warehouse_id = s.warehouse_id
       AND COALESCE(sm.variant_id, 0) = COALESCE(s.variant_id, 0)
 
-    ${warehouse_id ? "WHERE s.warehouse_id = $1" : ""}
+    WHERE p.is_active = true
+    ${warehouse_id ? "AND s.warehouse_id = $1" : ""}
 
     GROUP BY p.id, p.name, p.manufacturer, w.name, p.wholesale_package, p.retail_package, s.quantity, s.variant_id
 
@@ -118,7 +119,9 @@ exports.getProductMovement = async (req, res) => {
       req.query;
 
     if (!product_id && !product_name) {
-      return res.status(400).json({ error: "product_id أو product_name مطلوب" });
+      return res
+        .status(400)
+        .json({ error: "product_id أو product_name مطلوب" });
     }
 
     const conditions = [];
