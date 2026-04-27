@@ -945,6 +945,81 @@ async function getRowByPk(poolRef, table, pk, rowLike) {
   return found.rows[0] || null;
 }
 
+async function syncReferencedRowById(sourcePool, targetPool, table, id) {
+  if (id === undefined || id === null || id === "") {
+    return 0;
+  }
+
+  const meta = await getTableMeta(table);
+  if (!meta || meta.pk.length !== 1) {
+    return 0;
+  }
+
+  const sourceRes = await sourcePool.query(
+    `SELECT * FROM "${table}" WHERE "${meta.pk[0]}" = $1 LIMIT 1`,
+    [id],
+  );
+  const sourceRow = sourceRes.rows[0];
+  if (!sourceRow) {
+    return 0;
+  }
+
+  return syncRowFromSourceToTarget(sourcePool, targetPool, meta, sourceRow);
+}
+
+async function syncCashInDependencies(sourcePool, targetPool, cashInRow) {
+  if (!cashInRow) return 0;
+
+  let synced = 0;
+
+  synced += await syncReferencedRowById(
+    sourcePool,
+    targetPool,
+    "customers",
+    cashInRow.customer_id,
+  );
+
+  if (cashInRow.invoice_id !== undefined && cashInRow.invoice_id !== null) {
+    const invoiceMeta = await getTableMeta("invoices");
+    if (invoiceMeta && invoiceMeta.pk.length === 1) {
+      const invoiceRes = await sourcePool.query(
+        `SELECT * FROM "invoices" WHERE "${invoiceMeta.pk[0]}" = $1 LIMIT 1`,
+        [cashInRow.invoice_id],
+      );
+      const invoiceRow = invoiceRes.rows[0];
+      if (invoiceRow) {
+        synced += await syncReferencedRowById(
+          sourcePool,
+          targetPool,
+          "customers",
+          invoiceRow.customer_id,
+        );
+        synced += await syncReferencedRowById(
+          sourcePool,
+          targetPool,
+          "suppliers",
+          invoiceRow.supplier_id,
+        );
+        synced += await syncRowFromSourceToTarget(
+          sourcePool,
+          targetPool,
+          invoiceMeta,
+          invoiceRow,
+        );
+      }
+    }
+  }
+
+  synced += await syncReferencedRowById(
+    sourcePool,
+    targetPool,
+    "daily_cash",
+    cashInRow.daily_cash_id,
+  );
+
+  return synced;
+}
+
 async function syncRowFromSourceToTarget(
   sourcePool,
   targetPool,
@@ -952,6 +1027,10 @@ async function syncRowFromSourceToTarget(
   sourceRow,
 ) {
   const { table, pk, columns, columnTypes, hasUpdatedAt } = meta;
+
+  if (table === "cash_in") {
+    await syncCashInDependencies(sourcePool, targetPool, sourceRow);
+  }
 
   const targetRow = await getRowByPk(targetPool, table, pk, sourceRow);
   if (!targetRow) {
