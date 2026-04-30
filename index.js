@@ -2037,7 +2037,8 @@ async function computeInvoiceStockDeltas(
     const key = buildStockDeltaKey(item.product_id, item.variant_id);
     currentEffects.set(
       key,
-      (currentEffects.get(key) || 0) + getInvoiceItemStockEffect(item, movementType),
+      (currentEffects.get(key) || 0) +
+        getInvoiceItemStockEffect(item, movementType),
     );
   }
 
@@ -2046,16 +2047,22 @@ async function computeInvoiceStockDeltas(
     const key = buildStockDeltaKey(item.product_id, item.variant_id);
     incomingEffects.set(
       key,
-      (incomingEffects.get(key) || 0) + getInvoiceItemStockEffect(item, movementType),
+      (incomingEffects.get(key) || 0) +
+        getInvoiceItemStockEffect(item, movementType),
     );
   }
 
-  const allKeys = new Set([...currentEffects.keys(), ...incomingEffects.keys()]);
+  const allKeys = new Set([
+    ...currentEffects.keys(),
+    ...incomingEffects.keys(),
+  ]);
   const deltas = [];
 
   for (const key of allKeys) {
     const [productId, variantId] = key.split(":").map(Number);
-    const delta = Number((incomingEffects.get(key) || 0) - (currentEffects.get(key) || 0));
+    const delta = Number(
+      (incomingEffects.get(key) || 0) - (currentEffects.get(key) || 0),
+    );
 
     if (!delta) continue;
 
@@ -3235,6 +3242,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       created_by_name,
       supplier_name,
       supplier_phone,
+      force_journal_post_when_unpaid = false,
     } = req.body;
     if (invoice_type !== "wholesale") {
       return res.status(400).json({
@@ -3582,12 +3590,21 @@ VALUES
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع - فقط لفرع الجملة
     let journal_posted = false;
+    const shouldForceJournalPostWhenUnpaid =
+      movement_type === "sale" &&
+      !is_return &&
+      Number(branch_id) === 2 &&
+      Number(paid_amount) <= 0 &&
+      Boolean(force_journal_post_when_unpaid);
     if (
       movement_type === "sale" &&
       !is_return &&
-      paid_amount > 0 &&
+      (paid_amount > 0 || shouldForceJournalPostWhenUnpaid) &&
       Number(branch_id) === 2
     ) {
+      const journalDescription = shouldForceJournalPostWhenUnpaid
+        ? `فاتورة جملة رقم #${invoiceId} - المتبقي ${remaining_amount}`
+        : `فاتورة جملة رقم #${invoiceId}`;
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
@@ -3599,7 +3616,7 @@ VALUES
           total,
           paid_amount,
           remaining_amount,
-          `فاتورة جملة رقم #${invoiceId}`,
+          journalDescription,
           invoice_date || getCairoDate(),
         ],
       );
@@ -3657,6 +3674,7 @@ app.post("/invoices/retail", async (req, res) => {
       supplier_name,
       supplier_phone,
       notes,
+      force_journal_post_when_unpaid = false,
     } = req.body;
 
     if (
@@ -3909,7 +3927,17 @@ app.post("/invoices/retail", async (req, res) => {
 
     // 💰 ترحيل المبالغ لليومية (cash_in) لفواتير البيع القطاعي
     let journal_posted = false;
-    if (movement_type === "sale" && Number(paid_amount) > 0) {
+    const shouldForceJournalPostWhenUnpaid =
+      movement_type === "sale" &&
+      Number(paid_amount) <= 0 &&
+      Boolean(force_journal_post_when_unpaid);
+    if (
+      movement_type === "sale" &&
+      (Number(paid_amount) > 0 || shouldForceJournalPostWhenUnpaid)
+    ) {
+      const journalDescription = shouldForceJournalPostWhenUnpaid
+        ? `فاتورة قطاعي رقم #${invoiceId} - المتبقي ${remaining_amount}`
+        : `فاتورة قطاعي رقم #${invoiceId}`;
       await client.query(
         `INSERT INTO cash_in 
          (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
@@ -3921,7 +3949,7 @@ app.post("/invoices/retail", async (req, res) => {
           Number(final_total),
           Number(paid_amount),
           remaining_amount,
-          `فاتورة قطاعي رقم #${invoiceId}`,
+          journalDescription,
           invoice_date || getCairoDate(),
         ],
       );
