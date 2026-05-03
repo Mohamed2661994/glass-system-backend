@@ -9192,14 +9192,21 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
 
     // 3️⃣ عكس التأثير
     for (const item of itemsRes.rows) {
+      // حاول تجيب الـ variant_id من حركات المخزن إذا كان 0 ومفيش عمود في الجدول
+      const moveRes = await client.query(
+        `SELECT variant_id FROM stock_movements WHERE reference_type = 'transfer' AND reference_id = $1 AND product_id = $2 AND movement_type = 'transfer_out' LIMIT 1`,
+        [transferId, item.product_id]
+      );
+      const actualVariantId = moveRes.rows.length ? Number(moveRes.rows[0].variant_id) : 0;
+
       // ➕ رجوع للجملة
       await client.query(
         `
         UPDATE stock
         SET quantity = quantity + $1
-        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
+        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
         `,
-        [item.from_quantity, item.from_warehouse_id, item.product_id],
+        [item.from_quantity, item.from_warehouse_id, item.product_id, actualVariantId]
       );
 
       // ➖ خصم من القطاعي
@@ -9238,17 +9245,19 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         (
           warehouse_id,
           product_id,
+          variant_id,
           quantity,
           movement_type,
           reference_type,
           reference_id,
           note
         )
-        VALUES ($1,$2,$3,'transfer_in','transfer_cancel',$4,$5)
+        VALUES ($1,$2,$3,$4,'transfer_in','transfer_cancel',$5,$6)
         `,
         [
           item.from_warehouse_id,
           item.product_id,
+          actualVariantId,
           item.from_quantity,
           transferId,
           "إلغاء تحويل – رجوع للجملة",
@@ -9262,13 +9271,14 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         (
           warehouse_id,
           product_id,
+          variant_id,
           quantity,
           movement_type,
           reference_type,
           reference_id,
           note
         )
-        VALUES ($1,$2,$3,'transfer_out','transfer_cancel',$4,$5)
+        VALUES ($1,$2,0,$3,'transfer_out','transfer_cancel',$4,$5)
         `,
         [
           item.to_warehouse_id,
@@ -9399,14 +9409,20 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
 
     // 3️⃣ عكس الكميات
 
+    const moveRes = await client.query(
+      `SELECT variant_id FROM stock_movements WHERE reference_type = 'transfer' AND reference_id = $1 AND product_id = $2 AND movement_type = 'transfer_out' LIMIT 1`,
+      [item.transfer_id, item.product_id]
+    );
+    const actualVariantId = moveRes.rows.length ? Number(moveRes.rows[0].variant_id) : 0;
+
     // ➕ رجوع للمخزن الأصلي
     await client.query(
       `
       UPDATE stock
       SET quantity = quantity + $1
-      WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
+      WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
       `,
-      [item.from_quantity, item.from_warehouse_id, item.product_id],
+      [item.from_quantity, item.from_warehouse_id, item.product_id, actualVariantId]
     );
 
     // ➖ خصم من المخزن الهدف
@@ -9428,17 +9444,19 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       (
         warehouse_id,
         product_id,
+        variant_id,
         quantity,
         movement_type,
         reference_type,
         reference_id,
         note
       )
-      VALUES ($1,$2,$3,'transfer_in','transfer_item_cancel',$4,$5)
+      VALUES ($1,$2,$3,$4,'transfer_in','transfer_item_cancel',$5,$6)
       `,
       [
         item.from_warehouse_id,
         item.product_id,
+        actualVariantId,
         item.from_quantity,
         item.id,
         "إلغاء صنف من تحويل – رجوع للمخزن الأصلي",
@@ -9452,13 +9470,14 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       (
         warehouse_id,
         product_id,
+        variant_id,
         quantity,
         movement_type,
         reference_type,
         reference_id,
         note
       )
-      VALUES ($1,$2,$3,'transfer_out','transfer_item_cancel',$4,$5)
+      VALUES ($1,$2,0,$3,'transfer_out','transfer_item_cancel',$4,$5)
       `,
       [
         item.to_warehouse_id,
