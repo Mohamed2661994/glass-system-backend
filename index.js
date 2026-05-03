@@ -1772,6 +1772,21 @@ async function getProductVariantPackageMeta(
   return meta;
 }
 
+async function updateRetailWeightedAverageCost(client, productId, addedRetailQty, addedTotalCost) {
+if (addedRetailQty <= 0) return;
+const stockRes = await client.query('SELECT quantity FROM stock WHERE product_id =  AND warehouse_id = 1 AND variant_id = 0', [productId]);
+const oldQty = stockRes.rows.length ? Number(stockRes.rows[0].quantity) : 0;
+const prodRes = await client.query('SELECT retail_purchase_price FROM products WHERE id = ', [productId]);
+if (!prodRes.rows.length) return;
+const oldPrice = Number(prodRes.rows[0].retail_purchase_price || 0);
+const validOldQty = oldQty > 0 ? oldQty : 0;
+const newQty = validOldQty + addedRetailQty;
+if (newQty > 0) {
+  const newPrice = ((validOldQty * oldPrice) + Number(addedTotalCost)) / newQty;
+  await client.query('UPDATE products SET retail_purchase_price =  WHERE id = ', [newPrice, productId]);
+}
+}
+
 async function resolveInvoiceItemVariantId(
   item,
   invoiceType,
