@@ -1778,6 +1778,11 @@ async function resolveInvoiceItemVariantId(
   client = pool,
   cache = new Map(),
 ) {
+  // 🔥 دمج كود القطاعي: أي فاتورة قطاعي تُحفظ إجبارياً على الكود الأساسي (0)
+  if (invoiceType === "retail") {
+    return 0;
+  }
+
   const incomingVariantId = Number(item?.variant_id || 0);
   const productId = Number(item?.product_id || 0);
   const packageName = normalizePackageName(item?.package);
@@ -1792,14 +1797,6 @@ async function resolveInvoiceItemVariantId(
   const matchedVariantId = packageName
     ? Number(variantPackageMap.get(packageName) || 0)
     : 0;
-
-  if (
-    invoiceType === "retail" &&
-    packageName &&
-    basePackages.has(packageName)
-  ) {
-    return 0;
-  }
 
   if (matchedVariantId) {
     return matchedVariantId;
@@ -7392,6 +7389,9 @@ app.post("/stock/transfer", authMiddleware, async (req, res) => {
       );
 
       // إضافة للوجهة (لو مش موجود ينشئه)
+      // 🔥 دمج كود القطاعي: أي بضاعة داخلة للقطاعي تتحفظ إجبارياً على الكود الأساسي (0)
+      const targetVariantId = toWarehouseId === 1 ? 0 : variantId;
+
       await client.query(
         `
         INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
@@ -7399,7 +7399,7 @@ app.post("/stock/transfer", authMiddleware, async (req, res) => {
         ON CONFLICT (warehouse_id, product_id, variant_id)
         DO UPDATE SET quantity = stock.quantity + $4
         `,
-        [toWarehouseId, product_id, variantId, quantity],
+        [toWarehouseId, product_id, targetVariantId, quantity],
       );
 
       // حركة خروج
@@ -7419,7 +7419,7 @@ app.post("/stock/transfer", authMiddleware, async (req, res) => {
         (warehouse_id, product_id, variant_id, quantity, movement_type)
         VALUES ($1, $2, $3, $4, 'transfer_in')
         `,
-        [toWarehouseId, product_id, variantId, quantity],
+        [toWarehouseId, product_id, targetVariantId, quantity],
       );
     }
 
@@ -8753,6 +8753,9 @@ app.post(
         );
 
         // 4️⃣ إضافة للقطاعي
+        // 🔥 دمج كود القطاعي: إجبار البضاعة المحولة للقطاعي أينما كانت على الكود الأساسي (0)
+        const targetVariantId = retailWarehouseId === 1 ? 0 : variantId;
+
         await client.query(
           `
         INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
@@ -8763,7 +8766,7 @@ app.post(
           [
             retailWarehouseId,
             product_id,
-            variantId,
+            targetVariantId,
             conversion.retail_quantity,
           ],
         );
@@ -8839,7 +8842,7 @@ app.post(
           [
             retailWarehouseId,
             product_id,
-            variantId,
+            targetVariantId,
             conversion.retail_quantity,
             transferId,
             "تحويل من الجملة إلى القطاعي",
