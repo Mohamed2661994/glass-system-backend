@@ -6258,8 +6258,9 @@ app.post("/admin/opening-stock", async (req, res) => {
       const product = barcodeMap.get(code);
       if (product) {
         const pkg = item.unit || product.retail_package || "";
-        // البحث عن variant_id من اسم العبوة
-        const variantId = variantMap.get(`${product.id}_${pkg.trim()}`) || 0;
+        
+        // 🔥 دمج كود القطاعي: رصيد أول مدة قطاعي يُحفظ إجبارياً على الكود الأساسي (0)
+        const variantId = 0;
 
         matchedItems.push({
           product_id: product.id,
