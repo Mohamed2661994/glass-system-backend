@@ -587,16 +587,299 @@ exports.getManufacturers = async (req, res) => {
 
 exports.getAllProducts = async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT id, name, manufacturer
-      FROM products
-      ORDER BY name ASC
-    `);
+    const { search, manufacturer, limit = 50 } = req.query;
+    const normalizedSearch = String(search || "").trim();
+    const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
+
+    if (!normalizedSearch && !normalizedManufacturer) {
+      return res.json([]);
+    }
+
+    const values = [];
+    const conditions = [];
+    let paramIdx = 1;
+
+    if (normalizedSearch) {
+      values.push(`%${normalizedSearch}%`);
+      conditions.push(
+        `(p.name ILIKE $${paramIdx} OR COALESCE(p.manufacturer, '') ILIKE $${paramIdx} OR COALESCE(p.barcode, '') ILIKE $${paramIdx} OR CAST(p.id AS TEXT) ILIKE $${paramIdx})`
+      );
+      paramIdx++;
+    }
+
+    if (normalizedManufacturer) {
+      values.push(`${normalizedManufacturer}`);
+      conditions.push(`LOWER(TRIM(COALESCE(p.manufacturer, ''))) = $${paramIdx}`);
+      paramIdx++;
+    }
+
+    values.push(safeLimit);
+
+    const result = await pool.query(
+      `
+      WITH first_purchase AS (
+        SELECT
+          ii.product_id,
+          MIN(COALESCE(i.invoice_date::date, i.created_at::date)) AS first_purchase_date
+        FROM invoice_items ii
+        JOIN invoices i ON i.id = ii.invoice_id
+        WHERE i.movement_type = 'purchase'
+          AND i.is_void IS NOT TRUE
+          AND COALESCE(ii.is_return, false) IS NOT TRUE
+        GROUP BY ii.product_id
+      )
+      SELECT
+        p.id,
+        p.name,
+        p.manufacturer,
+        fp.first_purchase_date AS created_at
+      FROM products p
+      LEFT JOIN first_purchase fp ON fp.product_id = p.id
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY p.name ASC
+      LIMIT $${paramIdx}
+      `,
+      values,
+    );
 
     res.json(result.rows);
   } catch (err) {
     console.error("GET PRODUCTS ERROR:", err);
     res.status(500).json({ error: "Server error" });
+  }
+};
+
+exports.getProductSalesProfit = async (req, res) => {
+  try {
+    await ensureInvoiceItemsCostPriceColumn();
+
+    const { product_ids, branch_id, invoice_type, date_from, date_to } =
+      req.query;
+
+    const parsedProductIds = String(product_ids || "")
+      .split(",")
+      .map((value) => Number(value.trim()))
+      .filter((value) => Number.isInteger(value) && value > 0);
+
+    if (parsedProductIds.length === 0) {
+      return res.status(400).json({ error: "product_ids مطلوبة" });
+    }
+
+    const values = [parsedProductIds];
+    const invoiceConditions = [
+      "i.movement_type = 'sale'",
+      "i.is_void IS NOT TRUE",
+    ];
+    let idx = 2;
+
+    if (branch_id) {
+      invoiceConditions.push(`i.branch_id = $${idx++}`);
+      values.push(Number(branch_id));
+    }
+
+    if (invoice_type) {
+      invoiceConditions.push(`i.invoice_type = $${idx++}`);
+      values.push(invoice_type);
+    }
+
+    if (date_from) {
+      invoiceConditions.push(
+        `COALESCE(i.invoice_date::date, i.created_at::date) >= $${idx++}::date`,
+      );
+      values.push(date_from);
+    }
+
+    if (date_to) {
+      invoiceConditions.push(
+        `COALESCE(i.invoice_date::date, i.created_at::date) <= $${idx++}::date`,
+      );
+      values.push(date_to);
+    }
+
+    const selectionStartDateParam = `$${idx++}`;
+    values.push(date_from || null);
+
+    const result = await pool.query(
+      `
+      WITH first_purchase AS (
+        SELECT
+          ii.product_id,
+          MIN(COALESCE(i.invoice_date::date, i.created_at::date)) AS first_purchase_date
+        FROM invoice_items ii
+        JOIN invoices i ON i.id = ii.invoice_id
+        WHERE i.movement_type = 'purchase'
+          AND i.is_void IS NOT TRUE
+          AND COALESCE(ii.is_return, false) IS NOT TRUE
+        GROUP BY ii.product_id
+      ),
+      selected_products AS (
+        SELECT
+          p.id AS product_id,
+          p.name AS product_name,
+          COALESCE(NULLIF(TRIM(p.manufacturer), ''), 'بدون مصنع') AS manufacturer_name,
+          fp.first_purchase_date AS product_created_at
+        FROM products p
+        LEFT JOIN first_purchase fp ON fp.product_id = p.id
+        WHERE p.id = ANY($1::int[])
+      ),
+      invoice_scope AS (
+        SELECT
+          i.id AS invoice_id,
+          i.branch_id,
+          i.invoice_type,
+          COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date,
+          COALESCE(i.total, 0) AS invoice_total
+        FROM invoices i
+        WHERE ${invoiceConditions.join(" AND ")}
+      ),
+      selected_invoice_ids AS (
+        SELECT DISTINCT ii.invoice_id
+        FROM invoice_items ii
+        JOIN selected_products sp ON sp.product_id = ii.product_id
+        JOIN invoice_scope inv ON inv.invoice_id = ii.invoice_id
+      ),
+      invoice_items_scoped AS (
+        SELECT
+          ii.invoice_id,
+          ii.product_id,
+          inv.branch_id,
+          inv.invoice_type,
+          inv.invoice_date,
+          inv.invoice_total,
+          CASE
+            WHEN COALESCE(ii.is_return, false)
+              THEN -COALESCE(
+                ii.total,
+                COALESCE(ii.quantity, 0)
+                  * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+              )
+            ELSE COALESCE(
+              ii.total,
+              COALESCE(ii.quantity, 0)
+                * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+            )
+          END AS signed_item_total,
+          CASE
+            WHEN COALESCE(ii.is_return, false)
+              THEN -COALESCE(ii.quantity, 0)
+            ELSE COALESCE(ii.quantity, 0)
+          END AS signed_quantity,
+          CASE
+            WHEN COALESCE(ii.is_return, false) THEN 0
+            ELSE COALESCE(ii.quantity, 0)
+              * COALESCE(
+                  ii.cost_price,
+                  CASE
+                    WHEN inv.invoice_type = 'retail'
+                      THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
+                    ELSE COALESCE(p.purchase_price, 0)
+                  END
+                )
+          END AS total_cost,
+          SUM(
+            CASE
+              WHEN COALESCE(ii.is_return, false)
+                THEN -COALESCE(
+                  ii.total,
+                  COALESCE(ii.quantity, 0)
+                    * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+                )
+              ELSE COALESCE(
+                ii.total,
+                COALESCE(ii.quantity, 0)
+                  * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+              )
+            END
+          ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
+        FROM invoice_scope inv
+        JOIN selected_invoice_ids sii ON sii.invoice_id = inv.invoice_id
+        JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
+        JOIN products p ON p.id = ii.product_id
+      ),
+      selected_profit_rows AS (
+        SELECT
+          sp.product_id,
+          sp.product_name,
+          sp.manufacturer_name,
+          sp.product_created_at,
+          iis.invoice_id,
+          iis.invoice_date,
+          iis.signed_quantity,
+          CASE
+            WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
+            ELSE iis.signed_item_total
+              - (
+                  (iis.invoice_items_total - iis.invoice_total)
+                  * (iis.signed_item_total / iis.invoice_items_total)
+                )
+          END AS sales_total_after_discount,
+          iis.total_cost
+        FROM selected_products sp
+        LEFT JOIN invoice_items_scoped iis ON iis.product_id = sp.product_id
+        WHERE iis.invoice_id IS NULL
+          OR iis.invoice_date >= COALESCE(
+            ${selectionStartDateParam}::date,
+            sp.product_created_at,
+            iis.invoice_date
+          )
+      ),
+      aggregated_profit AS (
+        SELECT
+          spr.product_id,
+          COUNT(DISTINCT spr.invoice_id) FILTER (
+            WHERE spr.invoice_id IS NOT NULL
+          ) AS invoices_count,
+          MIN(spr.invoice_date) AS first_sale_date,
+          MAX(spr.invoice_date) AS last_sale_date,
+          COALESCE(SUM(spr.signed_quantity), 0) AS sold_quantity,
+          COALESCE(SUM(spr.sales_total_after_discount), 0) AS sales_total_after_discount,
+          COALESCE(SUM(spr.total_cost), 0) AS total_cost
+        FROM selected_profit_rows spr
+        GROUP BY spr.product_id
+      )
+      SELECT
+        sp.product_id,
+        sp.product_name,
+        sp.manufacturer_name,
+        sp.product_created_at,
+        COALESCE(ap.invoices_count, 0) AS invoices_count,
+        ap.first_sale_date,
+        ap.last_sale_date,
+        COALESCE(ap.sold_quantity, 0) AS sold_quantity,
+        COALESCE(ap.sales_total_after_discount, 0) AS sales_total_after_discount,
+        COALESCE(ap.total_cost, 0) AS total_cost
+      FROM selected_products sp
+      LEFT JOIN aggregated_profit ap ON ap.product_id = sp.product_id
+      ORDER BY sp.product_name ASC
+      `,
+      values,
+    );
+
+    const rows = result.rows.map((row) => {
+      const salesTotal = Number(row.sales_total_after_discount || 0);
+      const totalCost = Number(row.total_cost || 0);
+      const netProfit = salesTotal - totalCost;
+
+      return {
+        product_id: Number(row.product_id),
+        product_name: row.product_name,
+        manufacturer_name: row.manufacturer_name,
+        product_created_at: row.product_created_at,
+        invoices_count: Number(row.invoices_count || 0),
+        first_sale_date: row.first_sale_date,
+        last_sale_date: row.last_sale_date,
+        sold_quantity: Number(row.sold_quantity || 0),
+        sales_total_after_discount: Math.round(salesTotal * 100) / 100,
+        total_cost: Math.round(totalCost * 100) / 100,
+        net_profit: Math.round(netProfit * 100) / 100,
+      };
+    });
+
+    res.json(rows);
+  } catch (err) {
+    console.error("PRODUCT SALES PROFIT ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
   }
 };
 
