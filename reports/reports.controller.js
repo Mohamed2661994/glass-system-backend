@@ -589,7 +589,9 @@ exports.getAllProducts = async (req, res) => {
   try {
     const { search, manufacturer, limit = 50 } = req.query;
     const normalizedSearch = String(search || "").trim();
-    const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
+    const normalizedManufacturer = String(manufacturer || "")
+      .trim()
+      .toLowerCase();
     const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 100));
 
     if (!normalizedSearch && !normalizedManufacturer) {
@@ -603,14 +605,16 @@ exports.getAllProducts = async (req, res) => {
     if (normalizedSearch) {
       values.push(`%${normalizedSearch}%`);
       conditions.push(
-        `(p.name ILIKE $${paramIdx} OR COALESCE(p.manufacturer, '') ILIKE $${paramIdx} OR COALESCE(p.barcode, '') ILIKE $${paramIdx} OR CAST(p.id AS TEXT) ILIKE $${paramIdx})`
+        `(p.name ILIKE $${paramIdx} OR COALESCE(p.manufacturer, '') ILIKE $${paramIdx} OR COALESCE(p.barcode, '') ILIKE $${paramIdx} OR CAST(p.id AS TEXT) ILIKE $${paramIdx})`,
       );
       paramIdx++;
     }
 
     if (normalizedManufacturer) {
       values.push(`${normalizedManufacturer}`);
-      conditions.push(`LOWER(TRIM(COALESCE(p.manufacturer, ''))) = $${paramIdx}`);
+      conditions.push(
+        `LOWER(TRIM(COALESCE(p.manufacturer, ''))) = $${paramIdx}`,
+      );
       paramIdx++;
     }
 
@@ -981,31 +985,42 @@ exports.getCustomerDebtDetails = async (req, res) => {
       return res.status(400).json({ error: "customer_name مطلوب" });
     }
 
-    let conditions = [
+    let invoiceConditions = [
       "i.customer_name = $1",
       "i.movement_type = 'sale'",
       "i.is_void = false",
+    ];
+    let paymentConditions = [
+      "cp.source_type = 'customer_payment'",
+      "cp.customer_name = $1",
     ];
 
     let values = [customer_name];
     let idx = 2;
 
     if (from) {
-      conditions.push(`i.invoice_date >= $${idx++}`);
+      const param = `$${idx++}`;
+      invoiceConditions.push(`i.invoice_date >= ${param}`);
+      paymentConditions.push(`cp.created_at >= ${param}`);
       values.push(from);
     }
 
     if (to) {
-      conditions.push(`i.invoice_date <= $${idx++}`);
+      const param = `$${idx++}`;
+      invoiceConditions.push(`i.invoice_date <= ${param}`);
+      paymentConditions.push(`cp.created_at <= ${param}`);
       values.push(to);
     }
 
     if (warehouse_id) {
-      conditions.push(`i.branch_id = $${idx++}`);
+      const param = `$${idx++}`;
+      invoiceConditions.push(`i.branch_id = ${param}`);
+      paymentConditions.push(`cp.branch_id = ${param}`);
       values.push(warehouse_id);
     }
 
-    const invoiceWhere = `WHERE ${conditions.join(" AND ")}`;
+    const invoiceWhere = `WHERE ${invoiceConditions.join(" AND ")}`;
+    const paymentWhere = `WHERE ${paymentConditions.join(" AND ")}`;
 
     const result = await pool.query(
       `
@@ -1035,17 +1050,32 @@ exports.getCustomerDebtDetails = async (req, res) => {
         cp.amount AS paid_amount,
         0 AS remaining_amount
       FROM cash_in cp
-      WHERE cp.source_type = 'customer_payment'
-      AND cp.customer_name = $1
-      ${from ? `AND cp.created_at >= '${from}'` : ""}
-      ${to ? `AND cp.created_at <= '${to}'` : ""}
+      ${paymentWhere}
 
       ORDER BY invoice_date ASC
       `,
       values,
     );
 
-    res.json(result.rows);
+    let runningBalance = 0;
+    const rows = result.rows.map((row) => {
+      const paidAmount = Number(row.paid_amount || 0);
+      const remainingAmount = Number(row.remaining_amount || 0);
+
+      if (row.record_type === "invoice") {
+        runningBalance = remainingAmount;
+      } else {
+        runningBalance -= paidAmount;
+      }
+
+      return {
+        ...row,
+        remaining_amount: runningBalance,
+        running_balance: runningBalance,
+      };
+    });
+
+    res.json(rows);
   } catch (err) {
     console.error("CUSTOMER DEBT DETAILS ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });
