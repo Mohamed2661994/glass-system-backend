@@ -1,0 +1,31 @@
+# Public webhook rollout env template
+#
+# Safe default profile:
+# - No capture
+# - No delivery
+# - Test routes disabled
+# Use this profile if you only want to deploy the code first.
+
+PUBLIC_WEBHOOK_CAPTURE_ENABLED=false
+PUBLIC_WEBHOOK_DELIVERY_ENABLED=false
+PUBLIC_WEBHOOK_TEST_ROUTES_ENABLED=false
+PUBLIC_WEBHOOK_URL=
+PUBLIC_WEBHOOK_SECRET=
+PUBLIC_WEBHOOK_TIMEOUT_MS=3000
+PUBLIC_WEBHOOK_MAX_ATTEMPTS=5
+PUBLIC_WEBHOOK_POLL_INTERVAL_MS=15000
+
+# Dry-run profile:
+# - Keep capture off
+# - Turn delivery on
+# - Turn test routes on
+# - Use the website team's non-production webhook URL and test secret
+#
+# PUBLIC_WEBHOOK_CAPTURE_ENABLED=false
+# PUBLIC_WEBHOOK_DELIVERY_ENABLED=true
+# PUBLIC_WEBHOOK_TEST_ROUTES_ENABLED=true
+# PUBLIC_WEBHOOK_URL=https://example.test/webhooks/glass
+# PUBLIC_WEBHOOK_SECRET=replace_with_test_shared_secret
+# PUBLIC_WEBHOOK_TIMEOUT_MS=3000
+# PUBLIC_WEBHOOK_MAX_ATTEMPTS=5
+# PUBLIC_WEBHOOK_POLL_INTERVAL_MS=15000

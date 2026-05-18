@@ -30,6 +30,9 @@ const {
   checkPool,
   getSyncLogs,
   enqueueInvoiceAggregateSync,
+  queuePublicWebhookTestEvent,
+  replayPublicWebhookDelivery,
+  arePublicWebhookTestRoutesEnabled,
 } = require("./db");
 const {
   convertWholesaleToRetail,
@@ -229,6 +232,171 @@ app.get("/admin/sync-logs", (req, res) => {
     res.json({ ok: true, logs });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ── Admin: Queue public webhook test delivery ── */
+app.post("/admin/public-webhooks/test-delivery", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
+    if (!arePublicWebhookTestRoutesEnabled()) {
+      return res.status(403).json({
+        error: "Public webhook test routes are disabled",
+      });
+    }
+
+    const eventType = String(req.body.eventType || "").trim();
+    const scopeMode = String(req.body.scopeMode || "items")
+      .trim()
+      .toLowerCase();
+    const allowedEventTypes = [
+      "public.products.changed",
+      "public.stock.changed",
+    ];
+
+    if (!allowedEventTypes.includes(eventType)) {
+      return res.status(400).json({
+        error:
+          "eventType must be public.products.changed or public.stock.changed",
+      });
+    }
+
+    if (!["items", "full"].includes(scopeMode)) {
+      return res.status(400).json({
+        error: 'scopeMode must be "items" or "full"',
+      });
+    }
+
+    const delivery = await queuePublicWebhookTestEvent(pool, {
+      eventType,
+      scopeMode,
+      items: Array.isArray(req.body.items) ? req.body.items : undefined,
+    });
+
+    res.status(201).json({
+      ok: true,
+      delivery,
+      delivery_enabled: dbState.publicWebhook.deliveryEnabled,
+    });
+  } catch (err) {
+    console.error("PUBLIC WEBHOOK TEST DELIVERY ERROR:", err);
+    res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+
+/* ── Admin: Public webhook status ── */
+app.get("/admin/public-webhooks/status", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
+    if (!arePublicWebhookTestRoutesEnabled()) {
+      return res.status(403).json({
+        error: "Public webhook test routes are disabled",
+      });
+    }
+
+    const summaryResult = await pool.query(
+      `
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+        COUNT(*) FILTER (WHERE status = 'delivering') AS delivering_count,
+        COUNT(*) FILTER (WHERE status = 'failed') AS failed_count,
+        COUNT(*) FILTER (WHERE status = 'delivered') AS delivered_count,
+        MIN(next_attempt_at) FILTER (
+          WHERE status IN ('pending', 'failed', 'delivering')
+        ) AS oldest_pending_at,
+        MAX(delivered_at) AS last_delivered_at
+      FROM public_webhook_deliveries
+      `,
+    );
+
+    const unqueuedResult = await pool.query(
+      `
+      SELECT COUNT(*) AS unqueued_change_rows
+      FROM public_webhook_change_log l
+      LEFT JOIN public_webhook_deliveries d
+        ON d.batch_txid = l.batch_txid
+       AND d.event_type = l.event_type
+      WHERE d.id IS NULL
+      `,
+    );
+
+    const recentDeliveriesResult = await pool.query(
+      `
+      SELECT event_id, event_type, revision, status, attempts, next_attempt_at, delivered_at, updated_at
+      FROM public_webhook_deliveries
+      ORDER BY revision DESC
+      LIMIT 10
+      `,
+    );
+
+    res.json({
+      ok: true,
+      config: {
+        capture_enabled: dbState.publicWebhook.captureEnabled,
+        delivery_enabled: dbState.publicWebhook.deliveryEnabled,
+        test_routes_enabled: arePublicWebhookTestRoutesEnabled(),
+      },
+      runtime: {
+        last_claimed_at: dbState.publicWebhook.lastClaimedAt,
+        last_delivery_at: dbState.publicWebhook.lastDeliveryAt,
+        last_delivery_error: dbState.publicWebhook.lastDeliveryError,
+      },
+      summary: {
+        ...summaryResult.rows[0],
+        unqueued_change_rows: Number(
+          unqueuedResult.rows[0]?.unqueued_change_rows || 0,
+        ),
+      },
+      recent_deliveries: recentDeliveriesResult.rows,
+    });
+  } catch (err) {
+    console.error("PUBLIC WEBHOOK STATUS ERROR:", err);
+    res.status(500).json({ error: err.message || "Server error" });
+  }
+});
+
+/* ── Admin: Replay public webhook delivery ── */
+app.post("/admin/public-webhooks/replay", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await requireAdminUser(req, res);
+    if (!currentUser) return;
+
+    if (!arePublicWebhookTestRoutesEnabled()) {
+      return res.status(403).json({
+        error: "Public webhook test routes are disabled",
+      });
+    }
+
+    const eventId = String(req.body.eventId || "").trim();
+    const revision = Number(req.body.revision || 0) || null;
+
+    if (!eventId && !revision) {
+      return res.status(400).json({
+        error: "eventId or revision is required",
+      });
+    }
+
+    const deliveries = await replayPublicWebhookDelivery(pool, {
+      eventId,
+      revision,
+    });
+
+    if (!deliveries.length) {
+      return res.status(404).json({ error: "Delivery not found" });
+    }
+
+    res.json({
+      ok: true,
+      deliveries,
+      delivery_enabled: dbState.publicWebhook.deliveryEnabled,
+    });
+  } catch (err) {
+    console.error("PUBLIC WEBHOOK REPLAY ERROR:", err);
+    res.status(500).json({ error: err.message || "Server error" });
   }
 });
 
@@ -1772,19 +1940,33 @@ async function getProductVariantPackageMeta(
   return meta;
 }
 
-async function updateRetailWeightedAverageCost(client, productId, addedRetailQty, addedTotalCost) {
-if (addedRetailQty <= 0) return;
-const stockRes = await client.query('SELECT quantity FROM stock WHERE product_id =  AND warehouse_id = 1 AND variant_id = 0', [productId]);
-const oldQty = stockRes.rows.length ? Number(stockRes.rows[0].quantity) : 0;
-const prodRes = await client.query('SELECT retail_purchase_price FROM products WHERE id = ', [productId]);
-if (!prodRes.rows.length) return;
-const oldPrice = Number(prodRes.rows[0].retail_purchase_price || 0);
-const validOldQty = oldQty > 0 ? oldQty : 0;
-const newQty = validOldQty + addedRetailQty;
-if (newQty > 0) {
-  const newPrice = ((validOldQty * oldPrice) + Number(addedTotalCost)) / newQty;
-  await client.query('UPDATE products SET retail_purchase_price =  WHERE id = ', [newPrice, productId]);
-}
+async function updateRetailWeightedAverageCost(
+  client,
+  productId,
+  addedRetailQty,
+  addedTotalCost,
+) {
+  if (addedRetailQty <= 0) return;
+  const stockRes = await client.query(
+    "SELECT quantity FROM stock WHERE product_id =  AND warehouse_id = 1 AND variant_id = 0",
+    [productId],
+  );
+  const oldQty = stockRes.rows.length ? Number(stockRes.rows[0].quantity) : 0;
+  const prodRes = await client.query(
+    "SELECT retail_purchase_price FROM products WHERE id = ",
+    [productId],
+  );
+  if (!prodRes.rows.length) return;
+  const oldPrice = Number(prodRes.rows[0].retail_purchase_price || 0);
+  const validOldQty = oldQty > 0 ? oldQty : 0;
+  const newQty = validOldQty + addedRetailQty;
+  if (newQty > 0) {
+    const newPrice = (validOldQty * oldPrice + Number(addedTotalCost)) / newQty;
+    await client.query(
+      "UPDATE products SET retail_purchase_price =  WHERE id = ",
+      [newPrice, productId],
+    );
+  }
 }
 
 async function resolveInvoiceItemVariantId(
@@ -6273,7 +6455,7 @@ app.post("/admin/opening-stock", async (req, res) => {
       const product = barcodeMap.get(code);
       if (product) {
         const pkg = item.unit || product.retail_package || "";
-        
+
         // 🔥 دمج كود القطاعي: رصيد أول مدة قطاعي يُحفظ إجبارياً على الكود الأساسي (0)
         const variantId = 0;
 
@@ -9195,9 +9377,11 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
       // حاول تجيب الـ variant_id من حركات المخزن إذا كان 0 ومفيش عمود في الجدول
       const moveRes = await client.query(
         `SELECT variant_id FROM stock_movements WHERE reference_type = 'transfer' AND reference_id = $1 AND product_id = $2 AND movement_type = 'transfer_out' LIMIT 1`,
-        [transferId, item.product_id]
+        [transferId, item.product_id],
       );
-      const actualVariantId = moveRes.rows.length ? Number(moveRes.rows[0].variant_id) : 0;
+      const actualVariantId = moveRes.rows.length
+        ? Number(moveRes.rows[0].variant_id)
+        : 0;
 
       // ➕ رجوع للجملة
       await client.query(
@@ -9206,7 +9390,12 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         SET quantity = quantity + $1
         WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
         `,
-        [item.from_quantity, item.from_warehouse_id, item.product_id, actualVariantId]
+        [
+          item.from_quantity,
+          item.from_warehouse_id,
+          item.product_id,
+          actualVariantId,
+        ],
       );
 
       // ➖ خصم من القطاعي
@@ -9411,9 +9600,11 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
 
     const moveRes = await client.query(
       `SELECT variant_id FROM stock_movements WHERE reference_type = 'transfer' AND reference_id = $1 AND product_id = $2 AND movement_type = 'transfer_out' LIMIT 1`,
-      [item.transfer_id, item.product_id]
+      [item.transfer_id, item.product_id],
     );
-    const actualVariantId = moveRes.rows.length ? Number(moveRes.rows[0].variant_id) : 0;
+    const actualVariantId = moveRes.rows.length
+      ? Number(moveRes.rows[0].variant_id)
+      : 0;
 
     // ➕ رجوع للمخزن الأصلي
     await client.query(
@@ -9422,7 +9613,12 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       SET quantity = quantity + $1
       WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
       `,
-      [item.from_quantity, item.from_warehouse_id, item.product_id, actualVariantId]
+      [
+        item.from_quantity,
+        item.from_warehouse_id,
+        item.product_id,
+        actualVariantId,
+      ],
     );
 
     // ➖ خصم من المخزن الهدف

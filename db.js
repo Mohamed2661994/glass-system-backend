@@ -1,4 +1,7 @@
 const { Pool } = require("pg");
+const http = require("http");
+const https = require("https");
+const crypto = require("crypto");
 require("dotenv").config();
 
 /* ══════════════════════════════════════════════════════════
@@ -8,6 +11,46 @@ require("dotenv").config();
 
 /* ── Pool configuration ── */
 const POOL_OPTS = { connectionTimeoutMillis: 5000, max: 10 };
+
+function parseBooleanEnv(value, defaultValue = false) {
+  if (value == null || value === "") return defaultValue;
+  return ["1", "true", "yes", "on"].includes(
+    String(value).trim().toLowerCase(),
+  );
+}
+
+const PUBLIC_WEBHOOK_RETRY_DELAYS_MS = [60000, 300000, 900000, 3600000];
+const PUBLIC_WEBHOOK_MAX_BATCH = 10;
+const PUBLIC_WEBHOOK_DELIVERY_STALE_AFTER_MS = 5 * 60 * 1000;
+const PUBLIC_WEBHOOK_SOURCE = "glass-system-backend";
+const PUBLIC_WEBHOOK_CONFIG = Object.freeze({
+  captureEnabled: parseBooleanEnv(
+    process.env.PUBLIC_WEBHOOK_CAPTURE_ENABLED,
+    false,
+  ),
+  deliveryEnabled: parseBooleanEnv(
+    process.env.PUBLIC_WEBHOOK_DELIVERY_ENABLED,
+    false,
+  ),
+  url: String(process.env.PUBLIC_WEBHOOK_URL || "").trim(),
+  secret: String(process.env.PUBLIC_WEBHOOK_SECRET || ""),
+  testRoutesEnabled: parseBooleanEnv(
+    process.env.PUBLIC_WEBHOOK_TEST_ROUTES_ENABLED,
+    false,
+  ),
+  timeoutMs: Math.max(
+    1000,
+    Number(process.env.PUBLIC_WEBHOOK_TIMEOUT_MS) || 3000,
+  ),
+  maxAttempts: Math.max(
+    1,
+    Number(process.env.PUBLIC_WEBHOOK_MAX_ATTEMPTS) || 5,
+  ),
+  pollIntervalMs: Math.max(
+    5000,
+    Number(process.env.PUBLIC_WEBHOOK_POLL_INTERVAL_MS) || 15000,
+  ),
+});
 
 const localPool = new Pool({
   host: process.env.DB_HOST_LOCAL,
@@ -58,6 +101,13 @@ const state = {
   nextPeriodicSyncAt: null, // ISO string
   lastRealtimeSyncAt: null, // ISO string
   syncLogs: [], // recent sync attempts
+  publicWebhook: {
+    captureEnabled: PUBLIC_WEBHOOK_CONFIG.captureEnabled,
+    deliveryEnabled: PUBLIC_WEBHOOK_CONFIG.deliveryEnabled,
+    lastClaimedAt: null,
+    lastDeliveryAt: null,
+    lastDeliveryError: null,
+  },
 };
 
 const MAX_SYNC_LOGS = 200;
@@ -72,6 +122,784 @@ function pushSyncLog(entry) {
 function getSyncLogs(limit = 100) {
   const safeLimit = Math.max(1, Math.min(Number(limit) || 100, MAX_SYNC_LOGS));
   return state.syncLogs.slice(0, safeLimit);
+}
+
+function isPublicWebhookCaptureEnabled() {
+  return PUBLIC_WEBHOOK_CONFIG.captureEnabled;
+}
+
+function isPublicWebhookDeliveryEnabled() {
+  return PUBLIC_WEBHOOK_CONFIG.deliveryEnabled;
+}
+
+function isPublicWebhookDeliveryConfigured() {
+  return Boolean(PUBLIC_WEBHOOK_CONFIG.url && PUBLIC_WEBHOOK_CONFIG.secret);
+}
+
+function arePublicWebhookTestRoutesEnabled() {
+  return PUBLIC_WEBHOOK_CONFIG.testRoutesEnabled;
+}
+
+function getPublicWebhookRetryDelayMs(attemptNumber) {
+  const index = Math.max(
+    0,
+    Math.min(
+      Number(attemptNumber || 1) - 1,
+      PUBLIC_WEBHOOK_RETRY_DELAYS_MS.length - 1,
+    ),
+  );
+  return PUBLIC_WEBHOOK_RETRY_DELAYS_MS[index];
+}
+
+function buildPublicWebhookSignature(timestamp, rawBody) {
+  return `sha256=${crypto
+    .createHmac("sha256", PUBLIC_WEBHOOK_CONFIG.secret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest("hex")}`;
+}
+
+function buildPublicWebhookHeaders(delivery, rawBody) {
+  const timestamp = new Date().toISOString();
+  return {
+    timestamp,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Glass-Event-Id": delivery.event_id,
+      "X-Glass-Event-Type": delivery.event_type,
+      "X-Glass-Timestamp": timestamp,
+      "X-Glass-Signature": buildPublicWebhookSignature(timestamp, rawBody),
+    },
+  };
+}
+
+function sendPublicWebhookRequest(rawBody, headers) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(PUBLIC_WEBHOOK_CONFIG.url);
+    const transport = url.protocol === "http:" ? http : https;
+    const req = transport.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        timeout: PUBLIC_WEBHOOK_CONFIG.timeoutMs,
+        headers: {
+          ...headers,
+          "Content-Length": Buffer.byteLength(rawBody),
+        },
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          if (body.length < 4000) body += chunk;
+        });
+        res.on("end", () => {
+          resolve({
+            statusCode: Number(res.statusCode) || 0,
+            body,
+          });
+        });
+      },
+    );
+
+    req.on("timeout", () => {
+      req.destroy(
+        new Error(
+          `Public webhook request timed out after ${PUBLIC_WEBHOOK_CONFIG.timeoutMs}ms`,
+        ),
+      );
+    });
+    req.on("error", reject);
+    req.write(rawBody);
+    req.end();
+  });
+}
+
+async function claimPendingPublicWebhookDeliveries(
+  poolRef,
+  limit = PUBLIC_WEBHOOK_MAX_BATCH,
+) {
+  const result = await poolRef.query(
+    `
+    WITH next_delivery AS (
+      SELECT id
+      FROM public_webhook_deliveries
+      WHERE attempts < $1
+        AND (
+          status = 'pending'
+          OR (status = 'failed' AND next_attempt_at <= NOW())
+          OR (
+            status = 'delivering'
+            AND updated_at <= NOW() - ($3::int * INTERVAL '1 millisecond')
+          )
+        )
+      ORDER BY revision ASC
+      LIMIT $2
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE public_webhook_deliveries d
+    SET status = 'delivering',
+        updated_at = NOW()
+    FROM next_delivery nd
+    WHERE d.id = nd.id
+    RETURNING d.id, d.event_type, d.event_id, d.revision, d.payload, d.attempts
+    `,
+    [
+      PUBLIC_WEBHOOK_CONFIG.maxAttempts,
+      limit,
+      PUBLIC_WEBHOOK_DELIVERY_STALE_AFTER_MS,
+    ],
+  );
+
+  return result.rows;
+}
+
+async function markPublicWebhookDelivered(poolRef, deliveryId) {
+  await poolRef.query(
+    `
+    UPDATE public_webhook_deliveries
+    SET status = 'delivered',
+        delivered_at = NOW(),
+        last_error = NULL,
+        updated_at = NOW()
+    WHERE id = $1
+    `,
+    [deliveryId],
+  );
+}
+
+async function markPublicWebhookFailed(
+  poolRef,
+  deliveryId,
+  currentAttempts,
+  errorMessage,
+) {
+  await poolRef.query(
+    `
+    UPDATE public_webhook_deliveries
+    SET status = 'failed',
+        attempts = attempts + 1,
+        next_attempt_at = NOW() + ($2::int * INTERVAL '1 millisecond'),
+        last_error = LEFT($3, 1000),
+        updated_at = NOW()
+    WHERE id = $1
+    `,
+    [
+      deliveryId,
+      getPublicWebhookRetryDelayMs(Number(currentAttempts || 0) + 1),
+      errorMessage || 'Public webhook delivery failed',
+    ],
+  );
+}
+
+async function enqueuePublicWebhookDelivery(target, entry) {
+  if (!entry || typeof entry !== "object") return null;
+
+  const batchTxid = Number(entry.batchTxid) || 0;
+  const eventType = String(entry.eventType || "").trim();
+  const eventId = String(entry.eventId || "").trim();
+  const scopeMode = String(entry.scopeMode || "items").trim() || "items";
+  const payload = entry.payload && typeof entry.payload === "object"
+    ? entry.payload
+    : null;
+
+  if (!eventType || !eventId || !payload) {
+    return null;
+  }
+
+  const result = await target.query(
+    `
+    INSERT INTO public_webhook_deliveries
+      (batch_txid, event_type, event_id, scope_mode, payload, status, next_attempt_at)
+    VALUES
+      ($1, $2, $3, $4, $5::jsonb, 'pending', NOW())
+    ON CONFLICT (event_id)
+    DO UPDATE
+      SET payload = EXCLUDED.payload,
+          scope_mode = EXCLUDED.scope_mode,
+          updated_at = NOW()
+    RETURNING id, revision, event_id, event_type
+    `,
+    [batchTxid, eventType, eventId, scopeMode, JSON.stringify(payload)],
+  );
+
+  return result.rows[0] || null;
+}
+
+function buildPublicWebhookEventId(eventType, batchTxid) {
+  const normalizedType = String(eventType || "event")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return `evt_${normalizedType}_${String(batchTxid || "0")}`;
+}
+
+function normalizeChangedFields(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return normalizeChangedFields(parsed);
+    } catch {
+      return value ? [value] : [];
+    }
+  }
+  return [];
+}
+
+function unionChangedFields(rows) {
+  const seen = new Set();
+  for (const row of rows) {
+    for (const field of normalizeChangedFields(row.changed_fields)) {
+      seen.add(field);
+    }
+  }
+  return [...seen];
+}
+
+function getLastRow(rows) {
+  return Array.isArray(rows) && rows.length > 0 ? rows[rows.length - 1] : null;
+}
+
+function getFirstNonNull(rows, key) {
+  for (const row of rows) {
+    if (row?.[key] !== null && row?.[key] !== undefined) {
+      return row[key];
+    }
+  }
+  return null;
+}
+
+function getLastNonNull(rows, key) {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (row?.[key] !== null && row?.[key] !== undefined) {
+      return row[key];
+    }
+  }
+  return null;
+}
+
+function toIsoTimestamp(value) {
+  if (!value) return new Date().toISOString();
+
+  const normalized = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(normalized.getTime())) {
+    return new Date().toISOString();
+  }
+
+  return normalized.toISOString();
+}
+
+async function listPendingPublicWebhookBatches(
+  poolRef,
+  limit = PUBLIC_WEBHOOK_MAX_BATCH,
+) {
+  const result = await poolRef.query(
+    `
+    SELECT
+      l.batch_txid,
+      l.event_type,
+      CASE
+        WHEN BOOL_OR(l.scope_mode = 'full') THEN 'full'
+        WHEN BOOL_OR(l.scope_mode = 'branch') THEN 'branch'
+        ELSE 'items'
+      END AS scope_mode,
+      MIN(l.id) AS first_change_id
+    FROM public_webhook_change_log l
+    LEFT JOIN public_webhook_deliveries d
+      ON d.batch_txid = l.batch_txid
+     AND d.event_type = l.event_type
+    WHERE d.id IS NULL
+    GROUP BY l.batch_txid, l.event_type
+    ORDER BY MIN(l.id) ASC
+    LIMIT $1
+    `,
+    [limit],
+  );
+
+  return result.rows;
+}
+
+async function getPublicWebhookChangeRows(poolRef, batchTxid, eventType) {
+  const result = await poolRef.query(
+    `
+    SELECT
+      id,
+      batch_txid,
+      event_type,
+      scope_mode,
+      product_id,
+      variant_id,
+      warehouse_id,
+      branch_id,
+      operation,
+      changed_fields,
+      old_stock,
+      new_stock,
+      created_at
+    FROM public_webhook_change_log
+    WHERE batch_txid = $1
+      AND event_type = $2
+    ORDER BY id ASC
+    `,
+    [batchTxid, eventType],
+  );
+
+  return result.rows;
+}
+
+async function loadPublicWebhookLookups(poolRef, rows) {
+  const productIds = [
+    ...new Set(
+      rows
+        .map((row) => Number(row.product_id || 0))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  ];
+  const variantIds = [
+    ...new Set(
+      rows
+        .map((row) => Number(row.variant_id || 0))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  ];
+  const warehouseIds = [
+    ...new Set(
+      rows
+        .map((row) => Number(row.warehouse_id || 0))
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  ];
+
+  const productById = new Map();
+  const variantById = new Map();
+  const warehouseById = new Map();
+
+  if (productIds.length > 0) {
+    const productsRes = await poolRef.query(
+      `SELECT id, barcode FROM products WHERE id = ANY($1::bigint[])`,
+      [productIds],
+    );
+    for (const row of productsRes.rows) {
+      productById.set(Number(row.id), row);
+    }
+  }
+
+  if (variantIds.length > 0) {
+    const variantsRes = await poolRef.query(
+      `SELECT id, product_id, barcode FROM product_variants WHERE id = ANY($1::bigint[])`,
+      [variantIds],
+    );
+    for (const row of variantsRes.rows) {
+      variantById.set(Number(row.id), row);
+    }
+  }
+
+  if (warehouseIds.length > 0) {
+    const warehousesRes = await poolRef.query(
+      `SELECT id, branch_id FROM warehouses WHERE id = ANY($1::bigint[])`,
+      [warehouseIds],
+    );
+    for (const row of warehousesRes.rows) {
+      warehouseById.set(Number(row.id), row);
+    }
+  }
+
+  return { productById, variantById, warehouseById };
+}
+
+function buildPublicProductsItems(rows, lookups) {
+  const grouped = new Map();
+
+  for (const row of rows) {
+    const productId = Number(row.product_id || 0);
+    if (!productId) continue;
+    if (!grouped.has(productId)) {
+      grouped.set(productId, []);
+    }
+    grouped.get(productId).push(row);
+  }
+
+  const items = [];
+  for (const [productId, groupRows] of grouped) {
+    const lastRow = getLastRow(groupRows);
+    const product = lookups.productById.get(productId);
+    items.push({
+      productId,
+      productCode: productId,
+      barcode: product?.barcode || null,
+      operation: lastRow?.operation === "delete" ? "delete" : "upsert",
+      changedFields: unionChangedFields(groupRows),
+    });
+  }
+
+  return items;
+}
+
+function buildPublicStockItems(rows, lookups) {
+  const grouped = new Map();
+
+  for (const row of rows) {
+    const productId = Number(row.product_id || 0);
+    const variantId = row.variant_id == null ? 0 : Number(row.variant_id);
+    const warehouseId =
+      row.warehouse_id == null ? null : Number(row.warehouse_id);
+    const key = `${productId}|${variantId}|${warehouseId}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push(row);
+  }
+
+  const items = [];
+  for (const [, groupRows] of grouped) {
+    const lastRow = getLastRow(groupRows);
+    const productId = Number(getLastNonNull(groupRows, "product_id") || 0);
+    if (!productId) continue;
+
+    const variantIdRaw = getLastNonNull(groupRows, "variant_id");
+    const warehouseIdRaw = getLastNonNull(groupRows, "warehouse_id");
+    const variantId = variantIdRaw == null ? 0 : Number(variantIdRaw);
+    const warehouseId = warehouseIdRaw == null ? null : Number(warehouseIdRaw);
+    const warehouse =
+      warehouseId == null ? null : lookups.warehouseById.get(warehouseId);
+    const variant = variantId > 0 ? lookups.variantById.get(variantId) : null;
+    const product = lookups.productById.get(productId);
+
+    items.push({
+      productId,
+      productCode: productId,
+      variantId,
+      barcode: variant?.barcode || product?.barcode || null,
+      warehouseId,
+      branchId:
+        getLastNonNull(groupRows, "branch_id") ?? warehouse?.branch_id ?? null,
+      operation: lastRow?.operation === "delete" ? "delete" : "upsert",
+      oldStock: getFirstNonNull(groupRows, "old_stock"),
+      newStock: getLastNonNull(groupRows, "new_stock"),
+      changedFields: unionChangedFields(groupRows),
+    });
+  }
+
+  return items;
+}
+
+async function buildPublicWebhookPayload(poolRef, candidate, rows) {
+  const scopeMode = String(candidate.scope_mode || "items");
+  const lookups =
+    scopeMode === "items"
+      ? await loadPublicWebhookLookups(poolRef, rows)
+      : { productById: new Map(), variantById: new Map(), warehouseById: new Map() };
+
+  let items = [];
+  if (scopeMode === "items") {
+    if (candidate.event_type === "public.products.changed") {
+      items = buildPublicProductsItems(rows, lookups);
+    } else if (candidate.event_type === "public.stock.changed") {
+      items = buildPublicStockItems(rows, lookups);
+    }
+  }
+
+  return {
+    eventId: buildPublicWebhookEventId(candidate.event_type, candidate.batch_txid),
+    eventType: candidate.event_type,
+    changedAt: toIsoTimestamp(getLastNonNull(rows, "created_at")),
+    revision: null,
+    source: PUBLIC_WEBHOOK_SOURCE,
+    scope: {
+      mode: scopeMode,
+    },
+    items,
+  };
+}
+
+async function materializePendingPublicWebhookDeliveries(
+  poolRef,
+  limit = PUBLIC_WEBHOOK_MAX_BATCH,
+) {
+  const candidates = await listPendingPublicWebhookBatches(poolRef, limit);
+  let materializedCount = 0;
+
+  for (const candidate of candidates) {
+    const rows = await getPublicWebhookChangeRows(
+      poolRef,
+      candidate.batch_txid,
+      candidate.event_type,
+    );
+    if (rows.length === 0) continue;
+
+    const payload = await buildPublicWebhookPayload(poolRef, candidate, rows);
+    const delivery = await enqueuePublicWebhookDelivery(poolRef, {
+      batchTxid: candidate.batch_txid,
+      eventType: candidate.event_type,
+      eventId: payload.eventId,
+      scopeMode: candidate.scope_mode,
+      payload,
+    });
+
+    if (!delivery) continue;
+
+    await poolRef.query(
+      `
+      UPDATE public_webhook_deliveries
+      SET payload = jsonb_set(payload, '{revision}', to_jsonb(revision), true),
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [delivery.id],
+    );
+    console.log(
+      `🧾 Public webhook queued: ${candidate.event_type}#${delivery.revision}`,
+    );
+    materializedCount += 1;
+  }
+
+  return materializedCount;
+}
+
+function buildDefaultPublicWebhookTestItems(eventType, scopeMode) {
+  if (scopeMode === "full") {
+    return [];
+  }
+
+  if (eventType === "public.products.changed") {
+    return [
+      {
+        productId: 999001,
+        productCode: 999001,
+        barcode: "TEST-PRODUCT-999001",
+        operation: "upsert",
+        changedFields: ["name", "retail_price"],
+      },
+    ];
+  }
+
+  return [
+    {
+      productId: 999001,
+      productCode: 999001,
+      variantId: 0,
+      barcode: "TEST-STOCK-999001",
+      warehouseId: 1,
+      branchId: 1,
+      operation: "upsert",
+      oldStock: 10,
+      newStock: 12,
+      changedFields: ["quantity"],
+    },
+  ];
+}
+
+async function queuePublicWebhookTestEvent(target, options = {}) {
+  const eventType = String(options.eventType || "").trim();
+  const scopeMode =
+    String(options.scopeMode || "items").trim().toLowerCase() === "full"
+      ? "full"
+      : "items";
+
+  if (
+    ![
+      "public.products.changed",
+      "public.stock.changed",
+    ].includes(eventType)
+  ) {
+    throw new Error("Unsupported public webhook event type");
+  }
+
+  const batchTxid = Date.now();
+  const eventId = `evt_test_${String(eventType)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")}_${batchTxid}`;
+  const items = Array.isArray(options.items)
+    ? options.items
+    : buildDefaultPublicWebhookTestItems(eventType, scopeMode);
+  const payload = {
+    eventId,
+    eventType,
+    changedAt: new Date().toISOString(),
+    revision: null,
+    source: PUBLIC_WEBHOOK_SOURCE,
+    scope: {
+      mode: scopeMode,
+    },
+    items,
+  };
+
+  const delivery = await enqueuePublicWebhookDelivery(target, {
+    batchTxid,
+    eventType,
+    eventId,
+    scopeMode,
+    payload,
+  });
+
+  if (!delivery) {
+    throw new Error("Failed to queue public webhook test event");
+  }
+
+  const updated = await target.query(
+    `
+    UPDATE public_webhook_deliveries
+    SET payload = jsonb_set(payload, '{revision}', to_jsonb(revision), true),
+        updated_at = NOW()
+    WHERE id = $1
+    RETURNING id, event_id, event_type, revision, status, payload
+    `,
+    [delivery.id],
+  );
+
+  const queued = updated.rows[0] || null;
+  if (queued) {
+    console.log(
+      `🧪 Public webhook test queued: ${queued.event_type}#${queued.revision}`,
+    );
+  }
+
+  return queued;
+}
+
+async function replayPublicWebhookDelivery(target, options = {}) {
+  const eventId = String(options.eventId || "").trim() || null;
+  const revision = Number(options.revision || 0) || null;
+
+  if (!eventId && !revision) {
+    throw new Error("eventId or revision is required to replay a delivery");
+  }
+
+  const result = await target.query(
+    `
+    UPDATE public_webhook_deliveries
+    SET status = 'pending',
+        attempts = 0,
+        next_attempt_at = NOW(),
+        last_error = NULL,
+        delivered_at = NULL,
+        updated_at = NOW()
+    WHERE ($1::text IS NULL OR event_id = $1)
+      AND ($2::bigint IS NULL OR revision = $2)
+    RETURNING id, event_id, event_type, revision, status, payload
+    `,
+    [eventId, revision],
+  );
+
+  return result.rows;
+}
+
+let publicWebhookDeliveryInterval = null;
+
+async function runPublicWebhookDeliveryTick() {
+  if (!isPublicWebhookDeliveryEnabled()) return;
+
+  if (!isPublicWebhookDeliveryConfigured()) {
+    const message =
+      "Public webhook delivery is enabled but PUBLIC_WEBHOOK_URL or PUBLIC_WEBHOOK_SECRET is missing";
+    if (state.publicWebhook.lastDeliveryError !== message) {
+      console.warn(`⚠️  ${message}`);
+      state.publicWebhook.lastDeliveryError = message;
+    }
+    return;
+  }
+
+  const deliveryPool = getActivePool();
+  let claimed = [];
+
+  if (isPublicWebhookCaptureEnabled()) {
+    try {
+      const materialized = await materializePendingPublicWebhookDeliveries(
+        deliveryPool,
+      );
+      if (materialized > 0) {
+        console.log(
+          `📦 Public webhook deliveries materialized: ${materialized} batches`,
+        );
+      }
+    } catch (err) {
+      state.publicWebhook.lastDeliveryError = err.message;
+      console.error("❌ Public webhook materialization error:", err.message);
+      return;
+    }
+  }
+
+  try {
+    claimed = await claimPendingPublicWebhookDeliveries(deliveryPool);
+  } catch (err) {
+    state.publicWebhook.lastDeliveryError = err.message;
+    console.error("❌ Public webhook claim error:", err.message);
+    return;
+  }
+
+  if (claimed.length === 0) return;
+  state.publicWebhook.lastClaimedAt = new Date().toISOString();
+
+  for (const delivery of claimed) {
+    try {
+      const payload =
+        delivery.payload && typeof delivery.payload === "object"
+          ? delivery.payload
+          : {};
+      const rawBody = JSON.stringify(payload);
+      const { headers } = buildPublicWebhookHeaders(delivery, rawBody);
+      const response = await sendPublicWebhookRequest(rawBody, headers);
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        await markPublicWebhookDelivered(deliveryPool, delivery.id);
+        state.publicWebhook.lastDeliveryAt = new Date().toISOString();
+        state.publicWebhook.lastDeliveryError = null;
+        console.log(
+          `✅ Public webhook delivered: ${delivery.event_type}#${delivery.revision} (${response.statusCode})`,
+        );
+        continue;
+      }
+
+      const responseError = `Public webhook returned status ${response.statusCode}${response.body ? `: ${response.body.slice(0, 300)}` : ""}`;
+      await markPublicWebhookFailed(
+        deliveryPool,
+        delivery.id,
+        delivery.attempts,
+        responseError,
+      );
+      state.publicWebhook.lastDeliveryError = responseError;
+      console.error("❌", responseError);
+    } catch (err) {
+      const deliveryError = err.message || "Public webhook delivery failed";
+      await markPublicWebhookFailed(
+        deliveryPool,
+        delivery.id,
+        delivery.attempts,
+        deliveryError,
+      );
+      state.publicWebhook.lastDeliveryError = deliveryError;
+      console.error(
+        `❌ Public webhook delivery failed for ${delivery.event_type}#${delivery.revision}:`,
+        deliveryError,
+      );
+    }
+  }
+}
+
+function startPublicWebhookDelivery() {
+  if (!isPublicWebhookDeliveryEnabled() || publicWebhookDeliveryInterval) {
+    return;
+  }
+
+  publicWebhookDeliveryInterval = setInterval(() => {
+    runPublicWebhookDeliveryTick().catch((err) => {
+      state.publicWebhook.lastDeliveryError = err.message;
+      console.error("❌ Public webhook interval error:", err.message);
+    });
+  }, PUBLIC_WEBHOOK_CONFIG.pollIntervalMs);
+
+  runPublicWebhookDeliveryTick().catch((err) => {
+    state.publicWebhook.lastDeliveryError = err.message;
+    console.error("❌ Public webhook startup tick error:", err.message);
+  });
 }
 
 /* ── Realtime sync scheduler (debounced) ── */
@@ -1758,6 +2586,586 @@ async function ensureSyncSchema() {
     $$
   `;
 
+  const ensurePublicWebhookRevisionSeqSql = `
+    CREATE SEQUENCE IF NOT EXISTS public_webhook_revision_seq AS BIGINT
+  `;
+
+  const ensurePublicWebhookChangeLogSql = `
+    CREATE TABLE IF NOT EXISTS public_webhook_change_log (
+      id BIGSERIAL PRIMARY KEY,
+      batch_txid BIGINT NOT NULL,
+      event_type TEXT NOT NULL,
+      scope_mode TEXT NOT NULL DEFAULT 'items',
+      product_id BIGINT,
+      variant_id BIGINT,
+      warehouse_id BIGINT,
+      branch_id BIGINT,
+      operation TEXT NOT NULL DEFAULT 'upsert',
+      changed_fields JSONB NOT NULL DEFAULT '[]'::jsonb,
+      old_stock NUMERIC,
+      new_stock NUMERIC,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+
+  const ensurePublicWebhookChangeLogBatchIndexSql = `
+    CREATE INDEX IF NOT EXISTS public_webhook_change_log_batch_idx
+    ON public_webhook_change_log (batch_txid)
+  `;
+
+  const ensurePublicWebhookChangeLogEventIndexSql = `
+    CREATE INDEX IF NOT EXISTS public_webhook_change_log_event_type_idx
+    ON public_webhook_change_log (event_type)
+  `;
+
+  const ensurePublicWebhookChangeLogItemIndexSql = `
+    CREATE INDEX IF NOT EXISTS public_webhook_change_log_item_idx
+    ON public_webhook_change_log (product_id, variant_id, warehouse_id)
+  `;
+
+  const ensurePublicWebhookChangeLogCreatedAtIndexSql = `
+    CREATE INDEX IF NOT EXISTS public_webhook_change_log_created_at_idx
+    ON public_webhook_change_log (created_at)
+  `;
+
+  const ensurePublicWebhookDeliveriesSql = `
+    CREATE TABLE IF NOT EXISTS public_webhook_deliveries (
+      id BIGSERIAL PRIMARY KEY,
+      batch_txid BIGINT NOT NULL,
+      event_type TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      revision BIGINT NOT NULL DEFAULT nextval('public_webhook_revision_seq'),
+      scope_mode TEXT NOT NULL DEFAULT 'items',
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_error TEXT,
+      delivered_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `;
+
+  const ensurePublicWebhookDeliveriesEventIdUniqueSql = `
+    CREATE UNIQUE INDEX IF NOT EXISTS public_webhook_deliveries_event_id_uidx
+    ON public_webhook_deliveries (event_id)
+  `;
+
+  const ensurePublicWebhookDeliveriesBatchEventUniqueSql = `
+    CREATE UNIQUE INDEX IF NOT EXISTS public_webhook_deliveries_batch_event_uidx
+    ON public_webhook_deliveries (batch_txid, event_type)
+  `;
+
+  const ensurePublicWebhookDeliveriesPendingIndexSql = `
+    CREATE INDEX IF NOT EXISTS public_webhook_deliveries_pending_idx
+    ON public_webhook_deliveries (status, next_attempt_at)
+  `;
+
+  const ensurePublicWebhookDeliveriesRevisionIndexSql = `
+    CREATE INDEX IF NOT EXISTS public_webhook_deliveries_revision_idx
+    ON public_webhook_deliveries (revision)
+  `;
+
+  const ensurePublicWebhookHelperFunctionsSql = `
+    CREATE OR REPLACE FUNCTION public.log_public_webhook_change(
+      p_event_type TEXT,
+      p_scope_mode TEXT DEFAULT 'items',
+      p_product_id BIGINT DEFAULT NULL,
+      p_variant_id BIGINT DEFAULT NULL,
+      p_warehouse_id BIGINT DEFAULT NULL,
+      p_branch_id BIGINT DEFAULT NULL,
+      p_operation TEXT DEFAULT 'upsert',
+      p_changed_fields JSONB DEFAULT '[]'::jsonb,
+      p_old_stock NUMERIC DEFAULT NULL,
+      p_new_stock NUMERIC DEFAULT NULL
+    )
+    RETURNS VOID
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      INSERT INTO public_webhook_change_log (
+        batch_txid,
+        event_type,
+        scope_mode,
+        product_id,
+        variant_id,
+        warehouse_id,
+        branch_id,
+        operation,
+        changed_fields,
+        old_stock,
+        new_stock
+      )
+      VALUES (
+        txid_current(),
+        p_event_type,
+        COALESCE(NULLIF(p_scope_mode, ''), 'items'),
+        p_product_id,
+        p_variant_id,
+        p_warehouse_id,
+        p_branch_id,
+        COALESCE(NULLIF(p_operation, ''), 'upsert'),
+        COALESCE(p_changed_fields, '[]'::jsonb),
+        p_old_stock,
+        p_new_stock
+      );
+    END;
+    $$;
+
+    CREATE OR REPLACE FUNCTION public.is_public_product_active(p_product_id BIGINT)
+    RETURNS BOOLEAN
+    LANGUAGE SQL
+    STABLE
+    AS $$
+      SELECT COALESCE((
+        SELECT p.is_active
+        FROM products p
+        WHERE p.id = p_product_id
+        LIMIT 1
+      ), FALSE)
+    $$;
+
+    CREATE OR REPLACE FUNCTION public.public_webhook_branch_for_warehouse(p_warehouse_id BIGINT)
+    RETURNS BIGINT
+    LANGUAGE SQL
+    STABLE
+    AS $$
+      SELECT w.branch_id
+      FROM warehouses w
+      WHERE w.id = p_warehouse_id
+      LIMIT 1
+    $$;
+  `;
+
+  const ensurePublicWebhookCaptureFunctionsSql = `
+    CREATE OR REPLACE FUNCTION public.capture_public_products_changes()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      product_fields TEXT[] := ARRAY[]::TEXT[];
+      stock_fields TEXT[] := ARRAY[]::TEXT[];
+      was_public BOOLEAN := FALSE;
+      is_public BOOLEAN := FALSE;
+      target_id BIGINT := NULL;
+      product_operation TEXT := 'upsert';
+      stock_operation TEXT := 'upsert';
+    BEGIN
+      IF TG_OP = 'INSERT' THEN
+        IF COALESCE(NEW.is_active, FALSE) THEN
+          PERFORM public.log_public_webhook_change(
+            'public.products.changed',
+            'items',
+            NEW.id,
+            NULL,
+            NULL,
+            NULL,
+            'upsert',
+            to_jsonb(ARRAY['name', 'wholesale_price', 'retail_price', 'discount_amount', 'barcode', 'is_active'])
+          );
+          PERFORM public.log_public_webhook_change(
+            'public.stock.changed',
+            'items',
+            NEW.id,
+            NULL,
+            NULL,
+            NULL,
+            'upsert',
+            to_jsonb(ARRAY['name', 'barcode', 'manufacturer', 'wholesale_package', 'retail_package', 'wholesale_price', 'retail_price', 'description', 'is_active'])
+          );
+        END IF;
+        RETURN NEW;
+      END IF;
+
+      IF TG_OP = 'DELETE' THEN
+        IF COALESCE(OLD.is_active, FALSE) THEN
+          PERFORM public.log_public_webhook_change(
+            'public.products.changed',
+            'items',
+            OLD.id,
+            NULL,
+            NULL,
+            NULL,
+            'delete',
+            to_jsonb(ARRAY['is_active'])
+          );
+          PERFORM public.log_public_webhook_change(
+            'public.stock.changed',
+            'items',
+            OLD.id,
+            NULL,
+            NULL,
+            NULL,
+            'delete',
+            to_jsonb(ARRAY['is_active'])
+          );
+        END IF;
+        RETURN OLD;
+      END IF;
+
+      was_public := COALESCE(OLD.is_active, FALSE);
+      is_public := COALESCE(NEW.is_active, FALSE);
+      target_id := COALESCE(NEW.id, OLD.id);
+
+      IF NEW.name IS DISTINCT FROM OLD.name THEN
+        product_fields := array_append(product_fields, 'name');
+        stock_fields := array_append(stock_fields, 'name');
+      END IF;
+      IF NEW.wholesale_price IS DISTINCT FROM OLD.wholesale_price THEN
+        product_fields := array_append(product_fields, 'wholesale_price');
+        stock_fields := array_append(stock_fields, 'wholesale_price');
+      END IF;
+      IF NEW.retail_price IS DISTINCT FROM OLD.retail_price THEN
+        product_fields := array_append(product_fields, 'retail_price');
+        stock_fields := array_append(stock_fields, 'retail_price');
+      END IF;
+      IF NEW.discount_amount IS DISTINCT FROM OLD.discount_amount THEN
+        product_fields := array_append(product_fields, 'discount_amount');
+      END IF;
+      IF NEW.barcode IS DISTINCT FROM OLD.barcode THEN
+        product_fields := array_append(product_fields, 'barcode');
+        stock_fields := array_append(stock_fields, 'barcode');
+      END IF;
+      IF NEW.manufacturer IS DISTINCT FROM OLD.manufacturer THEN
+        stock_fields := array_append(stock_fields, 'manufacturer');
+      END IF;
+      IF NEW.wholesale_package IS DISTINCT FROM OLD.wholesale_package THEN
+        stock_fields := array_append(stock_fields, 'wholesale_package');
+      END IF;
+      IF NEW.retail_package IS DISTINCT FROM OLD.retail_package THEN
+        stock_fields := array_append(stock_fields, 'retail_package');
+      END IF;
+      IF NEW.description IS DISTINCT FROM OLD.description THEN
+        stock_fields := array_append(stock_fields, 'description');
+      END IF;
+      IF NEW.is_active IS DISTINCT FROM OLD.is_active THEN
+        product_fields := array_append(product_fields, 'is_active');
+        stock_fields := array_append(stock_fields, 'is_active');
+      END IF;
+
+      IF NOT was_public AND NOT is_public THEN
+        RETURN NEW;
+      END IF;
+
+      IF was_public AND NOT is_public THEN
+        product_operation := 'delete';
+        stock_operation := 'delete';
+      END IF;
+
+      IF array_length(product_fields, 1) IS NOT NULL THEN
+        PERFORM public.log_public_webhook_change(
+          'public.products.changed',
+          'items',
+          target_id,
+          NULL,
+          NULL,
+          NULL,
+          product_operation,
+          to_jsonb(product_fields)
+        );
+      END IF;
+
+      IF array_length(stock_fields, 1) IS NOT NULL THEN
+        PERFORM public.log_public_webhook_change(
+          'public.stock.changed',
+          'items',
+          target_id,
+          NULL,
+          NULL,
+          NULL,
+          stock_operation,
+          to_jsonb(stock_fields)
+        );
+      END IF;
+
+      RETURN NEW;
+    END;
+    $$;
+
+    CREATE OR REPLACE FUNCTION public.capture_public_product_variant_changes()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      field_names TEXT[] := ARRAY[]::TEXT[];
+      target_product_id BIGINT := NULL;
+      target_variant_id BIGINT := NULL;
+      is_public_product BOOLEAN := FALSE;
+    BEGIN
+      IF TG_OP = 'INSERT' THEN
+        IF public.is_public_product_active(NEW.product_id) THEN
+          PERFORM public.log_public_webhook_change(
+            'public.stock.changed',
+            'items',
+            NEW.product_id,
+            NEW.id,
+            NULL,
+            NULL,
+            'upsert',
+            to_jsonb(ARRAY['label', 'barcode', 'retail_price', 'wholesale_price'])
+          );
+        END IF;
+        RETURN NEW;
+      END IF;
+
+      IF TG_OP = 'DELETE' THEN
+        IF public.is_public_product_active(OLD.product_id) THEN
+          PERFORM public.log_public_webhook_change(
+            'public.stock.changed',
+            'items',
+            OLD.product_id,
+            OLD.id,
+            NULL,
+            NULL,
+            'delete',
+            to_jsonb(ARRAY['label', 'barcode', 'retail_price', 'wholesale_price'])
+          );
+        END IF;
+        RETURN OLD;
+      END IF;
+
+      IF NEW.product_id IS DISTINCT FROM OLD.product_id THEN
+        PERFORM public.log_public_webhook_change(
+          'public.stock.changed',
+          'full',
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          'upsert',
+          '[]'::jsonb
+        );
+        RETURN NEW;
+      END IF;
+
+      target_product_id := COALESCE(NEW.product_id, OLD.product_id);
+      target_variant_id := COALESCE(NEW.id, OLD.id);
+      is_public_product := public.is_public_product_active(target_product_id);
+
+      IF NOT is_public_product THEN
+        RETURN NEW;
+      END IF;
+
+      IF NEW.label IS DISTINCT FROM OLD.label THEN
+        field_names := array_append(field_names, 'label');
+      END IF;
+      IF NEW.barcode IS DISTINCT FROM OLD.barcode THEN
+        field_names := array_append(field_names, 'barcode');
+      END IF;
+      IF NEW.retail_price IS DISTINCT FROM OLD.retail_price THEN
+        field_names := array_append(field_names, 'retail_price');
+      END IF;
+      IF NEW.wholesale_price IS DISTINCT FROM OLD.wholesale_price THEN
+        field_names := array_append(field_names, 'wholesale_price');
+      END IF;
+
+      IF array_length(field_names, 1) IS NOT NULL THEN
+        PERFORM public.log_public_webhook_change(
+          'public.stock.changed',
+          'items',
+          target_product_id,
+          target_variant_id,
+          NULL,
+          NULL,
+          'upsert',
+          to_jsonb(field_names)
+        );
+      END IF;
+
+      RETURN NEW;
+    END;
+    $$;
+
+    CREATE OR REPLACE FUNCTION public.capture_public_stock_changes()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      target_product_id BIGINT := NULL;
+      target_variant_id BIGINT := NULL;
+      target_warehouse_id BIGINT := NULL;
+      target_branch_id BIGINT := NULL;
+      is_public_product BOOLEAN := FALSE;
+    BEGIN
+      IF TG_OP = 'INSERT' THEN
+        target_product_id := NEW.product_id;
+        target_variant_id := COALESCE(NEW.variant_id, 0);
+        target_warehouse_id := NEW.warehouse_id;
+        IF NOT public.is_public_product_active(target_product_id) THEN
+          RETURN NEW;
+        END IF;
+        target_branch_id := public.public_webhook_branch_for_warehouse(target_warehouse_id);
+        PERFORM public.log_public_webhook_change(
+          'public.stock.changed',
+          'items',
+          target_product_id,
+          target_variant_id,
+          target_warehouse_id,
+          target_branch_id,
+          'upsert',
+          to_jsonb(ARRAY['quantity']),
+          0,
+          COALESCE(NEW.quantity, 0)
+        );
+        RETURN NEW;
+      END IF;
+
+      IF TG_OP = 'DELETE' THEN
+        target_product_id := OLD.product_id;
+        target_variant_id := COALESCE(OLD.variant_id, 0);
+        target_warehouse_id := OLD.warehouse_id;
+        IF NOT public.is_public_product_active(target_product_id) THEN
+          RETURN OLD;
+        END IF;
+        target_branch_id := public.public_webhook_branch_for_warehouse(target_warehouse_id);
+        PERFORM public.log_public_webhook_change(
+          'public.stock.changed',
+          'items',
+          target_product_id,
+          target_variant_id,
+          target_warehouse_id,
+          target_branch_id,
+          'delete',
+          to_jsonb(ARRAY['quantity']),
+          COALESCE(OLD.quantity, 0),
+          0
+        );
+        RETURN OLD;
+      END IF;
+
+      target_product_id := NEW.product_id;
+      target_variant_id := COALESCE(NEW.variant_id, 0);
+      target_warehouse_id := NEW.warehouse_id;
+      is_public_product := public.is_public_product_active(target_product_id);
+      IF NOT is_public_product OR NEW.quantity IS NOT DISTINCT FROM OLD.quantity THEN
+        RETURN NEW;
+      END IF;
+
+      target_branch_id := public.public_webhook_branch_for_warehouse(target_warehouse_id);
+      PERFORM public.log_public_webhook_change(
+        'public.stock.changed',
+        'items',
+        target_product_id,
+        target_variant_id,
+        target_warehouse_id,
+        target_branch_id,
+        'upsert',
+        to_jsonb(ARRAY['quantity']),
+        COALESCE(OLD.quantity, 0),
+        COALESCE(NEW.quantity, 0)
+      );
+      RETURN NEW;
+    END;
+    $$;
+
+    CREATE OR REPLACE FUNCTION public.capture_public_warehouse_changes()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+      target_branch_id BIGINT := NULL;
+    BEGIN
+      IF TG_OP = 'INSERT' THEN
+        target_branch_id := NEW.branch_id;
+        PERFORM public.log_public_webhook_change(
+          'public.stock.changed',
+          'full',
+          NULL,
+          NULL,
+          NULL,
+          target_branch_id,
+          'upsert',
+          '[]'::jsonb
+        );
+        RETURN NEW;
+      END IF;
+
+      IF TG_OP = 'DELETE' THEN
+        target_branch_id := OLD.branch_id;
+        PERFORM public.log_public_webhook_change(
+          'public.stock.changed',
+          'full',
+          NULL,
+          NULL,
+          NULL,
+          target_branch_id,
+          'upsert',
+          '[]'::jsonb
+        );
+        RETURN OLD;
+      END IF;
+
+      IF NEW.name IS NOT DISTINCT FROM OLD.name
+         AND NEW.branch_id IS NOT DISTINCT FROM OLD.branch_id THEN
+        RETURN NEW;
+      END IF;
+
+      target_branch_id := COALESCE(NEW.branch_id, OLD.branch_id);
+      PERFORM public.log_public_webhook_change(
+        'public.stock.changed',
+        'full',
+        NULL,
+        NULL,
+        NULL,
+        target_branch_id,
+        'upsert',
+        '[]'::jsonb
+      );
+      RETURN NEW;
+    END;
+    $$;
+  `;
+
+  const dropPublicWebhookCaptureTriggersSql = `
+    DO $$
+    BEGIN
+      IF to_regclass('public.products') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS trg_capture_public_products_changes ON public.products;
+      END IF;
+      IF to_regclass('public.product_variants') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS trg_capture_public_product_variant_changes ON public.product_variants;
+      END IF;
+      IF to_regclass('public.stock') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS trg_capture_public_stock_changes ON public.stock;
+      END IF;
+      IF to_regclass('public.warehouses') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS trg_capture_public_warehouse_changes ON public.warehouses;
+      END IF;
+    END;
+    $$;
+  `;
+
+  const ensurePublicWebhookCaptureTriggersSql = `
+    DO $$
+    BEGIN
+      IF to_regclass('public.products') IS NOT NULL THEN
+        CREATE TRIGGER trg_capture_public_products_changes
+        AFTER INSERT OR UPDATE OR DELETE ON public.products
+        FOR EACH ROW EXECUTE FUNCTION public.capture_public_products_changes();
+      END IF;
+
+      IF to_regclass('public.product_variants') IS NOT NULL THEN
+        CREATE TRIGGER trg_capture_public_product_variant_changes
+        AFTER INSERT OR UPDATE OR DELETE ON public.product_variants
+        FOR EACH ROW EXECUTE FUNCTION public.capture_public_product_variant_changes();
+      END IF;
+
+      IF to_regclass('public.stock') IS NOT NULL THEN
+        CREATE TRIGGER trg_capture_public_stock_changes
+        AFTER INSERT OR UPDATE OF quantity OR DELETE ON public.stock
+        FOR EACH ROW EXECUTE FUNCTION public.capture_public_stock_changes();
+      END IF;
+
+      IF to_regclass('public.warehouses') IS NOT NULL THEN
+        CREATE TRIGGER trg_capture_public_warehouse_changes
+        AFTER INSERT OR UPDATE OR DELETE ON public.warehouses
+        FOR EACH ROW EXECUTE FUNCTION public.capture_public_warehouse_changes();
+      END IF;
+    END;
+    $$;
+  `;
+
   for (const [poolRef, label] of [
     [localPool, "Local"],
     [cloudPool, "Cloud"],
@@ -1818,6 +3226,44 @@ async function ensureSyncSchema() {
     } catch (err) {
       console.error(`❌ ${label}: track_deletion ensure failed:`, err.message);
     }
+
+    try {
+      await poolRef.query(ensurePublicWebhookRevisionSeqSql);
+      await poolRef.query(ensurePublicWebhookChangeLogSql);
+      await poolRef.query(ensurePublicWebhookChangeLogBatchIndexSql);
+      await poolRef.query(ensurePublicWebhookChangeLogEventIndexSql);
+      await poolRef.query(ensurePublicWebhookChangeLogItemIndexSql);
+      await poolRef.query(ensurePublicWebhookChangeLogCreatedAtIndexSql);
+      await poolRef.query(ensurePublicWebhookDeliveriesSql);
+      await poolRef.query(ensurePublicWebhookDeliveriesEventIdUniqueSql);
+      await poolRef.query(ensurePublicWebhookDeliveriesBatchEventUniqueSql);
+      await poolRef.query(ensurePublicWebhookDeliveriesPendingIndexSql);
+      await poolRef.query(ensurePublicWebhookDeliveriesRevisionIndexSql);
+      console.log(`✅ ${label}: public webhook schema ready`);
+    } catch (err) {
+      console.error(
+        `❌ ${label}: public webhook schema ensure failed:`,
+        err.message,
+      );
+    }
+
+    try {
+      await poolRef.query(ensurePublicWebhookHelperFunctionsSql);
+      await poolRef.query(ensurePublicWebhookCaptureFunctionsSql);
+      await poolRef.query(dropPublicWebhookCaptureTriggersSql);
+
+      if (isPublicWebhookCaptureEnabled()) {
+        await poolRef.query(ensurePublicWebhookCaptureTriggersSql);
+        console.log(`✅ ${label}: public webhook capture triggers ready`);
+      } else {
+        console.log(`ℹ️  ${label}: public webhook capture disabled`);
+      }
+    } catch (err) {
+      console.error(
+        `❌ ${label}: public webhook capture ensure failed:`,
+        err.message,
+      );
+    }
   }
 
   tableMetaCache.clear();
@@ -1844,6 +3290,7 @@ function startPeriodicSync() {
 }
 ensureSyncSchema().finally(() => {
   startPeriodicSync();
+  startPublicWebhookDelivery();
 });
 
 /* ── Exports ── */
@@ -1941,3 +3388,9 @@ module.exports.checkPool = checkPool;
 module.exports.getActivePool = getActivePool;
 module.exports.getSyncLogs = getSyncLogs;
 module.exports.enqueueInvoiceAggregateSync = enqueueInvoiceAggregateSync;
+module.exports.enqueuePublicWebhookDelivery = enqueuePublicWebhookDelivery;
+module.exports.queuePublicWebhookTestEvent = queuePublicWebhookTestEvent;
+module.exports.replayPublicWebhookDelivery = replayPublicWebhookDelivery;
+module.exports.arePublicWebhookTestRoutesEnabled =
+  arePublicWebhookTestRoutesEnabled;
+module.exports.publicWebhookConfig = PUBLIC_WEBHOOK_CONFIG;
