@@ -103,7 +103,10 @@ const state = {
   syncLogs: [], // recent sync attempts
   publicWebhook: {
     captureEnabled: PUBLIC_WEBHOOK_CONFIG.captureEnabled,
-    deliveryEnabled: PUBLIC_WEBHOOK_CONFIG.deliveryEnabled,
+    deliveryEnabled: Boolean(
+      PUBLIC_WEBHOOK_CONFIG.deliveryEnabled ||
+        (PUBLIC_WEBHOOK_CONFIG.url && PUBLIC_WEBHOOK_CONFIG.secret)
+    ),
     lastClaimedAt: null,
     lastDeliveryAt: null,
     lastDeliveryError: null,
@@ -129,7 +132,10 @@ function isPublicWebhookCaptureEnabled() {
 }
 
 function isPublicWebhookDeliveryEnabled() {
-  return PUBLIC_WEBHOOK_CONFIG.deliveryEnabled;
+  return Boolean(
+    PUBLIC_WEBHOOK_CONFIG.deliveryEnabled ||
+      (PUBLIC_WEBHOOK_CONFIG.url && PUBLIC_WEBHOOK_CONFIG.secret),
+  );
 }
 
 function isPublicWebhookDeliveryConfigured() {
@@ -137,7 +143,10 @@ function isPublicWebhookDeliveryConfigured() {
 }
 
 function arePublicWebhookTestRoutesEnabled() {
-  return PUBLIC_WEBHOOK_CONFIG.testRoutesEnabled;
+  return Boolean(
+    PUBLIC_WEBHOOK_CONFIG.testRoutesEnabled ||
+      (PUBLIC_WEBHOOK_CONFIG.url && PUBLIC_WEBHOOK_CONFIG.secret),
+  );
 }
 
 function getPublicWebhookRetryDelayMs(attemptNumber) {
