@@ -1022,6 +1022,10 @@ exports.getCustomerDebtDetails = async (req, res) => {
     const invoiceWhere = `WHERE ${invoiceConditions.join(" AND ")}`;
     const paymentWhere = `WHERE ${paymentConditions.join(" AND ")}`;
 
+    const isBranch1 = Number(warehouse_id) === 1;
+    const prevBalanceCol = isBranch1 ? "i.previous_balance" : "0 AS previous_balance";
+    const additionalAmountCol = isBranch1 ? "i.additional_amount" : "0 AS additional_amount";
+
     const result = await pool.query(
       `
       -- 🧾 الفواتير
@@ -1033,7 +1037,9 @@ exports.getCustomerDebtDetails = async (req, res) => {
         COALESCE(i.discount_total, 0) AS discount_total,
         i.total,
         i.paid_amount,
-        i.remaining_amount
+        i.remaining_amount,
+        ${prevBalanceCol},
+        ${additionalAmountCol}
       FROM invoices i
       ${invoiceWhere}
 
@@ -1048,7 +1054,9 @@ exports.getCustomerDebtDetails = async (req, res) => {
         0 AS discount_total,
         0 AS total,
         cp.amount AS paid_amount,
-        0 AS remaining_amount
+        0 AS remaining_amount,
+        0 AS previous_balance,
+        0 AS additional_amount
       FROM cash_in cp
       ${paymentWhere}
 
