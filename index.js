@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
 const { exec } = require("child_process");
@@ -3408,7 +3408,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
   console.log("📝 INVOICE CREATE - notes value:", req.body.notes);
 
   const userBranchId = req.user.branch_id;
-  req.body.branch_id = userBranchId;
+  req.body.branch_id = 2; // Wholesale invoices always belong to the Wholesale branch (branch 2)
   const client = await pool.connect();
 
   try {
@@ -3746,7 +3746,7 @@ VALUES
     const MAIN_WAREHOUSE_ID = 2;
     const SHOWROOM_BRANCH_ID = 1;
 
-    if (invoice_type === "wholesale" && branch_id === SHOWROOM_BRANCH_ID) {
+    if (invoice_type === "wholesale" && userBranchId === SHOWROOM_BRANCH_ID) {
       const title = "فاتورة جملة جديدة";
 
       const message = `تم إنشاء فاتورة جملة رقم #${invoiceId} للعميل ${customer_name || "عميل نقدي"}`;
