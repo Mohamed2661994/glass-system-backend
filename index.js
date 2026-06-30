@@ -7743,6 +7743,7 @@ app.get("/products/for-replace", async (req, res) => {
       SELECT
         p.id,
         p.name,
+        p.barcode,
         p.wholesale_package,
         p.retail_package,
         p.manufacturer,
@@ -7753,7 +7754,7 @@ app.get("/products/for-replace", async (req, res) => {
         ON s.product_id = p.id
         AND s.warehouse_id = $1
       WHERE p.is_active = true
-      GROUP BY p.id, p.name, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price
+      GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price
       ORDER BY p.name
       `,
       [warehouse_id],
