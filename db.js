@@ -1888,13 +1888,21 @@ async function syncRowFromSourceToTarget(
 }
 
 async function syncRecentRowsForTable(table, sinceIso, sourcePool, targetPool) {
+  if (table === "invoice_items") {
+    return 0; // Handled exclusively by syncInvoiceAggregate
+  }
+
   const meta = await getTableMeta(table);
   if (!meta || !meta.hasUpdatedAt) return 0;
 
-  const changed = await sourcePool.query(
-    `SELECT * FROM "${table}" WHERE "updated_at" > $1 ORDER BY "updated_at" ASC`,
-    [sinceIso],
-  );
+  let queryStr = `SELECT * FROM "${table}" WHERE "updated_at" > $1 ORDER BY "updated_at" ASC`;
+  if (table === "stock_movements") {
+    queryStr = `SELECT * FROM "stock_movements" WHERE "updated_at" > $1 AND "invoice_id" IS NULL ORDER BY "updated_at" ASC`;
+  } else if (table === "cash_in") {
+    queryStr = `SELECT * FROM "cash_in" WHERE "updated_at" > $1 AND "invoice_id" IS NULL ORDER BY "updated_at" ASC`;
+  }
+
+  const changed = await sourcePool.query(queryStr, [sinceIso]);
 
   let synced = 0;
   for (const sourceRow of changed.rows) {
@@ -1919,6 +1927,9 @@ async function syncOperationDetail(detail, sourcePool, targetPool) {
   if (detail.operation === "delete") {
     return { handled: true, synced: 0 };
   }
+  if (detail.table === "invoice_items") {
+    return { handled: true, synced: 0 }; // Handled exclusively by syncInvoiceAggregate
+  }
 
   const meta = await getTableMeta(detail.table);
   if (!meta) {
@@ -1933,7 +1944,15 @@ async function syncOperationDetail(detail, sourcePool, targetPool) {
     `SELECT * FROM "${detail.table}" WHERE "${meta.pk[0]}" = $1 LIMIT 1`,
     [detail.id],
   );
-  if (!sourceRes.rows[0]) {
+  const row = sourceRes.rows[0];
+  if (!row) {
+    return { handled: true, synced: 0 };
+  }
+
+  if (detail.table === "stock_movements" && row.invoice_id != null) {
+    return { handled: true, synced: 0 };
+  }
+  if (detail.table === "cash_in" && row.invoice_id != null) {
     return { handled: true, synced: 0 };
   }
 
@@ -1941,7 +1960,7 @@ async function syncOperationDetail(detail, sourcePool, targetPool) {
     sourcePool,
     targetPool,
     meta,
-    sourceRes.rows[0],
+    row,
   );
 
   return { handled: true, synced: changed > 0 ? 1 : 0 };
@@ -2169,6 +2188,10 @@ async function syncBetweenPools(options = {}) {
 }
 
 async function syncTable(table, pk) {
+  if (table === "invoice_items") {
+    return 0; // Handled exclusively by syncInvoiceAggregate
+  }
+
   let synced = 0;
 
   const meta = await getTableMeta(table);
@@ -2177,9 +2200,16 @@ async function syncTable(table, pk) {
   const { pk: effectivePk, columns, hasUpdatedAt } = meta;
   pk = effectivePk;
 
+  let queryStr = `SELECT * FROM "${table}"`;
+  if (table === "stock_movements") {
+    queryStr = `SELECT * FROM "stock_movements" WHERE "invoice_id" IS NULL`;
+  } else if (table === "cash_in") {
+    queryStr = `SELECT * FROM "cash_in" WHERE "invoice_id" IS NULL`;
+  }
+
   // Fetch all rows from both sides
-  const localRows = await localPool.query(`SELECT * FROM "${table}"`);
-  const cloudRows = await cloudPool.query(`SELECT * FROM "${table}"`);
+  const localRows = await localPool.query(queryStr);
+  const cloudRows = await cloudPool.query(queryStr);
 
   // Build lookup maps keyed by PK
   const pkKey = (row) => pk.map((k) => String(row[k])).join("|");
