@@ -10,7 +10,7 @@ require("dotenv").config();
    ══════════════════════════════════════════════════════════ */
 
 /* ── Pool configuration ── */
-const POOL_OPTS = { connectionTimeoutMillis: 5000, max: 10 };
+const POOL_OPTS = { connectionTimeoutMillis: 5000, query_timeout: 10000, max: 10 };
 
 function parseBooleanEnv(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
@@ -2097,6 +2097,14 @@ async function syncBetweenPools(options = {}) {
       }
 
       state.lastRealtimeSyncAt = nowIso;
+
+      // ── Sync sequences: ensure both DBs have sequences >= max(id) ──
+      try {
+        await syncSequences();
+      } catch (err) {
+        console.error("⚠️  Sequence sync error during realtime sync:", err.message);
+        errorDetails.push(`sequences: ${err.message}`);
+      }
     } else {
       // ── Step 1: Process deletions FIRST (before row sync re-inserts them) ──
       try {
