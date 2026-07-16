@@ -492,7 +492,7 @@ exports.getInventoryDetails = async (req, res) => {
     }
 
     if (manufacturer) {
-      conditions.push(`p.manufacturer = $${idx++}`);
+      conditions.push(`LOWER(TRIM(p.manufacturer)) = $${idx++}`);
       values.push(manufacturer);
     }
 
