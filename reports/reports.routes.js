@@ -19,6 +19,7 @@ router.get("/supplier-balances", reports.getSupplierBalances);
 router.get("/supplier-debt-details", reports.getSupplierDebtDetails);
 router.get("/product-sales-profit", reports.getProductSalesProfit);
 router.get("/invoice-sales-profit", reports.getInvoiceSalesProfit);
+router.get("/manufacturer-analytics", reports.getManufacturerAnalytics);
 
 module.exports = router;
 

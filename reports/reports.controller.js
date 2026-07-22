@@ -1397,3 +1397,422 @@ exports.getInvoiceSalesProfit = async (req, res) => {
     res.status(500).json({ error: "Server error", details: err.message });
   }
 };
+
+/* ===============================
+   🏭 تقرير تحليلات وتفاصيل المصانع الشاملة
+   عرض الإحصائيات الكاملة، الأرباح، العدادات، المخزون، والشارات
+================================ */
+exports.getManufacturerAnalytics = async (req, res) => {
+  try {
+    await ensureInvoiceItemsCostPriceColumn();
+
+    const {
+      manufacturer,
+      branch_id,
+      invoice_type,
+      date_from,
+      date_to,
+      search,
+      page = 1,
+      limit = 50,
+    } = req.query;
+
+    const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
+
+    // 1. Fetch products (either belonging to a specific manufacturer, or ALL if omitted/'all')
+    let productsQuery = `
+      SELECT
+        p.id,
+        p.name,
+        p.id AS sku,
+        p.manufacturer,
+        p.purchase_price,
+        p.retail_purchase_price,
+        p.retail_price,
+        p.wholesale_price,
+        p.wholesale_package,
+        p.retail_package,
+        p.created_at
+      FROM products p
+      WHERE p.is_active IS NOT FALSE
+    `;
+    let queryParams = [];
+
+    if (normalizedManufacturer && normalizedManufacturer !== "all") {
+      productsQuery += ` AND LOWER(TRIM(p.manufacturer)) = LOWER(TRIM($1))`;
+      queryParams.push(normalizedManufacturer);
+    }
+
+    productsQuery += ` ORDER BY p.name ASC`;
+
+    const productsRes = await pool.query(productsQuery, queryParams);
+
+    if (productsRes.rows.length === 0) {
+      return res.json({
+        summary: {
+          manufacturer: manufacturer,
+          total_products_count: 0,
+          total_acquired_qty: 0,
+          total_acquired_cost: 0,
+          total_sold_qty: 0,
+          total_sales_amount: 0,
+          total_cost_of_goods_sold: 0,
+          total_net_profit: 0,
+          profit_margin_percent: 0,
+          current_stock_qty: 0,
+          current_stock_valuation_cost: 0,
+          sell_through_percent: 0,
+          remaining_stock_percent: 0,
+          is_date_filtered: Boolean(date_from || date_to),
+        },
+        champions: {},
+        products: [],
+        pagination: { page: 1, limit: Number(limit), total_pages: 0, total_items: 0 }
+      });
+    }
+
+    const productIds = productsRes.rows.map(p => p.id);
+
+    // 2. Fetch current stock per product (grouped by warehouse if branch_id filter is passed)
+    let stockWhere = "WHERE s.product_id = ANY($1::int[])";
+    const stockValues = [productIds];
+    if (branch_id) {
+      stockWhere += ` AND s.warehouse_id = $2`;
+      stockValues.push(Number(branch_id));
+    }
+
+    const stockRes = await pool.query(
+      `
+      SELECT
+        s.product_id,
+        COALESCE(SUM(s.quantity), 0) AS current_stock
+      FROM stock s
+      ${stockWhere}
+      GROUP BY s.product_id
+      `,
+      stockValues
+    );
+
+    const stockMap = {};
+    for (const row of stockRes.rows) {
+      stockMap[row.product_id] = Number(row.current_stock || 0);
+    }
+
+    // 3. Fetch sales & profit per product from invoice_items + invoices
+    const invoiceConditions = [
+      "ii.product_id = ANY($1::int[])",
+      "i.movement_type = 'sale'",
+      "i.is_void IS NOT TRUE"
+    ];
+    const invoiceValues = [productIds];
+    let idx = 2;
+
+    if (branch_id) {
+      invoiceConditions.push(`i.branch_id = $${idx++}`);
+      invoiceValues.push(Number(branch_id));
+    }
+    if (invoice_type) {
+      invoiceConditions.push(`i.invoice_type = $${idx++}`);
+      invoiceValues.push(invoice_type);
+    }
+    if (date_from) {
+      invoiceConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) >= $${idx++}::date`);
+      invoiceValues.push(date_from);
+    }
+    if (date_to) {
+      invoiceConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) <= $${idx++}::date`);
+      invoiceValues.push(date_to);
+    }
+
+    const salesRes = await pool.query(
+      `
+      SELECT
+        ii.product_id,
+        COUNT(DISTINCT i.id) AS invoices_count,
+        MIN(COALESCE(i.invoice_date::date, i.created_at::date)) AS first_sale_date,
+        MAX(COALESCE(i.invoice_date::date, i.created_at::date)) AS last_sale_date,
+        SUM(
+          CASE WHEN COALESCE(ii.is_return, false) THEN -COALESCE(ii.quantity, 0)
+          ELSE COALESCE(ii.quantity, 0) END
+        ) AS signed_sold_quantity,
+        SUM(
+          CASE WHEN COALESCE(ii.is_return, false)
+            THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+          ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+        ) AS signed_sales_total,
+        SUM(
+          CASE WHEN COALESCE(ii.is_return, false)
+            THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+          ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+        ) AS signed_gross_sales,
+        SUM(
+          CASE WHEN COALESCE(ii.is_return, false)
+            THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.discount, 0))
+          ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.discount, 0)) END
+        ) AS signed_item_discounts,
+        SUM(
+          CASE WHEN COALESCE(ii.is_return, false) THEN 0
+          ELSE COALESCE(ii.quantity, 0) * COALESCE(ii.cost_price, CASE WHEN i.invoice_type = 'retail' THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0) ELSE COALESCE(p.purchase_price, 0) END) END
+        ) AS total_cost
+      FROM invoice_items ii
+      JOIN invoices i ON i.id = ii.invoice_id
+      JOIN products p ON p.id = ii.product_id
+      WHERE ${invoiceConditions.join(" AND ")}
+      GROUP BY ii.product_id
+      `,
+      invoiceValues
+    );
+
+    const salesMap = {};
+    for (const row of salesRes.rows) {
+      salesMap[row.product_id] = {
+        invoices_count: Number(row.invoices_count || 0),
+        first_sale_date: row.first_sale_date,
+        last_sale_date: row.last_sale_date,
+        sold_quantity: Number(row.signed_sold_quantity || 0),
+        sales_total: Number(row.signed_sales_total || 0),
+        gross_sales: Number(row.signed_gross_sales || 0),
+        item_discounts: Number(row.signed_item_discounts || 0),
+        total_cost: Number(row.total_cost || 0),
+      };
+    }
+
+    // 4. Fetch total purchases/inbound per product
+    const purchaseRes = await pool.query(
+      `
+      SELECT
+        ii.product_id,
+        SUM(COALESCE(ii.quantity, 0)) AS purchased_qty
+      FROM invoice_items ii
+      JOIN invoices i ON i.id = ii.invoice_id
+      WHERE ii.product_id = ANY($1::int[])
+        AND i.movement_type = 'purchase'
+        AND i.is_void IS NOT TRUE
+        AND COALESCE(ii.is_return, false) IS NOT TRUE
+      GROUP BY ii.product_id
+      `,
+      [productIds]
+    );
+
+    const purchaseMap = {};
+    for (const row of purchaseRes.rows) {
+      purchaseMap[row.product_id] = Number(row.purchased_qty || 0);
+    }
+
+    // 4.5 Fetch product variants purchase prices for fallback
+    const variantsRes = await pool.query(
+      `SELECT product_id, purchase_price, retail_purchase_price FROM product_variants WHERE product_id = ANY($1::int[])`,
+      [productIds]
+    );
+    const variantCostMap = {};
+    for (const v of variantsRes.rows) {
+      const vRetailCost = Number(v.retail_purchase_price || 0);
+      const vWholesaleCost = Number(v.purchase_price || 0);
+      const chosenCost = branch_id == 2
+        ? (vWholesaleCost > 0 ? vWholesaleCost : vRetailCost)
+        : (vRetailCost > 0 ? vRetailCost : vWholesaleCost);
+
+      if (!variantCostMap[v.product_id] || variantCostMap[v.product_id] === 0) {
+        variantCostMap[v.product_id] = chosenCost;
+      }
+    }
+
+    // 5. System Champion (Top sold product across all system)
+    const sysChampRes = await pool.query(
+      `
+      SELECT ii.product_id, SUM(CASE WHEN COALESCE(ii.is_return, false) THEN -ii.quantity ELSE ii.quantity END) AS total_sold
+      FROM invoice_items ii
+      JOIN invoices i ON i.id = ii.invoice_id
+      WHERE i.movement_type = 'sale' AND i.is_void IS NOT TRUE
+      GROUP BY ii.product_id
+      ORDER BY total_sold DESC
+      LIMIT 1
+      `
+    );
+    const systemChampionId = sysChampRes.rows.length > 0 ? Number(sysChampRes.rows[0].product_id) : null;
+
+    // 6. Aggregate & Build rows per product
+    let totalAcquiredQty = 0;
+    let totalAcquiredCost = 0;
+    let totalSoldQty = 0;
+    let totalGrossSales = 0;
+    let totalItemDiscounts = 0;
+    let totalSalesAmount = 0;
+    let totalCostOfGoodsSold = 0;
+    let totalNetProfit = 0;
+    let currentStockQty = 0;
+    let currentStockValuationCost = 0;
+
+    let factoryTopQtyId = null;
+    let maxQty = -Infinity;
+    let factoryTopSalesId = null;
+    let maxSales = -Infinity;
+    let factoryTopProfitId = null;
+    let maxProfit = -Infinity;
+
+    let allProductRows = productsRes.rows.map((p) => {
+      const stockQty = stockMap[p.id] || 0;
+      const sales = salesMap[p.id] || {
+        invoices_count: 0,
+        first_sale_date: null,
+        last_sale_date: null,
+        sold_quantity: 0,
+        sales_total: 0,
+        gross_sales: 0,
+        item_discounts: 0,
+        total_cost: 0,
+      };
+      const purchasedQty = purchaseMap[p.id] || 0;
+
+      // Base unit cost price for current stock valuation
+      const pRetailCost = Number(p.retail_purchase_price || 0);
+      const pWholesaleCost = Number(p.purchase_price || 0);
+      const variantCost = Number(variantCostMap[p.id] || 0);
+
+      let currentUnitCost = 0;
+      if (branch_id == 2) {
+        currentUnitCost = pWholesaleCost > 0 ? pWholesaleCost : (pRetailCost > 0 ? pRetailCost : variantCost);
+      } else {
+        currentUnitCost = pRetailCost > 0 ? pRetailCost : (pWholesaleCost > 0 ? pWholesaleCost : variantCost);
+      }
+
+      // Base unit selling price on system
+      const pRetailSell = Number(p.retail_price || 0);
+      const pWholesaleSell = Number(p.wholesale_price || 0);
+      let currentSellingPrice = 0;
+      if (branch_id == 2 || invoice_type === 'wholesale') {
+        currentSellingPrice = pWholesaleSell > 0 ? pWholesaleSell : pRetailSell;
+      } else {
+        currentSellingPrice = pRetailSell > 0 ? pRetailSell : pWholesaleSell;
+      }
+
+      // Acquired quantity = MAX(stock + sold, purchased)
+      const acquiredQty = Math.max(stockQty + Math.max(0, sales.sold_quantity), purchasedQty);
+      const acquiredCost = acquiredQty * currentUnitCost;
+
+      const netProfit = sales.sales_total - sales.total_cost;
+      const profitMarginPercent = sales.sales_total > 0 ? (netProfit / sales.sales_total) * 100 : 0;
+      const stockValuationCost = Math.max(0, stockQty) * currentUnitCost;
+      const sellThroughPercent = acquiredQty > 0 ? (sales.sold_quantity / acquiredQty) * 100 : 0;
+
+      // Global totals accumulators
+      totalAcquiredQty += acquiredQty;
+      totalAcquiredCost += acquiredCost;
+      totalSoldQty += sales.sold_quantity;
+      totalGrossSales += sales.gross_sales;
+      totalItemDiscounts += sales.item_discounts;
+      totalSalesAmount += sales.sales_total;
+      totalCostOfGoodsSold += sales.total_cost;
+      totalNetProfit += netProfit;
+      currentStockQty += stockQty;
+      currentStockValuationCost += stockValuationCost;
+
+      // Track Factory Champions
+      if (sales.sold_quantity > maxQty && sales.sold_quantity > 0) {
+        maxQty = sales.sold_quantity;
+        factoryTopQtyId = p.id;
+      }
+      if (sales.sales_total > maxSales && sales.sales_total > 0) {
+        maxSales = sales.sales_total;
+        factoryTopSalesId = p.id;
+      }
+      if (netProfit > maxProfit && netProfit > 0) {
+        maxProfit = netProfit;
+        factoryTopProfitId = p.id;
+      }
+
+      const packageLabel = [p.wholesale_package, p.retail_package].filter(Boolean).join(" / ") || "1 قطعة";
+
+      const avgSellingPrice = sales.sold_quantity > 0 ? sales.sales_total / sales.sold_quantity : 0;
+
+      return {
+        product_id: p.id,
+        product_name: p.name,
+        sku: p.id ? `PROD-${p.id}` : `-`,
+        manufacturer_name: p.manufacturer,
+        package_name: packageLabel,
+        product_created_at: p.created_at,
+        first_sale_date: sales.first_sale_date,
+        last_sale_date: sales.last_sale_date,
+        invoices_count: sales.invoices_count,
+        total_acquired_qty: acquiredQty,
+        sold_quantity: sales.sold_quantity,
+        current_stock_qty: stockQty,
+        purchase_price: currentUnitCost,
+        selling_price: currentSellingPrice,
+        avg_selling_price: Math.round(avgSellingPrice * 100) / 100,
+        sales_total: Math.round(sales.sales_total * 100) / 100,
+        gross_sales: Math.round(sales.gross_sales * 100) / 100,
+        item_discounts: Math.round(sales.item_discounts * 100) / 100,
+        total_cost: Math.round(sales.total_cost * 100) / 100,
+        net_profit: Math.round(netProfit * 100) / 100,
+        profit_margin_percent: Math.round(profitMarginPercent * 100) / 100,
+        current_stock_value: Math.round(stockValuationCost * 100) / 100,
+        sell_through_percent: Math.round(sellThroughPercent * 100) / 100,
+        is_low_stock: stockQty <= 5,
+      };
+    });
+
+    // Apply search filter if search term provided
+    if (search && String(search).trim()) {
+      const q = String(search).trim().toLowerCase();
+      allProductRows = allProductRows.filter(
+        (row) =>
+          row.product_name.toLowerCase().includes(q) ||
+          String(row.sku).toLowerCase().includes(q)
+      );
+    }
+
+    // Global summary totals
+    const overallProfitMargin = totalSalesAmount > 0 ? (totalNetProfit / totalSalesAmount) * 100 : 0;
+    const overallSellThrough = totalAcquiredQty > 0 ? (totalSoldQty / totalAcquiredQty) * 100 : 0;
+    const overallRemainingPercent = totalAcquiredQty > 0 ? (currentStockQty / totalAcquiredQty) * 100 : 0;
+    const overallAvgSoldUnitPrice = totalSoldQty > 0 ? totalSalesAmount / totalSoldQty : 0;
+
+    // Apply pagination to products list
+    const currentPage = Math.max(1, Number(page) || 1);
+    const pageSize = Math.max(1, Math.min(Number(limit) || 50, 100));
+    const totalItems = allProductRows.length;
+    const totalPages = Math.ceil(totalItems / pageSize);
+    const paginatedProducts = allProductRows.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+    res.json({
+      summary: {
+        manufacturer: manufacturer,
+        total_products_count: productsRes.rows.length,
+        total_acquired_qty: totalAcquiredQty,
+        total_acquired_cost: Math.round(totalAcquiredCost * 100) / 100,
+        total_sold_qty: totalSoldQty,
+        total_gross_sales: Math.round(totalGrossSales * 100) / 100,
+        total_item_discounts: Math.round(totalItemDiscounts * 100) / 100,
+        total_sales_amount: Math.round(totalSalesAmount * 100) / 100,
+        avg_sold_unit_price: Math.round(overallAvgSoldUnitPrice * 100) / 100,
+        total_cost_of_goods_sold: Math.round(totalCostOfGoodsSold * 100) / 100,
+        total_net_profit: Math.round(totalNetProfit * 100) / 100,
+        profit_margin_percent: Math.round(overallProfitMargin * 100) / 100,
+        current_stock_qty: currentStockQty,
+        current_stock_valuation_cost: Math.round(currentStockValuationCost * 100) / 100,
+        sell_through_percent: Math.round(overallSellThrough * 100) / 100,
+        remaining_stock_percent: Math.round(overallRemainingPercent * 100) / 100,
+        is_date_filtered: Boolean(date_from || date_to),
+      },
+      champions: {
+        system_champion_product_id: systemChampionId,
+        factory_top_qty_product_id: factoryTopQtyId,
+        factory_top_sales_product_id: factoryTopSalesId,
+        factory_top_profit_product_id: factoryTopProfitId,
+      },
+      products: paginatedProducts,
+      pagination: {
+        page: currentPage,
+        limit: pageSize,
+        total_pages: totalPages,
+        total_items: totalItems,
+      },
+    });
+  } catch (err) {
+    console.error("MANUFACTURER ANALYTICS ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
+
