@@ -1473,11 +1473,19 @@ exports.getManufacturerAnalytics = async (req, res) => {
 
     const productIds = productsRes.rows.map(p => p.id);
 
-    // 2. Fetch current stock per product (grouped by warehouse if branch_id filter is passed)
-    let stockWhere = "WHERE s.product_id = ANY($1::int[])";
-    const stockValues = [productIds];
+    let stockWhere = "WHERE 1=1";
+    const stockValues = [];
+    let stockIdx = 1;
+
+    if (normalizedManufacturer && normalizedManufacturer !== "all") {
+      stockWhere += ` AND s.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${stockIdx++})))`;
+      stockValues.push(normalizedManufacturer);
+    } else {
+      stockWhere += ` AND s.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`;
+    }
+
     if (branch_id) {
-      stockWhere += ` AND s.warehouse_id = $2`;
+      stockWhere += ` AND s.warehouse_id = $${stockIdx++}`;
       stockValues.push(Number(branch_id));
     }
 
@@ -1500,12 +1508,18 @@ exports.getManufacturerAnalytics = async (req, res) => {
 
     // 3. Fetch sales & profit per product from invoice_items + invoices
     const invoiceConditions = [
-      "ii.product_id = ANY($1::int[])",
       "i.movement_type = 'sale'",
       "i.is_void IS NOT TRUE"
     ];
-    const invoiceValues = [productIds];
-    let idx = 2;
+    const invoiceValues = [];
+    let idx = 1;
+
+    if (normalizedManufacturer && normalizedManufacturer !== "all") {
+      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${idx++})))`);
+      invoiceValues.push(normalizedManufacturer);
+    } else {
+      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`);
+    }
 
     if (branch_id) {
       invoiceConditions.push(`i.branch_id = $${idx++}`);
@@ -1578,6 +1592,21 @@ exports.getManufacturerAnalytics = async (req, res) => {
     }
 
     // 4. Fetch total purchases/inbound per product
+    let purchaseWhere = `
+      WHERE i.movement_type = 'purchase'
+        AND i.is_void IS NOT TRUE
+        AND COALESCE(ii.is_return, false) IS NOT TRUE
+    `;
+    const purchaseValues = [];
+    let purchaseIdx = 1;
+
+    if (normalizedManufacturer && normalizedManufacturer !== "all") {
+      purchaseWhere += ` AND ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${purchaseIdx++})))`;
+      purchaseValues.push(normalizedManufacturer);
+    } else {
+      purchaseWhere += ` AND ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`;
+    }
+
     const purchaseRes = await pool.query(
       `
       SELECT
@@ -1585,13 +1614,10 @@ exports.getManufacturerAnalytics = async (req, res) => {
         SUM(COALESCE(ii.quantity, 0)) AS purchased_qty
       FROM invoice_items ii
       JOIN invoices i ON i.id = ii.invoice_id
-      WHERE ii.product_id = ANY($1::int[])
-        AND i.movement_type = 'purchase'
-        AND i.is_void IS NOT TRUE
-        AND COALESCE(ii.is_return, false) IS NOT TRUE
+      ${purchaseWhere}
       GROUP BY ii.product_id
       `,
-      [productIds]
+      purchaseValues
     );
 
     const purchaseMap = {};
@@ -1600,9 +1626,20 @@ exports.getManufacturerAnalytics = async (req, res) => {
     }
 
     // 4.5 Fetch product variants purchase prices for fallback
+    let variantsWhere = "WHERE 1=1";
+    const variantsValues = [];
+    let variantsIdx = 1;
+
+    if (normalizedManufacturer && normalizedManufacturer !== "all") {
+      variantsWhere += ` AND product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${variantsIdx++})))`;
+      variantsValues.push(normalizedManufacturer);
+    } else {
+      variantsWhere += ` AND product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`;
+    }
+
     const variantsRes = await pool.query(
-      `SELECT product_id, purchase_price, retail_purchase_price FROM product_variants WHERE product_id = ANY($1::int[])`,
-      [productIds]
+      `SELECT product_id, purchase_price, retail_purchase_price FROM product_variants ${variantsWhere}`,
+      variantsValues
     );
     const variantCostMap = {};
     for (const v of variantsRes.rows) {
