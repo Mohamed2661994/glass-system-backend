@@ -1600,6 +1600,11 @@ exports.getManufacturerAnalytics = async (req, res) => {
     const purchaseValues = [];
     let purchaseIdx = 1;
 
+    if (branch_id) {
+      purchaseWhere += ` AND i.branch_id = $${purchaseIdx++}`;
+      purchaseValues.push(Number(branch_id));
+    }
+
     if (normalizedManufacturer && normalizedManufacturer !== "all") {
       purchaseWhere += ` AND ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${purchaseIdx++})))`;
       purchaseValues.push(normalizedManufacturer);
