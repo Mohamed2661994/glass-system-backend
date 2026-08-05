@@ -893,6 +893,7 @@ exports.getCustomerBalances = async (req, res) => {
 
     let conditions_main = ["i.movement_type = 'sale'", "i.is_void = false"];
     let conditions_cte = ["movement_type = 'sale'", "is_void = false"];
+    let conditions_cash = ["source_type = 'customer_payment'"];
 
     let values = [];
     let idx = 1;
@@ -901,6 +902,7 @@ exports.getCustomerBalances = async (req, res) => {
       const p = "$" + idx++;
       conditions_main.push("i.invoice_date >= " + p);
       conditions_cte.push("invoice_date >= " + p);
+      conditions_cash.push("created_at >= " + p);
       values.push(from);
     }
 
@@ -908,6 +910,7 @@ exports.getCustomerBalances = async (req, res) => {
       const p = "$" + idx++;
       conditions_main.push("i.invoice_date <= " + p);
       conditions_cte.push("invoice_date <= " + p);
+      conditions_cash.push("created_at <= " + p);
       values.push(to);
     }
 
@@ -915,6 +918,7 @@ exports.getCustomerBalances = async (req, res) => {
       const p = "$" + idx++;
       conditions_main.push("i.customer_name ILIKE " + p);
       conditions_cte.push("customer_name ILIKE " + p);
+      conditions_cash.push("customer_name ILIKE " + p);
       values.push("%" + customer_name + "%");
     }
 
@@ -922,11 +926,13 @@ exports.getCustomerBalances = async (req, res) => {
       const p = "$" + idx++;
       conditions_main.push("i.branch_id = " + p);
       conditions_cte.push("branch_id = " + p);
+      conditions_cash.push("branch_id = " + p);
       values.push(warehouse_id);
     }
 
     const mainWhere = "WHERE " + conditions_main.join(" AND ");
     const cteWhere = "WHERE " + conditions_cte.join(" AND ");
+    const cashWhere = "WHERE " + conditions_cash.join(" AND ");
 
     const result = await pool.query(
       `
@@ -953,7 +959,7 @@ exports.getCustomerBalances = async (req, res) => {
       LEFT JOIN (
         SELECT customer_name, SUM(amount) AS extra_paid
         FROM cash_in
-        WHERE source_type = 'customer_payment'
+        ${cashWhere}
         GROUP BY customer_name
       ) cp ON cp.customer_name = i.customer_name
       ${mainWhere}
@@ -1415,6 +1421,8 @@ exports.getManufacturerAnalytics = async (req, res) => {
       search,
       page = 1,
       limit = 50,
+      chart_invoice_type,
+      timeline_interval,
     } = req.query;
 
     const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
@@ -1432,9 +1440,10 @@ exports.getManufacturerAnalytics = async (req, res) => {
         p.wholesale_price,
         p.wholesale_package,
         p.retail_package,
-        p.created_at
+        p.created_at,
+        p.is_active
       FROM products p
-      WHERE p.is_active IS NOT FALSE
+      WHERE (p.is_active IS NOT FALSE OR EXISTS (SELECT 1 FROM stock s WHERE s.product_id = p.id AND s.quantity != 0))
     `;
     let queryParams = [];
 
@@ -1478,10 +1487,10 @@ exports.getManufacturerAnalytics = async (req, res) => {
     let stockIdx = 1;
 
     if (normalizedManufacturer && normalizedManufacturer !== "all") {
-      stockWhere += ` AND s.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${stockIdx++})))`;
+      stockWhere += ` AND s.product_id IN (SELECT id FROM products WHERE LOWER(TRIM(manufacturer)) = LOWER(TRIM($${stockIdx++})))`;
       stockValues.push(normalizedManufacturer);
     } else {
-      stockWhere += ` AND s.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`;
+      stockWhere += ` AND s.product_id IN (SELECT id FROM products)`;
     }
 
     if (branch_id) {
@@ -1493,7 +1502,9 @@ exports.getManufacturerAnalytics = async (req, res) => {
       `
       SELECT
         s.product_id,
-        COALESCE(SUM(s.quantity), 0) AS current_stock
+        COALESCE(SUM(s.quantity), 0) AS current_stock,
+        COALESCE(SUM(CASE WHEN s.warehouse_id = 1 THEN s.quantity ELSE 0 END), 0) AS retail_stock,
+        COALESCE(SUM(CASE WHEN s.warehouse_id = 2 THEN s.quantity ELSE 0 END), 0) AS wholesale_stock
       FROM stock s
       ${stockWhere}
       GROUP BY s.product_id
@@ -1503,7 +1514,11 @@ exports.getManufacturerAnalytics = async (req, res) => {
 
     const stockMap = {};
     for (const row of stockRes.rows) {
-      stockMap[row.product_id] = Number(row.current_stock || 0);
+      stockMap[row.product_id] = {
+        total: Number(row.current_stock || 0),
+        retail: Number(row.retail_stock || 0),
+        wholesale: Number(row.wholesale_stock || 0)
+      };
     }
 
     // 3. Fetch sales & profit per product from invoice_items + invoices
@@ -1515,10 +1530,10 @@ exports.getManufacturerAnalytics = async (req, res) => {
     let idx = 1;
 
     if (normalizedManufacturer && normalizedManufacturer !== "all") {
-      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${idx++})))`);
+      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products WHERE LOWER(TRIM(manufacturer)) = LOWER(TRIM($${idx++})))`);
       invoiceValues.push(normalizedManufacturer);
     } else {
-      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`);
+      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products)`);
     }
 
     if (branch_id) {
@@ -1549,6 +1564,14 @@ exports.getManufacturerAnalytics = async (req, res) => {
           CASE WHEN COALESCE(ii.is_return, false) THEN -COALESCE(ii.quantity, 0)
           ELSE COALESCE(ii.quantity, 0) END
         ) AS signed_sold_quantity,
+        SUM(
+          CASE WHEN i.branch_id = 1 THEN (CASE WHEN COALESCE(ii.is_return, false) THEN -COALESCE(ii.quantity, 0) ELSE COALESCE(ii.quantity, 0) END)
+          ELSE 0 END
+        ) AS retail_sold_quantity,
+        SUM(
+          CASE WHEN i.branch_id = 2 THEN (CASE WHEN COALESCE(ii.is_return, false) THEN -COALESCE(ii.quantity, 0) ELSE COALESCE(ii.quantity, 0) END)
+          ELSE 0 END
+        ) AS wholesale_sold_quantity,
         SUM(
           CASE WHEN COALESCE(ii.is_return, false)
             THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
@@ -1584,11 +1607,165 @@ exports.getManufacturerAnalytics = async (req, res) => {
         first_sale_date: row.first_sale_date,
         last_sale_date: row.last_sale_date,
         sold_quantity: Number(row.signed_sold_quantity || 0),
+        retail_sold: Number(row.retail_sold_quantity || 0),
+        wholesale_sold: Number(row.wholesale_sold_quantity || 0),
         sales_total: Number(row.signed_sales_total || 0),
         gross_sales: Number(row.signed_gross_sales || 0),
         item_discounts: Number(row.signed_item_discounts || 0),
         total_cost: Number(row.total_cost || 0),
       };
+    }
+
+
+    // 3.5 Build timeline data for charts
+    let timeGroupFormat = "'YYYY-MM'";
+    if (timeline_interval === 'daily') {
+      timeGroupFormat = "'YYYY-MM-DD'";
+    } else if (timeline_interval === 'monthly') {
+      timeGroupFormat = "'YYYY-MM'";
+    } else if (timeline_interval === 'yearly') {
+      timeGroupFormat = "'YYYY'";
+    } else {
+      if (date_from && date_to) {
+        const d1 = new Date(date_from);
+        const d2 = new Date(date_to);
+        const diffDays = Math.ceil(Math.abs(d2 - d1) / (1000 * 60 * 60 * 24)); 
+        if (diffDays <= 45) {
+          timeGroupFormat = "'YYYY-MM-DD'";
+        }
+      } else if (date_from && !date_to) {
+        const d1 = new Date(date_from);
+        const diffDays = Math.ceil(Math.abs(new Date() - d1) / (1000 * 60 * 60 * 24));
+        if (diffDays <= 45) {
+          timeGroupFormat = "'YYYY-MM-DD'";
+        }
+      }
+    }
+
+    const timelineConditions = [
+      `i.movement_type = 'sale'`,
+      `i.is_void IS NOT TRUE`,
+    ];
+    const timelineValues = [];
+    let tIdx = 1;
+    
+    if (normalizedManufacturer && normalizedManufacturer !== "all") {
+      timelineConditions.push(`ii.product_id IN (SELECT id FROM products WHERE LOWER(TRIM(manufacturer)) = LOWER(TRIM($${tIdx++})))`);
+      timelineValues.push(normalizedManufacturer);
+    } else {
+      timelineConditions.push(`ii.product_id IN (SELECT id FROM products)`);
+    }
+
+    // Chart specific invoice type logic
+    const activeChartInvoiceType = chart_invoice_type || invoice_type;
+    if (activeChartInvoiceType === 'retail') {
+      timelineConditions.push(`i.branch_id = $${tIdx++}`);
+      timelineValues.push(1);
+      timelineConditions.push(`i.invoice_type = $${tIdx++}`);
+      timelineValues.push('retail');
+    } else if (activeChartInvoiceType === 'wholesale') {
+      timelineConditions.push(`i.branch_id = $${tIdx++}`);
+      timelineValues.push(2);
+      timelineConditions.push(`i.invoice_type = $${tIdx++}`);
+      timelineValues.push('wholesale');
+    }
+
+    if (date_from) {
+      timelineConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) >= $${tIdx++}::date`);
+      timelineValues.push(date_from);
+    }
+    if (date_to) {
+      timelineConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) <= $${tIdx++}::date`);
+      timelineValues.push(date_to);
+    }
+
+    const timelineRes = await pool.query(
+      `
+      SELECT
+        TO_CHAR(COALESCE(i.invoice_date::date, i.created_at::date), ${timeGroupFormat}) AS period,
+        SUM(
+          CASE WHEN COALESCE(ii.is_return, false)
+            THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+          ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+        ) AS sales_revenue,
+        SUM(
+          CASE WHEN COALESCE(ii.is_return, false) THEN 0
+          ELSE COALESCE(ii.quantity, 0) * COALESCE(ii.cost_price, CASE WHEN i.invoice_type = 'retail' THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0) ELSE COALESCE(p.purchase_price, 0) END) END
+        ) AS cost_of_goods
+      FROM invoice_items ii
+      JOIN invoices i ON i.id = ii.invoice_id
+      JOIN products p ON p.id = ii.product_id
+      WHERE ${timelineConditions.join(" AND ")}
+      GROUP BY period
+      ORDER BY period ASC
+      `,
+      timelineValues
+    );
+
+    const timeline = timelineRes.rows.map(r => {
+      const sales = Math.round(Number(r.sales_revenue || 0) * 100) / 100;
+      const cost = Math.round(Number(r.cost_of_goods || 0) * 100) / 100;
+      return {
+        period: r.period,
+        sales: sales,
+        cost: cost,
+        profit: Math.round((sales - cost) * 100) / 100
+      };
+    });
+
+    // 3.6 Fill missing periods with zeroes
+    let filledTimeline = [];
+    if (timeline.length > 0 || (date_from && date_to)) {
+      let startDateStr = date_from ? String(date_from) : timeline[0].period;
+      let endDateStr = date_to ? String(date_to) : timeline[timeline.length - 1].period;
+      
+      const isDaily = timeGroupFormat === "'YYYY-MM-DD'";
+      const isMonthly = timeGroupFormat === "'YYYY-MM'";
+      const isYearly = timeGroupFormat === "'YYYY'";
+
+      const getNextPeriod = (currentStr) => {
+        const d = new Date(currentStr + (isYearly ? "-01-01" : isMonthly ? "-01" : "T12:00:00"));
+        if (isDaily) d.setDate(d.getDate() + 1);
+        if (isMonthly) d.setMonth(d.getMonth() + 1);
+        if (isYearly) d.setFullYear(d.getFullYear() + 1);
+        
+        let year = d.getFullYear();
+        let month = String(d.getMonth() + 1).padStart(2, '0');
+        let day = String(d.getDate()).padStart(2, '0');
+        
+        if (isDaily) return `${year}-${month}-${day}`;
+        if (isMonthly) return `${year}-${month}`;
+        return `${year}`;
+      };
+
+      let currentPeriod = startDateStr;
+      if (isMonthly) currentPeriod = currentPeriod.substring(0, 7);
+      if (isYearly) currentPeriod = currentPeriod.substring(0, 4);
+
+      let endPeriod = endDateStr;
+      if (isMonthly) endPeriod = endPeriod.substring(0, 7);
+      if (isYearly) endPeriod = endPeriod.substring(0, 4);
+
+      const timelineMap = {};
+      timeline.forEach(t => timelineMap[t.period] = t);
+
+      let iterations = 0;
+      while (currentPeriod <= endPeriod && iterations < 2000) {
+        if (timelineMap[currentPeriod]) {
+          filledTimeline.push(timelineMap[currentPeriod]);
+        } else {
+          filledTimeline.push({
+            period: currentPeriod,
+            sales: 0,
+            cost: 0,
+            profit: 0
+          });
+        }
+        currentPeriod = getNextPeriod(currentPeriod);
+        iterations++;
+      }
+    } else {
+      filledTimeline = timeline;
     }
 
     // 4. Fetch total purchases/inbound per product
@@ -1606,17 +1783,19 @@ exports.getManufacturerAnalytics = async (req, res) => {
     }
 
     if (normalizedManufacturer && normalizedManufacturer !== "all") {
-      purchaseWhere += ` AND ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${purchaseIdx++})))`;
+      purchaseWhere += ` AND ii.product_id IN (SELECT id FROM products WHERE LOWER(TRIM(manufacturer)) = LOWER(TRIM($${purchaseIdx++})))`;
       purchaseValues.push(normalizedManufacturer);
     } else {
-      purchaseWhere += ` AND ii.product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`;
+      purchaseWhere += ` AND ii.product_id IN (SELECT id FROM products)`;
     }
 
     const purchaseRes = await pool.query(
       `
       SELECT
         ii.product_id,
-        SUM(COALESCE(ii.quantity, 0)) AS purchased_qty
+        SUM(COALESCE(ii.quantity, 0)) AS purchased_qty,
+        SUM(CASE WHEN i.branch_id = 1 THEN COALESCE(ii.quantity, 0) ELSE 0 END) AS retail_purchased,
+        SUM(CASE WHEN i.branch_id = 2 THEN COALESCE(ii.quantity, 0) ELSE 0 END) AS wholesale_purchased
       FROM invoice_items ii
       JOIN invoices i ON i.id = ii.invoice_id
       ${purchaseWhere}
@@ -1627,7 +1806,11 @@ exports.getManufacturerAnalytics = async (req, res) => {
 
     const purchaseMap = {};
     for (const row of purchaseRes.rows) {
-      purchaseMap[row.product_id] = Number(row.purchased_qty || 0);
+      purchaseMap[row.product_id] = {
+        total: Number(row.purchased_qty || 0),
+        retail: Number(row.retail_purchased || 0),
+        wholesale: Number(row.wholesale_purchased || 0)
+      };
     }
 
     // 4.5 Fetch product variants purchase prices for fallback
@@ -1636,10 +1819,10 @@ exports.getManufacturerAnalytics = async (req, res) => {
     let variantsIdx = 1;
 
     if (normalizedManufacturer && normalizedManufacturer !== "all") {
-      variantsWhere += ` AND product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE AND LOWER(TRIM(manufacturer)) = LOWER(TRIM($${variantsIdx++})))`;
+      variantsWhere += ` AND product_id IN (SELECT id FROM products WHERE LOWER(TRIM(manufacturer)) = LOWER(TRIM($${variantsIdx++})))`;
       variantsValues.push(normalizedManufacturer);
     } else {
-      variantsWhere += ` AND product_id IN (SELECT id FROM products WHERE is_active IS NOT FALSE)`;
+      variantsWhere += ` AND product_id IN (SELECT id FROM products)`;
     }
 
     const variantsRes = await pool.query(
@@ -1684,7 +1867,8 @@ exports.getManufacturerAnalytics = async (req, res) => {
     let totalNetProfit = 0;
     let currentStockQty = 0;
     let currentStockValuationCost = 0;
-
+    let activeStockValuationCost = 0;
+    let inactiveStockValuationCost = 0;
     let factoryTopQtyId = null;
     let maxQty = -Infinity;
     let factoryTopSalesId = null;
@@ -1693,18 +1877,22 @@ exports.getManufacturerAnalytics = async (req, res) => {
     let maxProfit = -Infinity;
 
     let allProductRows = productsRes.rows.map((p) => {
-      const stockQty = stockMap[p.id] || 0;
+      const stockData = stockMap[p.id] || { total: 0, retail: 0, wholesale: 0 };
+      const stockQty = stockData.total;
       const sales = salesMap[p.id] || {
         invoices_count: 0,
         first_sale_date: null,
         last_sale_date: null,
         sold_quantity: 0,
+        retail_sold: 0,
+        wholesale_sold: 0,
         sales_total: 0,
         gross_sales: 0,
         item_discounts: 0,
         total_cost: 0,
       };
-      const purchasedQty = purchaseMap[p.id] || 0;
+      const purchasedData = purchaseMap[p.id] || { total: 0, retail: 0, wholesale: 0 };
+      const purchasedQty = purchasedData.total;
 
       // Base unit cost price for current stock valuation
       const pRetailCost = Number(p.retail_purchase_price || 0);
@@ -1712,10 +1900,33 @@ exports.getManufacturerAnalytics = async (req, res) => {
       const variantCost = Number(variantCostMap[p.id] || 0);
 
       let currentUnitCost = 0;
-      if (branch_id == 2) {
-        currentUnitCost = pWholesaleCost > 0 ? pWholesaleCost : (pRetailCost > 0 ? pRetailCost : variantCost);
-      } else {
+      let localStockValuationCost = 0;
+      let acquiredQty = 0;
+      let acquiredCost = 0;
+
+      if (branch_id == 1 || invoice_type === 'retail') {
         currentUnitCost = pRetailCost > 0 ? pRetailCost : (pWholesaleCost > 0 ? pWholesaleCost : variantCost);
+        localStockValuationCost = stockQty * currentUnitCost;
+        acquiredQty = Math.max(stockQty + Math.max(0, sales.sold_quantity), purchasedQty);
+        acquiredCost = acquiredQty * currentUnitCost;
+      } else if (branch_id == 2 || invoice_type === 'wholesale') {
+        currentUnitCost = pWholesaleCost > 0 ? pWholesaleCost : (pRetailCost > 0 ? pRetailCost : variantCost);
+        localStockValuationCost = stockQty * currentUnitCost;
+        acquiredQty = Math.max(stockQty + Math.max(0, sales.sold_quantity), purchasedQty);
+        acquiredCost = acquiredQty * currentUnitCost;
+      } else {
+        const retailUnitCost = pRetailCost > 0 ? pRetailCost : (pWholesaleCost > 0 ? pWholesaleCost : variantCost);
+        const wholesaleUnitCost = pWholesaleCost > 0 ? pWholesaleCost : (pRetailCost > 0 ? pRetailCost : variantCost);
+        
+        const retailAcquired = Math.max(stockData.retail + Math.max(0, sales.retail_sold), purchasedData.retail);
+        const wholesaleAcquired = Math.max(stockData.wholesale + Math.max(0, sales.wholesale_sold), purchasedData.wholesale);
+        
+        localStockValuationCost = (stockData.retail * retailUnitCost) + (stockData.wholesale * wholesaleUnitCost);
+        acquiredQty = retailAcquired + wholesaleAcquired;
+        acquiredCost = (retailAcquired * retailUnitCost) + (wholesaleAcquired * wholesaleUnitCost);
+        
+        // Default display cost for "all" is wholesale
+        currentUnitCost = wholesaleUnitCost;
       }
 
       // Base unit selling price on system
@@ -1728,13 +1939,9 @@ exports.getManufacturerAnalytics = async (req, res) => {
         currentSellingPrice = pRetailSell > 0 ? pRetailSell : pWholesaleSell;
       }
 
-      // Acquired quantity = MAX(stock + sold, purchased)
-      const acquiredQty = Math.max(stockQty + Math.max(0, sales.sold_quantity), purchasedQty);
-      const acquiredCost = acquiredQty * currentUnitCost;
-
       const netProfit = sales.sales_total - sales.total_cost;
       const profitMarginPercent = sales.sales_total > 0 ? (netProfit / sales.sales_total) * 100 : 0;
-      const stockValuationCost = Math.max(0, stockQty) * currentUnitCost;
+      const stockValuationCost = Math.max(0, localStockValuationCost);
       const sellThroughPercent = acquiredQty > 0 ? (sales.sold_quantity / acquiredQty) * 100 : 0;
 
       // Global totals accumulators
@@ -1748,6 +1955,11 @@ exports.getManufacturerAnalytics = async (req, res) => {
       totalNetProfit += netProfit;
       currentStockQty += stockQty;
       currentStockValuationCost += stockValuationCost;
+      if (p.is_active !== false) {
+        activeStockValuationCost += stockValuationCost;
+      } else {
+        inactiveStockValuationCost += stockValuationCost;
+      }
 
       // Track Factory Champions
       if (sales.sold_quantity > maxQty && sales.sold_quantity > 0) {
@@ -1792,8 +2004,14 @@ exports.getManufacturerAnalytics = async (req, res) => {
         current_stock_value: Math.round(stockValuationCost * 100) / 100,
         sell_through_percent: Math.round(sellThroughPercent * 100) / 100,
         is_low_stock: stockQty <= 5,
+        is_active: p.is_active !== false,
       };
     });
+
+    // Filter out products with zero activity across all tracked metrics
+    allProductRows = allProductRows.filter(
+      (row) => row.total_acquired_qty !== 0 || row.sold_quantity !== 0 || row.current_stock_qty !== 0
+    );
 
     // Apply search filter if search term provided
     if (search && String(search).trim()) {
@@ -1821,7 +2039,7 @@ exports.getManufacturerAnalytics = async (req, res) => {
     res.json({
       summary: {
         manufacturer: manufacturer,
-        total_products_count: productsRes.rows.length,
+        total_products_count: allProductRows.length,
         total_acquired_qty: totalAcquiredQty,
         total_acquired_cost: Math.round(totalAcquiredCost * 100) / 100,
         total_sold_qty: totalSoldQty,
@@ -1834,6 +2052,8 @@ exports.getManufacturerAnalytics = async (req, res) => {
         profit_margin_percent: Math.round(overallProfitMargin * 100) / 100,
         current_stock_qty: currentStockQty,
         current_stock_valuation_cost: Math.round(currentStockValuationCost * 100) / 100,
+        active_stock_value: Math.round(activeStockValuationCost * 100) / 100,
+        inactive_stock_value: Math.round(inactiveStockValuationCost * 100) / 100,
         sell_through_percent: Math.round(overallSellThrough * 100) / 100,
         remaining_stock_percent: Math.round(overallRemainingPercent * 100) / 100,
         is_date_filtered: Boolean(date_from || date_to),
@@ -1845,6 +2065,7 @@ exports.getManufacturerAnalytics = async (req, res) => {
         factory_top_profit_product_id: factoryTopProfitId,
       },
       products: paginatedProducts,
+      timeline: filledTimeline,
       pagination: {
         page: currentPage,
         limit: pageSize,
