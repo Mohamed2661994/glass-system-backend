@@ -8407,6 +8407,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       amount,
       notes,
       source_type,
+      remaining_amount,
     } = req.body;
 
     if (!branch_id || !amount || Number(amount) <= 0) {
