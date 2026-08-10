@@ -8441,8 +8441,8 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     $5::text,
     $6::numeric,
     $7::numeric,
-    0::numeric,
-    $8::text
+    $8::numeric,
+    $9::text
   )
   RETURNING id
   `,
