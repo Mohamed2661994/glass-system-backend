@@ -8454,7 +8454,8 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
         description || "", // 5
         Number(amount), // 6
         Number(amount), // 7
-        notes || null, // 8
+        Number(branch_id) === 1 && remaining_amount !== undefined ? Number(remaining_amount) : 0, // 8
+        notes || null, // 9
       ],
     );
 
