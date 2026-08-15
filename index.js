@@ -11320,6 +11320,50 @@ app.get("/chat/users", authMiddleware, async (req, res) => {
 });
 
 /* ===============================
+   🖨️ LOCAL PRINT SERVICE
+================================ */
+app.post("/print/invoice/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const io = req.app.get("io");
+    
+    // Emit event to a dedicated room for local print services
+    // The print service will listen to 'print-job' and process it
+    io.emit("print-job", {
+      type: "invoice",
+      id: id,
+      path: `/invoices/${id}/print-thermal`,
+      timestamp: Date.now()
+    });
+
+    res.json({ success: true, message: "Print job sent successfully" });
+  } catch (err) {
+    console.error("PRINT INVOICE ERROR:", err);
+    res.status(500).json({ error: "فشل إرسال أمر الطباعة" });
+  }
+});
+
+app.post("/print/barcode/:id", authMiddleware, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { count = 1 } = req.body;
+    const io = req.app.get("io");
+    
+    io.emit("print-job", {
+      type: "barcode",
+      id: id,
+      path: `/products/${id}/barcode-thermal?count=${count}`,
+      timestamp: Date.now()
+    });
+
+    res.json({ success: true, message: "Barcode print job sent successfully" });
+  } catch (err) {
+    console.error("PRINT BARCODE ERROR:", err);
+    res.status(500).json({ error: "فشل إرسال أمر طباعة الباركود" });
+  }
+});
+
+/* ===============================
    🔌 SOCKET.IO
 ================================ */
 const http = require("http");
