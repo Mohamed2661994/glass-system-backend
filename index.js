@@ -10469,7 +10469,7 @@ app.post("/login", async (req, res) => {
       .catch((e) => console.error("LOG LOGIN ERR:", e.message));
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Login error" });
+    res.status(500).json({ error: `Login error: ${err.message}` });
   }
 });
 
