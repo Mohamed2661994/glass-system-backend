@@ -11326,6 +11326,7 @@ app.post("/print/invoice/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const io = req.app.get("io");
+    const token = req.headers.authorization?.split(" ")[1] || "";
     
     // Emit event to a dedicated room for local print services
     // The print service will listen to 'print-job' and process it
@@ -11333,6 +11334,7 @@ app.post("/print/invoice/:id", authMiddleware, async (req, res) => {
       type: "invoice",
       id: id,
       path: `/invoices/${id}/print-thermal`,
+      token: token,
       timestamp: Date.now()
     });
 
@@ -11348,11 +11350,13 @@ app.post("/print/barcode/:id", authMiddleware, async (req, res) => {
     const { id } = req.params;
     const { count = 1 } = req.body;
     const io = req.app.get("io");
+    const token = req.headers.authorization?.split(" ")[1] || "";
     
     io.emit("print-job", {
       type: "barcode",
       id: id,
       path: `/products/${id}/barcode-thermal?count=${count}`,
+      token: token,
       timestamp: Date.now()
     });
 
