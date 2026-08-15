@@ -11367,6 +11367,40 @@ app.post("/print/barcode/:id", authMiddleware, async (req, res) => {
   }
 });
 
+// GET print settings
+app.get("/settings/print-settings", authMiddleware, async (req, res) => {
+  try {
+    const id = req.user.branch_id;
+    const result = await pool.query(`SELECT thermal_print_settings, barcode_print_settings FROM branches WHERE id = $1`, [id]);
+    if (!result.rows.length) return res.status(404).json({ error: "الفرع غير موجود" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("GET PRINT SETTINGS ERR:", err);
+    res.status(500).json({ error: "فشل جلب إعدادات الطباعة" });
+  }
+});
+
+// POST print settings
+app.post("/settings/print-settings", authMiddleware, async (req, res) => {
+  try {
+    const id = req.user.branch_id;
+    const { type, settings } = req.body; // type: "thermal" or "barcode"
+    
+    if (type === "thermal") {
+      await pool.query(`UPDATE branches SET thermal_print_settings = $1 WHERE id = $2`, [settings, id]);
+    } else if (type === "barcode") {
+      await pool.query(`UPDATE branches SET barcode_print_settings = $1 WHERE id = $2`, [settings, id]);
+    } else {
+      return res.status(400).json({ error: "نوع الإعدادات غير صحيح" });
+    }
+    
+    res.json({ success: true, message: "تم حفظ الإعدادات بنجاح" });
+  } catch (err) {
+    console.error("POST PRINT SETTINGS ERR:", err);
+    res.status(500).json({ error: "فشل حفظ إعدادات الطباعة" });
+  }
+});
+
 /* ===============================
    🔌 SOCKET.IO
 ================================ */
