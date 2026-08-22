@@ -733,7 +733,8 @@ exports.getProductSalesProfit = async (req, res) => {
           i.branch_id,
           i.invoice_type,
           COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date,
-          COALESCE(i.total, 0) AS invoice_total
+          COALESCE(i.total, 0) AS invoice_total,
+          COALESCE(i.apply_items_discount, true) AS apply_items_discount
         FROM invoices i
         WHERE ${invoiceConditions.join(" AND ")}
       ),
@@ -752,17 +753,25 @@ exports.getProductSalesProfit = async (req, res) => {
           inv.invoice_date,
           inv.invoice_total,
           CASE
-            WHEN COALESCE(ii.is_return, false)
-              THEN -COALESCE(
-                ii.total,
-                COALESCE(ii.quantity, 0)
-                  * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
-              )
-            ELSE COALESCE(
-              ii.total,
-              COALESCE(ii.quantity, 0)
-                * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
-            )
+            WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+              CASE
+                WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+              END
+            ELSE
+              CASE
+                WHEN COALESCE(ii.is_return, false)
+                  THEN -COALESCE(
+                    ii.total,
+                    COALESCE(ii.quantity, 0)
+                      * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+                  )
+                ELSE COALESCE(
+                  ii.total,
+                  COALESCE(ii.quantity, 0)
+                    * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+                )
+              END
           END AS signed_item_total,
           CASE
             WHEN COALESCE(ii.is_return, false)
@@ -783,17 +792,25 @@ exports.getProductSalesProfit = async (req, res) => {
           END AS total_cost,
           SUM(
             CASE
-              WHEN COALESCE(ii.is_return, false)
-                THEN -COALESCE(
-                  ii.total,
-                  COALESCE(ii.quantity, 0)
-                    * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
-                )
-              ELSE COALESCE(
-                ii.total,
-                COALESCE(ii.quantity, 0)
-                  * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
-              )
+              WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+                CASE
+                  WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                  ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                END
+              ELSE
+                CASE
+                  WHEN COALESCE(ii.is_return, false)
+                    THEN -COALESCE(
+                      ii.total,
+                      COALESCE(ii.quantity, 0)
+                        * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+                    )
+                  ELSE COALESCE(
+                    ii.total,
+                    COALESCE(ii.quantity, 0)
+                      * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))
+                  )
+                END
             END
           ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
         FROM invoice_scope inv
@@ -1423,9 +1440,11 @@ exports.getManufacturerAnalytics = async (req, res) => {
       limit = 50,
       chart_invoice_type,
       timeline_interval,
+      apply_distribution,
     } = req.query;
 
     const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
+    const isApplyDistribution = apply_distribution === 'true';
 
     // 1. Fetch products (either belonging to a specific manufacturer, or ALL if omitted/'all')
     let productsQuery = `
@@ -1522,83 +1541,140 @@ exports.getManufacturerAnalytics = async (req, res) => {
     }
 
     // 3. Fetch sales & profit per product from invoice_items + invoices
+    const salesValues = [];
+    let idx = 1;
+
+    let manufacturerCondition = "WHERE (p.is_active IS NOT FALSE OR EXISTS (SELECT 1 FROM stock s WHERE s.product_id = p.id AND s.quantity != 0))";
+    if (normalizedManufacturer && normalizedManufacturer !== "all") {
+      manufacturerCondition += ` AND LOWER(TRIM(p.manufacturer)) = LOWER(TRIM($${idx++}))`;
+      salesValues.push(normalizedManufacturer);
+    }
+
     const invoiceConditions = [
       "i.movement_type = 'sale'",
       "i.is_void IS NOT TRUE"
     ];
-    const invoiceValues = [];
-    let idx = 1;
-
-    if (normalizedManufacturer && normalizedManufacturer !== "all") {
-      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products WHERE LOWER(TRIM(manufacturer)) = LOWER(TRIM($${idx++})))`);
-      invoiceValues.push(normalizedManufacturer);
-    } else {
-      invoiceConditions.push(`ii.product_id IN (SELECT id FROM products)`);
-    }
 
     if (branch_id) {
       invoiceConditions.push(`i.branch_id = $${idx++}`);
-      invoiceValues.push(Number(branch_id));
+      salesValues.push(Number(branch_id));
     }
     if (invoice_type) {
       invoiceConditions.push(`i.invoice_type = $${idx++}`);
-      invoiceValues.push(invoice_type);
+      salesValues.push(invoice_type);
     }
     if (date_from) {
       invoiceConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) >= $${idx++}::date`);
-      invoiceValues.push(date_from);
+      salesValues.push(date_from);
     }
     if (date_to) {
       invoiceConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) <= $${idx++}::date`);
-      invoiceValues.push(date_to);
+      salesValues.push(date_to);
     }
 
-    const salesRes = await pool.query(
-      `
+    const salesQuery = `
+      WITH selected_products AS (
+        SELECT p.id AS product_id
+        FROM products p
+        ${manufacturerCondition}
+      ),
+      invoice_scope AS (
+        SELECT 
+          i.id AS invoice_id, 
+          i.branch_id, 
+          i.invoice_type, 
+          COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date, 
+          COALESCE(i.total, 0) AS invoice_total,
+          COALESCE(i.apply_items_discount, true) AS apply_items_discount
+        FROM invoices i
+        WHERE ${invoiceConditions.join(" AND ")}
+      ),
+      selected_invoice_ids AS (
+        SELECT DISTINCT ii.invoice_id
+        FROM invoice_items ii
+        JOIN selected_products sp ON sp.product_id = ii.product_id
+        JOIN invoice_scope inv ON inv.invoice_id = ii.invoice_id
+      ),
+      invoice_items_scoped AS (
+        SELECT
+          ii.invoice_id,
+          ii.product_id,
+          ii.quantity, ii.price, ii.discount, ii.total, ii.is_return, ii.cost_price,
+          inv.branch_id, inv.invoice_type, inv.invoice_date, inv.invoice_total, inv.apply_items_discount,
+          p.purchase_price, p.retail_purchase_price,
+          CASE
+            WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+              CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+              ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+            ELSE
+              CASE WHEN COALESCE(ii.is_return, false)
+                THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+              ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+          END AS signed_item_total,
+          SUM(
+            CASE
+              WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+                CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+              ELSE
+                CASE WHEN COALESCE(ii.is_return, false)
+                  THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+                ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+            END
+          ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
+        FROM invoice_scope inv
+        JOIN selected_invoice_ids sii ON sii.invoice_id = inv.invoice_id
+        JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
+        JOIN products p ON p.id = ii.product_id
+      )
       SELECT
-        ii.product_id,
-        COUNT(DISTINCT i.id) AS invoices_count,
-        MIN(COALESCE(i.invoice_date::date, i.created_at::date)) AS first_sale_date,
-        MAX(COALESCE(i.invoice_date::date, i.created_at::date)) AS last_sale_date,
+        iis.product_id,
+        COUNT(DISTINCT iis.invoice_id) AS invoices_count,
+        MIN(iis.invoice_date) AS first_sale_date,
+        MAX(iis.invoice_date) AS last_sale_date,
         SUM(
-          CASE WHEN COALESCE(ii.is_return, false) THEN -COALESCE(ii.quantity, 0)
-          ELSE COALESCE(ii.quantity, 0) END
+          CASE WHEN COALESCE(iis.is_return, false) THEN -COALESCE(iis.quantity, 0)
+          ELSE COALESCE(iis.quantity, 0) END
         ) AS signed_sold_quantity,
         SUM(
-          CASE WHEN i.branch_id = 1 THEN (CASE WHEN COALESCE(ii.is_return, false) THEN -COALESCE(ii.quantity, 0) ELSE COALESCE(ii.quantity, 0) END)
+          CASE WHEN iis.branch_id = 1 THEN (CASE WHEN COALESCE(iis.is_return, false) THEN -COALESCE(iis.quantity, 0) ELSE COALESCE(iis.quantity, 0) END)
           ELSE 0 END
         ) AS retail_sold_quantity,
         SUM(
-          CASE WHEN i.branch_id = 2 THEN (CASE WHEN COALESCE(ii.is_return, false) THEN -COALESCE(ii.quantity, 0) ELSE COALESCE(ii.quantity, 0) END)
+          CASE WHEN iis.branch_id = 2 THEN (CASE WHEN COALESCE(iis.is_return, false) THEN -COALESCE(iis.quantity, 0) ELSE COALESCE(iis.quantity, 0) END)
           ELSE 0 END
         ) AS wholesale_sold_quantity,
         SUM(
-          CASE WHEN COALESCE(ii.is_return, false)
-            THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
-          ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+          CASE 
+            WHEN ${isApplyDistribution ? 'true' : 'false'} THEN
+              CASE
+                WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
+                ELSE iis.signed_item_total - ((iis.invoice_items_total - iis.invoice_total) * (iis.signed_item_total / iis.invoice_items_total))
+              END
+            ELSE
+              iis.signed_item_total
+          END
         ) AS signed_sales_total,
         SUM(
-          CASE WHEN COALESCE(ii.is_return, false)
-            THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
-          ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+          CASE WHEN COALESCE(iis.is_return, false)
+            THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.price, 0))
+          ELSE (COALESCE(iis.quantity, 0) * COALESCE(iis.price, 0)) END
         ) AS signed_gross_sales,
         SUM(
-          CASE WHEN COALESCE(ii.is_return, false)
-            THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.discount, 0))
-          ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.discount, 0)) END
+          CASE WHEN COALESCE(iis.is_return, false)
+            THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.discount, 0))
+          ELSE (COALESCE(iis.quantity, 0) * COALESCE(iis.discount, 0)) END
         ) AS signed_item_discounts,
         SUM(
-          CASE WHEN COALESCE(ii.is_return, false) THEN 0
-          ELSE COALESCE(ii.quantity, 0) * COALESCE(ii.cost_price, CASE WHEN i.invoice_type = 'retail' THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0) ELSE COALESCE(p.purchase_price, 0) END) END
+          CASE WHEN COALESCE(iis.is_return, false) THEN 0
+          ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
         ) AS total_cost
-      FROM invoice_items ii
-      JOIN invoices i ON i.id = ii.invoice_id
-      JOIN products p ON p.id = ii.product_id
-      WHERE ${invoiceConditions.join(" AND ")}
-      GROUP BY ii.product_id
-      `,
-      invoiceValues
-    );
+      FROM invoice_items_scoped iis
+      JOIN selected_products sp ON sp.product_id = iis.product_id
+      GROUP BY iis.product_id
+    `;
+    
+    const salesRes = await pool.query(salesQuery, salesValues);
 
     const salesMap = {};
     for (const row of salesRes.rows) {
@@ -1649,11 +1725,10 @@ exports.getManufacturerAnalytics = async (req, res) => {
     const timelineValues = [];
     let tIdx = 1;
     
+    let timelineManufacturerCondition = "WHERE (p.is_active IS NOT FALSE OR EXISTS (SELECT 1 FROM stock s WHERE s.product_id = p.id AND s.quantity != 0))";
     if (normalizedManufacturer && normalizedManufacturer !== "all") {
-      timelineConditions.push(`ii.product_id IN (SELECT id FROM products WHERE LOWER(TRIM(manufacturer)) = LOWER(TRIM($${tIdx++})))`);
+      timelineManufacturerCondition += ` AND LOWER(TRIM(p.manufacturer)) = LOWER(TRIM($${tIdx++}))`;
       timelineValues.push(normalizedManufacturer);
-    } else {
-      timelineConditions.push(`ii.product_id IN (SELECT id FROM products)`);
     }
 
     // Chart specific invoice type logic
@@ -1679,28 +1754,85 @@ exports.getManufacturerAnalytics = async (req, res) => {
       timelineValues.push(date_to);
     }
 
-    const timelineRes = await pool.query(
-      `
+    const timelineQuery = `
+      WITH selected_products AS (
+        SELECT p.id AS product_id
+        FROM products p
+        ${timelineManufacturerCondition}
+      ),
+      invoice_scope AS (
+        SELECT 
+          i.id AS invoice_id, 
+          i.branch_id, 
+          i.invoice_type, 
+          COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date, 
+          COALESCE(i.total, 0) AS invoice_total,
+          COALESCE(i.apply_items_discount, true) AS apply_items_discount
+        FROM invoices i
+        WHERE ${timelineConditions.join(" AND ")}
+      ),
+      selected_invoice_ids AS (
+        SELECT DISTINCT ii.invoice_id
+        FROM invoice_items ii
+        JOIN selected_products sp ON sp.product_id = ii.product_id
+        JOIN invoice_scope inv ON inv.invoice_id = ii.invoice_id
+      ),
+      invoice_items_scoped AS (
+        SELECT
+          ii.invoice_id,
+          ii.product_id,
+          ii.quantity, ii.price, ii.discount, ii.total, ii.is_return, ii.cost_price,
+          inv.branch_id, inv.invoice_type, inv.invoice_date, inv.invoice_total, inv.apply_items_discount,
+          p.purchase_price, p.retail_purchase_price,
+          CASE
+            WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+              CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+              ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+            ELSE
+              CASE WHEN COALESCE(ii.is_return, false)
+                THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+              ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+          END AS signed_item_total,
+          SUM(
+            CASE
+              WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+                CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+              ELSE
+                CASE WHEN COALESCE(ii.is_return, false)
+                  THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+                ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+            END
+          ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
+        FROM invoice_scope inv
+        JOIN selected_invoice_ids sii ON sii.invoice_id = inv.invoice_id
+        JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
+        JOIN products p ON p.id = ii.product_id
+      )
       SELECT
-        TO_CHAR(COALESCE(i.invoice_date::date, i.created_at::date), ${timeGroupFormat}) AS period,
+        TO_CHAR(iis.invoice_date, ${timeGroupFormat}) AS period,
         SUM(
-          CASE WHEN COALESCE(ii.is_return, false)
-            THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
-          ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+          CASE 
+            WHEN ${isApplyDistribution ? 'true' : 'false'} THEN
+              CASE
+                WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
+                ELSE iis.signed_item_total - ((iis.invoice_items_total - iis.invoice_total) * (iis.signed_item_total / iis.invoice_items_total))
+              END
+            ELSE
+              iis.signed_item_total
+          END
         ) AS sales_revenue,
         SUM(
-          CASE WHEN COALESCE(ii.is_return, false) THEN 0
-          ELSE COALESCE(ii.quantity, 0) * COALESCE(ii.cost_price, CASE WHEN i.invoice_type = 'retail' THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0) ELSE COALESCE(p.purchase_price, 0) END) END
+          CASE WHEN COALESCE(iis.is_return, false) THEN 0
+          ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
         ) AS cost_of_goods
-      FROM invoice_items ii
-      JOIN invoices i ON i.id = ii.invoice_id
-      JOIN products p ON p.id = ii.product_id
-      WHERE ${timelineConditions.join(" AND ")}
+      FROM invoice_items_scoped iis
+      JOIN selected_products sp ON sp.product_id = iis.product_id
       GROUP BY period
       ORDER BY period ASC
-      `,
-      timelineValues
-    );
+    `;
+
+    const timelineRes = await pool.query(timelineQuery, timelineValues);
 
     const timeline = timelineRes.rows.map(r => {
       const sales = Math.round(Number(r.sales_revenue || 0) * 100) / 100;

@@ -6183,36 +6183,64 @@ app.get("/dashboard/stats", async (req, res) => {
           ) neg`,
         [warehouseId],
       ),
-      // Today's profit percentage using the same logic as the invoice profit report
+      // Today's profit percentage using the same logic as the invoice profit report (Proportional Distribution)
       pool.query(
-        `SELECT
-             COALESCE(SUM(
-               CASE
-                 WHEN COALESCE(ii.is_return, false) THEN 0
-                 ELSE COALESCE(ii.total, (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)) * COALESCE(ii.quantity, 0))
-               END
-             ), 0) AS sales_total,
-             COALESCE(SUM(
-               CASE
-                 WHEN COALESCE(ii.is_return, false) THEN 0
-                 ELSE COALESCE(ii.quantity, 0)
-                   * COALESCE(
-                       ii.cost_price,
-                       CASE
-                         WHEN i.invoice_type = 'retail'
-                           THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
-                         ELSE COALESCE(p.purchase_price, 0)
-                       END
-                     )
-               END
-             ), 0) AS total_cost
+        `WITH invoice_scope AS (
+           SELECT 
+             i.id AS invoice_id, 
+             i.branch_id, 
+             i.invoice_type, 
+             COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date, 
+             COALESCE(i.total, 0) AS invoice_total,
+             COALESCE(i.apply_items_discount, true) AS apply_items_discount
            FROM invoices i
-           JOIN invoice_items ii ON ii.invoice_id = i.id
-           JOIN products p ON p.id = ii.product_id
            WHERE i.invoice_type = $1
              AND i.movement_type = 'sale'
              AND i.is_void IS NOT TRUE
-             AND COALESCE(i.invoice_date::date, i.created_at::date) = CURRENT_DATE`,
+             AND COALESCE(i.invoice_date::date, i.created_at::date) = CURRENT_DATE
+         ),
+         invoice_items_scoped AS (
+           SELECT
+             ii.invoice_id,
+             ii.quantity, ii.price, ii.discount, ii.total, ii.is_return, ii.cost_price,
+             inv.branch_id, inv.invoice_type, inv.invoice_date, inv.invoice_total, inv.apply_items_discount,
+             p.purchase_price, p.retail_purchase_price,
+             CASE
+               WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+                 CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                 ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+               ELSE
+                 CASE WHEN COALESCE(ii.is_return, false)
+                   THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+                 ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+             END AS signed_item_total,
+             SUM(
+               CASE
+                 WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+                   CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                   ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+                 ELSE
+                   CASE WHEN COALESCE(ii.is_return, false)
+                     THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+                   ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+               END
+             ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
+           FROM invoice_scope inv
+           JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
+           JOIN products p ON p.id = ii.product_id
+         )
+         SELECT
+           COALESCE(SUM(
+             CASE
+               WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
+               ELSE iis.signed_item_total - ((iis.invoice_items_total - iis.invoice_total) * (iis.signed_item_total / iis.invoice_items_total))
+             END
+           ), 0) AS sales_total,
+           COALESCE(SUM(
+             CASE WHEN COALESCE(iis.is_return, false) THEN 0
+             ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
+           ), 0) AS total_cost
+         FROM invoice_items_scoped iis`,
         [invoice_type],
       ),
     ]);
