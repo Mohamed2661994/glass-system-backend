@@ -10565,6 +10565,29 @@ app.get("/auth/me", authMiddleware, async (req, res) => {
 });
 
 /* ===============================
+   🔀 SWITCH BRANCH (Admin Only)
+================================ */
+app.post("/auth/switch-branch", authMiddleware, async (req, res) => {
+  try {
+    if (req.user.username !== 'admin') {
+      return res.status(403).json({ error: "غير مصرح لك بتبديل الفرع" });
+    }
+    
+    const { target_branch_id } = req.body;
+    if (!target_branch_id) {
+      return res.status(400).json({ error: "يجب تحديد الفرع المطلوب" });
+    }
+
+    await pool.query('UPDATE users SET branch_id = $1 WHERE id = $2', [target_branch_id, req.user.id]);
+    
+    res.json({ success: true });
+  } catch (err) {
+    console.error("SWITCH BRANCH ERROR:", err);
+    res.status(500).json({ error: "فشل في تبديل الفرع" });
+  }
+});
+
+/* ===============================
    🔔 NOTIFICATIONS - جلب إشعارات الفرع
 ================================ */
 app.get("/notifications", authMiddleware, async (req, res) => {
