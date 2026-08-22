@@ -5757,6 +5757,7 @@ app.get("/invoices", async (req, res) => {
       invoice_type,
       movement_type,
       customer_name,
+      customer_phone,
       customer_id,
       is_return,
       invoice_id,
@@ -5824,9 +5825,17 @@ app.get("/invoices", async (req, res) => {
 
     if (customer_name) {
       conditions.push(
-        `(customer_name ILIKE $${idx} OR supplier_name ILIKE $${idx})`,
+        `(customer_name ILIKE $${idx} OR supplier_name ILIKE $${idx} OR customer_phone ILIKE $${idx} OR supplier_phone ILIKE $${idx})`,
       );
       values.push(`%${customer_name}%`);
+      idx++;
+    }
+
+    if (customer_phone) {
+      conditions.push(
+        `(customer_phone ILIKE $${idx} OR supplier_phone ILIKE $${idx})`,
+      );
+      values.push(`%${customer_phone}%`);
       idx++;
     }
 
@@ -7904,7 +7913,7 @@ let ensureUsersAccessControlColumnsPromise = null;
 async function ensureUsersAccessControlColumns() {
   if (!ensureUsersAccessControlColumnsPromise) {
     ensureUsersAccessControlColumnsPromise = (async () => {
-      const candidatePools = [pool.localPool, pool.cloudPool, pool].filter(
+      const candidatePools = [pool.localPool, pool.cloudPool].filter(
         Boolean,
       );
 
@@ -7927,13 +7936,17 @@ async function ensureUsersAccessControlColumns() {
       `;
 
       for (const poolRef of candidatePools) {
-        await poolRef.query(
-          `ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'`,
-        );
-        await poolRef.query(
-          `ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
-        );
-        await poolRef.query(ensureUsersRoleConstraintSql);
+        try {
+          await poolRef.query(
+            `ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'`,
+          );
+          await poolRef.query(
+            `ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
+          );
+          await poolRef.query(ensureUsersRoleConstraintSql);
+        } catch (err) {
+          console.error("⚠️ ensureUsersAccessControlColumns failed for a pool:", err.message);
+        }
       }
     })().catch((error) => {
       ensureUsersAccessControlColumnsPromise = null;
