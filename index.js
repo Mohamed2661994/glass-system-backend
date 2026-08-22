@@ -1405,6 +1405,34 @@ function getWarehouseIdByInvoiceType(invoice_type) {
   throw new Error("invoice_type غير معروف");
 }
 
+/* ===============================
+   🚀 GITHUB WEBHOOK (Auto Pull)
+================================ */
+app.post("/webhook/github", (req, res) => {
+  const token = req.query.token;
+  // If not configured, deny access
+  if (!process.env.GITHUB_WEBHOOK_SECRET || token !== process.env.GITHUB_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  // Acknowledge request immediately
+  res.json({ success: true, message: "Deployment started" });
+  console.log("🚀 Webhook received: Starting Git Pull...");
+
+  exec("git pull", (err, stdout, stderr) => {
+    if (err) {
+      console.error("Git Pull Error:", err);
+      return;
+    }
+    console.log("Git Pull Output:", stdout);
+    
+    console.log("🔄 Exiting process to allow PM2 to auto-restart and load new code...");
+    setTimeout(() => {
+      process.exit(0);
+    }, 1000);
+  });
+});
+
 async function decrementStockOrThrow(
   client,
   { warehouseId, productId, variantId = 0, quantity, reason },
