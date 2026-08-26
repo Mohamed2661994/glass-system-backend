@@ -82,7 +82,7 @@ app.use(
       "https://homeglass-web.vercel.app",
       "https://house-of-glass-phi.vercel.app",
       "https://x.hg-alshour.online",
-      "http://localhost:3000",
+      "http://localhost:3000", "http://localhost:3001", "http://localhost:3002",
       "http://localhost:8000",
       "http://192.168.1.63:3000",
       "https://hg-alshour.online",
@@ -105,6 +105,7 @@ const PUBLIC_PATHS = [
   "/admin",
   "/integrations",
   "/chat/media",
+  "/api/inter-branch/webhook",
 ];
 const jwt_auth = require("jsonwebtoken");
 app.use((req, res, next) => {
@@ -1026,6 +1027,9 @@ app.use((req, res, next) => {
 const reportsRoutes = require("./reports/reports.routes");
 app.use("/reports", reportsRoutes);
 
+const interBranchRoutes = require("./inter-branch/inter-branch.routes");
+app.use("/api/inter-branch", interBranchRoutes);
+
 const productsRoutes = require("./modules/products/products.routes");
 
 //app.use("/products", productsRoutes);
@@ -1076,6 +1080,17 @@ pool
   .then(() => console.log("✅ stock_transfer_items.received column ready"))
   .catch((e) =>
     console.error("❌ stock_transfer_items.received error:", e.message),
+  );
+
+// ✅ عمود أساس الخصم للمصنع: 'purchase' (افتراضي) أو 'sale'
+pool
+  .query(
+    `ALTER TABLE manufacturers
+       ADD COLUMN IF NOT EXISTS discount_base VARCHAR(20) NOT NULL DEFAULT 'purchase'`,
+  )
+  .then(() => console.log("✅ manufacturers.discount_base column ready"))
+  .catch((e) =>
+    console.error("❌ manufacturers.discount_base error:", e.message),
   );
 
 // 📦 إنشاء جدول الأكواد الفرعية (عبوات بديلة) لو مش موجود
@@ -1265,8 +1280,8 @@ pool
         FOR r IN
           SELECT warehouse_id, product_id, variant_id, SUM(
             CASE
-              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale') THEN quantity
-              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase') THEN -quantity
+              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out') THEN -quantity
               ELSE 0
             END
           ) AS calc_qty
@@ -1275,8 +1290,8 @@ pool
           GROUP BY warehouse_id, product_id, variant_id
           HAVING SUM(
             CASE
-              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale') THEN quantity
-              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase') THEN -quantity
+              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out') THEN -quantity
               ELSE 0
             END
           ) > 0
@@ -1291,8 +1306,8 @@ pool
         FOR r IN
           SELECT warehouse_id, product_id, SUM(
             CASE
-              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale') THEN quantity
-              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase') THEN -quantity
+              WHEN movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in') THEN quantity
+              WHEN movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out') THEN -quantity
               ELSE 0
             END
           ) AS calc_qty
@@ -6143,6 +6158,7 @@ app.get("/dashboard/stats", async (req, res) => {
       lowStockCount,
       negativeStockCount,
       todayProfitSummary,
+      interBranchProfitSummary,
     ] = await Promise.all([
       // Today's sales total
       pool.query(
@@ -6243,10 +6259,20 @@ app.get("/dashboard/stats", async (req, res) => {
          FROM invoice_items_scoped iis`,
         [invoice_type],
       ),
+      // Today's inter-branch outbound profit
+      pool.query(
+        `SELECT COALESCE(SUM(total_value), 0) AS total_sales,
+                COALESCE(SUM(total_cost), 0) AS total_cost
+         FROM inter_branch_transfers
+         WHERE direction = 'outbound'
+           AND status IN ('in_transit', 'received')
+           AND created_at >= CURRENT_DATE
+           AND created_at < CURRENT_DATE + INTERVAL '1 day'`
+      ),
     ]);
 
-    const todaySalesTotal = Number(todayProfitSummary.rows[0].sales_total || 0);
-    const todayTotalCost = Number(todayProfitSummary.rows[0].total_cost || 0);
+    const todaySalesTotal = Number(todayProfitSummary.rows[0].sales_total || 0) + Number(interBranchProfitSummary.rows[0].total_sales || 0);
+    const todayTotalCost = Number(todayProfitSummary.rows[0].total_cost || 0) + Number(interBranchProfitSummary.rows[0].total_cost || 0);
     const todayNetProfit = todaySalesTotal - todayTotalCost;
     const todayProfitPercentage =
       todaySalesTotal > 0 ? (todayNetProfit / todaySalesTotal) * 100 : 0;
@@ -7520,13 +7546,14 @@ app.get("/admin/manufacturers", async (req, res) => {
 // إضافة مصنع جديد
 app.post("/admin/manufacturers", async (req, res) => {
   try {
-    const { name, percentage } = req.body;
+    const { name, percentage, discount_base } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "اسم المصنع مطلوب" });
     }
+    const base = discount_base === "sale" ? "sale" : "purchase";
     const result = await pool.query(
-      "INSERT INTO manufacturers (name, percentage) VALUES ($1, $2) RETURNING *",
-      [name.trim(), percentage || 0],
+      "INSERT INTO manufacturers (name, percentage, discount_base) VALUES ($1, $2, $3) RETURNING *",
+      [name.trim(), percentage || 0, base],
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -7542,13 +7569,14 @@ app.post("/admin/manufacturers", async (req, res) => {
 app.put("/admin/manufacturers/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, percentage } = req.body;
+    const { name, percentage, discount_base } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "اسم المصنع مطلوب" });
     }
+    const base = discount_base === "sale" ? "sale" : "purchase";
     const result = await pool.query(
-      "UPDATE manufacturers SET name = $1, percentage = $2 WHERE id = $3 RETURNING *",
-      [name.trim(), percentage || 0, id],
+      "UPDATE manufacturers SET name = $1, percentage = $2, discount_base = $3 WHERE id = $4 RETURNING *",
+      [name.trim(), percentage || 0, base, id],
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "المصنع غير موجود" });
@@ -7812,14 +7840,18 @@ app.get("/products/for-replace", async (req, res) => {
         p.wholesale_package,
         p.retail_package,
         p.manufacturer,
-        p.purchase_price AS wholesale_price,
+        p.purchase_price,
+        p.wholesale_price,
+        COALESCE(m.discount_base, 'purchase') AS discount_base,
         COALESCE(SUM(s.quantity), 0) AS available_quantity
       FROM products p
       LEFT JOIN stock s
         ON s.product_id = p.id
         AND s.warehouse_id = $1
+      LEFT JOIN manufacturers m
+        ON m.name = p.manufacturer
       WHERE p.is_active = true
-      GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price
+      GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price, p.wholesale_price, m.discount_base
       ORDER BY p.name
       `,
       [warehouse_id],
@@ -8028,10 +8060,7 @@ function isAdminUser(user) {
 }
 
 function canManageBranch(user, branchId) {
-  return (
-    isSuperAdmin(user) ||
-    (user?.role === "admin" && Number(user?.branch_id) === Number(branchId))
-  );
+  return isAdminUser(user);
 }
 
 async function loadCurrentUserAccess(req) {
@@ -10799,6 +10828,55 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
       )
     `);
     console.log("✅ push_subscriptions table ready");
+
+    // --- Branch Connections Schema ---
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS branch_connections (
+          id SERIAL PRIMARY KEY,
+          branch_name VARCHAR(255) NOT NULL,
+          remote_url VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log("✅ branch_connections table ready");
+
+    // --- Inter-Branch Transfer Portal Schema ---
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS inter_branch_transfers (
+        id SERIAL PRIMARY KEY,
+        transfer_uuid VARCHAR(255) NOT NULL UNIQUE,
+        direction VARCHAR(50) NOT NULL, -- 'inbound' or 'outbound'
+        status VARCHAR(50) NOT NULL, -- 'pending_dispatch', 'in_transit', 'received', 'cancelled', 'rejected'
+        remote_branch_url VARCHAR(255) NOT NULL,
+        total_value DECIMAL(12,2) DEFAULT 0.00,
+        total_cost DECIMAL(12,2) DEFAULT 0.00,
+        created_at TIMESTAMP DEFAULT NOW(),
+        dispatched_at TIMESTAMP,
+        received_at TIMESTAMP
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS inter_branch_transfer_items (
+        id SERIAL PRIMARY KEY,
+        transfer_id INTEGER NOT NULL REFERENCES inter_branch_transfers(id) ON DELETE CASCADE,
+        barcode VARCHAR(255),
+        product_name VARCHAR(255),
+        quantity DECIMAL(10,2) NOT NULL,
+        transfer_price DECIMAL(10,2) NOT NULL,
+        original_cost DECIMAL(10,2) NOT NULL
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS external_branches_ledger (
+        id SERIAL PRIMARY KEY,
+        remote_branch_url VARCHAR(255) NOT NULL,
+        transfer_id INTEGER REFERENCES inter_branch_transfers(id) ON DELETE SET NULL,
+        amount DECIMAL(12,2) NOT NULL, -- Positive = Credit (We are owed), Negative = Debit (We owe them)
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ Inter-Branch Portal tables ready");
   } catch (e) {
     console.error("❌ chat tables error:", e.message);
   }
