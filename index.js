@@ -10685,7 +10685,7 @@ app.get("/notifications", authMiddleware, async (req, res) => {
       FROM notifications n
       JOIN users u ON u.id = n.from_user_id
       WHERE n.to_branch_id = $1
-        AND u.branch_id != $1
+        AND (u.branch_id != $1 OR u.branch_id IS NULL)
     `;
     const values = [branch_id];
 
@@ -10712,7 +10712,7 @@ app.get("/notifications/unread-count", authMiddleware, async (req, res) => {
     const result = await pool.query(
       `SELECT COUNT(*) AS count FROM notifications n
        JOIN users u ON u.id = n.from_user_id
-       WHERE n.to_branch_id = $1 AND n.is_read = false AND u.branch_id != $1`,
+       WHERE n.to_branch_id = $1 AND n.is_read = false AND (u.branch_id != $1 OR u.branch_id IS NULL)`,
       [branch_id],
     );
     res.json({ success: true, count: parseInt(result.rows[0].count) });
