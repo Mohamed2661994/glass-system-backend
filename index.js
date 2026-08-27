@@ -11744,6 +11744,13 @@ async function runStartupMigrations() {
 }
 
 runStartupMigrations().finally(() => {
+  app.get("/debug-notifications-xyz", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT n.*, u.branch_id as sender_branch FROM notifications n JOIN users u ON u.id = n.from_user_id ORDER BY n.id DESC LIMIT 20");
+    res.json(result.rows);
+  } catch(e) { res.json({ error: e.message }); }
+});
+
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server + Socket running on port ${PORT}`);
   });
