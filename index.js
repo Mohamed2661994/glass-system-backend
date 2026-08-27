@@ -9165,8 +9165,8 @@ app.post(
           [req.user.id],
         );
         const senderName = senderRes.rows[0]?.full_name || "مستخدم";
-        const title = "تحويل مخزون جديد";
-        const message = `قام ${senderName} بتحويل ${items.length} صنف (جملة ← قطاعي) - رقم #${transferId}`;
+        const title = "تحويل بضاعة من المعرض";
+        const message = `قام ${senderName} بسحب ${items.length} صنف من المخزن — تحويل رقم #${transferId}`;
 
         await pool.query(
           `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
@@ -9175,21 +9175,21 @@ app.post(
             title,
             message,
             req.user.id,
-            to_branch_id,
+            from_branch_id,
             "stock_transfer",
             transferId,
           ],
         );
 
         const io = req.app.get("io");
-        io.to(`branch_${to_branch_id}`).emit("new_notification", {
+        io.to(`branch_${from_branch_id}`).emit("new_notification", {
           title,
           message,
           type: "stock_transfer",
           reference_id: transferId,
         });
 
-        sendPushToBranch(to_branch_id, title, message, {
+        sendPushToBranch(from_branch_id, title, message, {
           type: "stock_transfer",
           transfer_id: transferId,
         });

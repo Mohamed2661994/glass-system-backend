@@ -41,13 +41,13 @@ exports.getInventorySummary = async (req, res) => {
 
       COALESCE(SUM(
         CASE 
-          WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale')
+          WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in')
           THEN sm.quantity ELSE 0 END
       ), 0) AS total_in,
 
       COALESCE(SUM(
         CASE 
-          WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase')
+          WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out')
           THEN sm.quantity ELSE 0 END
       ), 0) AS total_out,
 
@@ -67,8 +67,8 @@ exports.getInventorySummary = async (req, res) => {
     GROUP BY p.id, p.name, p.manufacturer, w.name, p.wholesale_package, p.retail_package, s.quantity, s.variant_id
 
     HAVING 
-      COALESCE(SUM(CASE WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale') THEN sm.quantity ELSE 0 END),0) > 0
-      OR COALESCE(SUM(CASE WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase') THEN sm.quantity ELSE 0 END),0) > 0
+      COALESCE(SUM(CASE WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in') THEN sm.quantity ELSE 0 END),0) > 0
+      OR COALESCE(SUM(CASE WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out') THEN sm.quantity ELSE 0 END),0) > 0
       OR COALESCE(s.quantity,0) > 0
 
     ORDER BY p.name
@@ -1661,12 +1661,15 @@ exports.getManufacturerAnalytics = async (req, res) => {
           ELSE (COALESCE(iis.quantity, 0) * COALESCE(iis.price, 0)) END
         ) AS signed_gross_sales,
         SUM(
-          CASE WHEN COALESCE(iis.is_return, false)
-            THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.discount, 0))
-          ELSE (COALESCE(iis.quantity, 0) * COALESCE(iis.discount, 0)) END
+          CASE
+            WHEN COALESCE(iis.apply_items_discount, true) = false THEN 0
+            WHEN COALESCE(iis.is_return, false)
+              THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.discount, 0))
+            ELSE (COALESCE(iis.quantity, 0) * COALESCE(iis.discount, 0)) END
         ) AS signed_item_discounts,
         SUM(
-          CASE WHEN COALESCE(iis.is_return, false) THEN 0
+          CASE WHEN COALESCE(iis.is_return, false)
+            THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END))
           ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
         ) AS total_cost
       FROM invoice_items_scoped iis
@@ -1823,7 +1826,8 @@ exports.getManufacturerAnalytics = async (req, res) => {
           END
         ) AS sales_revenue,
         SUM(
-          CASE WHEN COALESCE(iis.is_return, false) THEN 0
+          CASE WHEN COALESCE(iis.is_return, false)
+            THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END))
           ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
         ) AS cost_of_goods
       FROM invoice_items_scoped iis
