@@ -9436,6 +9436,7 @@ app.get("/stock-transfers/:id", async (req, res) => {
   p.name AS product_name,
   sti.from_quantity,
   sti.to_quantity,
+  sti.total_price,
   w1.name AS from_warehouse,
   w2.name AS to_warehouse
 FROM stock_transfer_items sti
