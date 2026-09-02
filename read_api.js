@@ -1,0 +1,1 @@
+﻿const fs = require('fs'); const logPath = 'C:\\\\Users\\\\Khaled\\\\.gemini\\\\antigravity-ide\\\\brain\\\\9e587f53-4b8f-4fc0-ad3d-a5d6d1c5f2c2\\\\.system_generated\\\\tasks\\\\task-2908.log'; const lines = fs.readFileSync(logPath, 'utf8').split('\n'); for(let i=Math.max(0, lines.length-50); i<lines.length; i++) console.log(lines[i]);

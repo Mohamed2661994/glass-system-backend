@@ -1,0 +1,1 @@
+﻿const fs = require('fs'); const lines = fs.readFileSync('index.js', 'utf8').split('\n'); for(let i=0; i<lines.length; i++) { if(lines[i].includes('/users/:id/toggle-active')) console.log(i + ': ' + lines[i]); }

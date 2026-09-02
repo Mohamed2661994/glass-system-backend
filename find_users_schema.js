@@ -1,0 +1,1 @@
+﻿const fs = require('fs'); const content = fs.readFileSync('db.js', 'utf8'); const match = content.match(/CREATE TABLE IF NOT EXISTS users \([\s\S]*?\);/); if(match) { console.log(match[0]); } else { console.log('Not found'); }

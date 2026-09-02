@@ -5401,6 +5401,56 @@ ${items
   }
 });
 
+// Universal PDF Export Proxy
+app.post("/api/pdf-export", async (req, res) => {
+  const { url, token, userStr } = req.body;
+  if (!url) return res.status(400).send("URL is required");
+
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: "new",
+      executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+      ],
+    });
+
+    const page = await browser.newPage();
+    
+    // Set localStorage data on localhost:3000 domain before navigating to the actual print page
+    await page.goto("http://localhost:3000/offline"); 
+    await page.evaluate((t, u) => {
+      if (t) localStorage.setItem("token", t);
+      if (u) localStorage.setItem("user", u);
+    }, token, userStr);
+
+    const fullUrl = `http://localhost:3000${url}`;
+    await page.goto(fullUrl, { waitUntil: "networkidle0", timeout: 30000 });
+    
+    // Wait for the #print-ready element to ensure the data is loaded
+    await page.waitForSelector("#print-ready", { timeout: 15000 });
+
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+      margin: { top: '0', bottom: '0', left: '0', right: '0' },
+    });
+
+    await browser.close();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename=report.pdf`);
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error("PDF EXPORT ERROR >>>", err);
+    if (browser) await browser.close();
+    res.status(500).send(err.message);
+  }
+});
+
 // Endpoint لطباعة الفاتورة كصفحة HTML (المتصفح هو اللي بيطبع / يحفظ PDF)
 app.get("/invoices/:id/print", async (req, res) => {
   const invoiceId = req.params.id;

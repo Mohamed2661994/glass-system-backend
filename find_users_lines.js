@@ -1,0 +1,1 @@
+﻿const fs = require('fs'); const content = fs.readFileSync('db.js', 'utf8'); const lines = content.split('\n'); for(let i=0; i<lines.length; i++) { if(lines[i].includes('users')) console.log(i + ': ' + lines[i].trim()); }

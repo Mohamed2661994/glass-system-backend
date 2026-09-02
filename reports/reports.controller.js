@@ -1838,6 +1838,37 @@ exports.getManufacturerAnalytics = async (req, res) => {
 
     const timelineRes = await pool.query(timelineQuery, timelineValues);
 
+    const expensesConditions = [`entry_type = 'expense'`];
+    const expensesValues = [];
+    let eIdx = 1;
+    if (activeChartInvoiceType === 'retail') {
+      expensesConditions.push(`branch_id = $${eIdx++}`);
+      expensesValues.push(1);
+    } else if (activeChartInvoiceType === 'wholesale') {
+      expensesConditions.push(`branch_id = $${eIdx++}`);
+      expensesValues.push(2);
+    }
+    if (date_from) {
+      expensesConditions.push(`transaction_date >= $${eIdx++}::date`);
+      expensesValues.push(date_from);
+    }
+    if (date_to) {
+      expensesConditions.push(`transaction_date <= $${eIdx++}::date`);
+      expensesValues.push(date_to);
+    }
+
+    const expensesQuery = `
+      SELECT TO_CHAR(transaction_date, ${timeGroupFormat}) AS period, SUM(amount) AS total_expenses
+      FROM cash_out
+      WHERE ${expensesConditions.join(" AND ")}
+      GROUP BY period
+    `;
+    const expensesRes = await pool.query(expensesQuery, expensesValues);
+    const expensesMap = {};
+    expensesRes.rows.forEach(r => {
+      expensesMap[r.period] = Math.round(Number(r.total_expenses || 0) * 100) / 100;
+    });
+
     const timeline = timelineRes.rows.map(r => {
       const sales = Math.round(Number(r.sales_revenue || 0) * 100) / 100;
       const cost = Math.round(Number(r.cost_of_goods || 0) * 100) / 100;
@@ -1851,9 +1882,12 @@ exports.getManufacturerAnalytics = async (req, res) => {
 
     // 3.6 Fill missing periods with zeroes
     let filledTimeline = [];
-    if (timeline.length > 0 || (date_from && date_to)) {
-      let startDateStr = date_from ? String(date_from) : timeline[0].period;
-      let endDateStr = date_to ? String(date_to) : timeline[timeline.length - 1].period;
+    const allPeriods = [...timeline.map(t => t.period), ...Object.keys(expensesMap)];
+    allPeriods.sort();
+
+    if (allPeriods.length > 0 || (date_from && date_to)) {
+      let startDateStr = date_from ? String(date_from) : allPeriods[0];
+      let endDateStr = date_to ? String(date_to) : allPeriods[allPeriods.length - 1];
       
       const isDaily = timeGroupFormat === "'YYYY-MM-DD'";
       const isMonthly = timeGroupFormat === "'YYYY-MM'";
@@ -1887,14 +1921,19 @@ exports.getManufacturerAnalytics = async (req, res) => {
 
       let iterations = 0;
       while (currentPeriod <= endPeriod && iterations < 2000) {
+        const periodExpenses = expensesMap[currentPeriod] || 0;
         if (timelineMap[currentPeriod]) {
-          filledTimeline.push(timelineMap[currentPeriod]);
+          filledTimeline.push({
+            ...timelineMap[currentPeriod],
+            expenses: periodExpenses
+          });
         } else {
           filledTimeline.push({
             period: currentPeriod,
             sales: 0,
             cost: 0,
-            profit: 0
+            profit: 0,
+            expenses: periodExpenses
           });
         }
         currentPeriod = getNextPeriod(currentPeriod);
