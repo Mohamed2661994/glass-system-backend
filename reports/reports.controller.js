@@ -1215,6 +1215,168 @@ exports.getSupplierBalances = async (req, res) => {
   }
 };
 
+// ============================================================
+//  حساب مديونية المخزن (عام واحد: المعرض ↔ المخزن)
+//  balance_due = رصيد افتتاحي + Σ(قيمة التحويلات) − Σ(مدفوعات "سداد للمخزن")
+//  الرصيد الافتتاحي وتاريخ البداية مخزّنين في app_settings.
+// ============================================================
+const WAREHOUSE_DEBT_OPENING_BALANCE_KEY = "warehouse_debt_opening_balance";
+const WAREHOUSE_DEBT_OPENING_DATE_KEY = "warehouse_debt_opening_date";
+
+async function readWarehouseAccountSettings() {
+  const { rows } = await pool.query(
+    `SELECT key, value FROM app_settings WHERE key = ANY($1)`,
+    [[WAREHOUSE_DEBT_OPENING_BALANCE_KEY, WAREHOUSE_DEBT_OPENING_DATE_KEY]],
+  );
+  const map = {};
+  for (const r of rows) map[r.key] = r.value;
+  const opening_balance =
+    Number(map[WAREHOUSE_DEBT_OPENING_BALANCE_KEY] || 0) || 0;
+  const opening_date = map[WAREHOUSE_DEBT_OPENING_DATE_KEY] || null; // YYYY-MM-DD أو null
+  return { opening_balance, opening_date };
+}
+
+exports.getWarehouseAccount = async (req, res) => {
+  try {
+    const { opening_balance, opening_date } = await readWarehouseAccountSettings();
+
+    // لو فيه تاريخ بداية: نحسب التحويلات/المدفوعات من التاريخ ده فصاعدًا فقط
+    const transferDateCond = opening_date
+      ? `AND (st.created_at AT TIME ZONE 'Africa/Cairo')::date >= $1::date`
+      : ``;
+    const payDateCond = opening_date ? `AND co.transaction_date >= $1::date` : ``;
+    const params = opening_date ? [opening_date] : [];
+
+    // التحويلات (مدين) — قيمة البضاعة المسحوبة، باستثناء الملغيّة
+    const transfersRes = await pool.query(
+      `
+      SELECT
+        st.id                                             AS transfer_id,
+        (st.created_at AT TIME ZONE 'Africa/Cairo')::date AS date,
+        st.note                                           AS note,
+        COALESCE(SUM(sti.total_price), 0)                 AS amount
+      FROM stock_transfer_items sti
+      JOIN stock_transfers st ON st.id = sti.transfer_id
+      WHERE st.status IS DISTINCT FROM 'cancelled'
+        AND sti.status IS DISTINCT FROM 'cancelled'
+        ${transferDateCond}
+      GROUP BY st.id, st.created_at, st.note
+      ORDER BY st.created_at ASC, st.id ASC
+      `,
+      params,
+    );
+
+    // المدفوعات (دائن) — قيود "سداد للمخزن" من أي فرع
+    const paymentsRes = await pool.query(
+      `
+      SELECT
+        co.id,
+        to_char(co.transaction_date, 'YYYY-MM-DD') AS date,
+        co.permission_number,
+        co.name,
+        co.notes,
+        co.branch_id,
+        co.amount
+      FROM cash_out co
+      WHERE co.entry_type = 'warehouse_settlement'
+        ${payDateCond}
+      ORDER BY co.transaction_date ASC, co.id ASC
+      `,
+      params,
+    );
+
+    const transfers_total = transfersRes.rows.reduce(
+      (s, r) => s + Number(r.amount || 0),
+      0,
+    );
+    const payments_total = paymentsRes.rows.reduce(
+      (s, r) => s + Number(r.amount || 0),
+      0,
+    );
+    const balance_due = opening_balance + transfers_total - payments_total;
+
+    // كشف حساب موحّد مرتّب بالتاريخ (التحويلات مدين، المدفوعات دائن)
+    const ledger = [
+      ...transfersRes.rows.map((r) => ({
+        kind: "debit",
+        date: r.date,
+        ref: `تحويل #${r.transfer_id}`,
+        transfer_id: r.transfer_id,
+        note: r.note || null,
+        amount: Number(r.amount || 0),
+      })),
+      ...paymentsRes.rows.map((r) => ({
+        kind: "credit",
+        date: r.date,
+        ref: r.permission_number ? `إذن ${r.permission_number}` : `سداد #${r.id}`,
+        cash_out_id: r.id,
+        name: r.name || null,
+        note: r.notes || null,
+        branch_id: r.branch_id,
+        amount: Number(r.amount || 0),
+      })),
+    ].sort((a, b) => {
+      const da = new Date(a.date).getTime();
+      const db = new Date(b.date).getTime();
+      if (da !== db) return da - db;
+      if (a.kind === b.kind) return 0;
+      return a.kind === "debit" ? -1 : 1; // التحويل قبل السداد في نفس اليوم
+    });
+
+    res.json({
+      opening_balance,
+      opening_date,
+      transfers_total,
+      payments_total,
+      balance_due,
+      ledger,
+    });
+  } catch (err) {
+    console.error("WAREHOUSE ACCOUNT ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
+
+exports.setWarehouseAccountOpening = async (req, res) => {
+  try {
+    const { opening_balance, opening_date } = req.body || {};
+
+    const balanceNum = Number(opening_balance);
+    if (!Number.isFinite(balanceNum)) {
+      return res.status(400).json({ error: "الرصيد الافتتاحي غير صحيح" });
+    }
+    if (opening_date && !/^\d{4}-\d{2}-\d{2}$/.test(String(opening_date))) {
+      return res.status(400).json({ error: "تاريخ البداية غير صحيح" });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+      `,
+      [WAREHOUSE_DEBT_OPENING_BALANCE_KEY, String(balanceNum)],
+    );
+    await pool.query(
+      `
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+      `,
+      [WAREHOUSE_DEBT_OPENING_DATE_KEY, opening_date ? String(opening_date) : null],
+    );
+
+    res.json({
+      success: true,
+      opening_balance: balanceNum,
+      opening_date: opening_date || null,
+    });
+  } catch (err) {
+    console.error("SET WAREHOUSE OPENING ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
+
 exports.getSupplierDebtDetails = async (req, res) => {
   try {
     const { supplier_id, from, to, warehouse_id } = req.query;

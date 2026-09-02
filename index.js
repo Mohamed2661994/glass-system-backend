@@ -7,6 +7,20 @@ const fs = require("fs");
 const crypto = require("crypto");
 const multer = require("multer");
 const puppeteer = require("puppeteer");
+let chromium;
+try {
+  chromium = require("@sparticuz/chromium");
+} catch (e) {}
+
+const launchPuppeteer = async () => {
+  const isWin = process.platform === "win32";
+  return await puppeteer.launch({
+    args: isWin ? ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] : chromium.args,
+    defaultViewport: isWin ? null : chromium.defaultViewport,
+    executablePath: isWin ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : await chromium.executablePath(),
+    headless: isWin ? "new" : chromium.headless,
+  });
+};
 const webPush = require("web-push");
 
 // VAPID keys for Web Push
@@ -5369,14 +5383,7 @@ ${items
     /* =========================
        4) Puppeteer → PDF
     ========================= */
-    const browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-      ],
-    });
+    const browser = await launchPuppeteer();
 
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "load" });
@@ -5408,15 +5415,7 @@ app.post("/api/pdf-export", async (req, res) => {
 
   let browser;
   try {
-    browser = await puppeteer.launch({
-      headless: "new",
-      executablePath: process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : undefined,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-      ],
-    });
+    browser = await launchPuppeteer();
 
     const page = await browser.newPage();
     
@@ -8198,7 +8197,8 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
     const safeEntryType =
       entry_type === "purchase" ||
       entry_type === "expense" ||
-      entry_type === "supplier_payment"
+      entry_type === "supplier_payment" ||
+      entry_type === "warehouse_settlement"
         ? entry_type
         : "expense";
 
@@ -8268,7 +8268,8 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
     const safeEntryType =
       entry_type === "purchase" ||
       entry_type === "expense" ||
-      entry_type === "supplier_payment"
+      entry_type === "supplier_payment" ||
+      entry_type === "warehouse_settlement"
         ? entry_type
         : "expense";
 
@@ -10927,6 +10928,16 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
       )
     `);
     console.log("✅ Inter-Branch Portal tables ready");
+
+    // --- App settings (key/value) — يُستخدم للرصيد الافتتاحي لمديونية المخزن ---
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key        VARCHAR(100) PRIMARY KEY,
+        value      TEXT,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ app_settings table ready");
   } catch (e) {
     console.error("❌ chat tables error:", e.message);
   }

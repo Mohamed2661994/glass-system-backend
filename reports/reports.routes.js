@@ -17,6 +17,8 @@ router.get("/manufacturers", reports.getManufacturers);
 router.get("/customer-debt-details", reports.getCustomerDebtDetails);
 router.get("/supplier-balances", reports.getSupplierBalances);
 router.get("/supplier-debt-details", reports.getSupplierDebtDetails);
+router.get("/warehouse-account", reports.getWarehouseAccount);
+router.put("/warehouse-account/opening", reports.setWarehouseAccountOpening);
 router.get("/product-sales-profit", reports.getProductSalesProfit);
 router.get("/invoice-sales-profit", reports.getInvoiceSalesProfit);
 router.get("/manufacturer-analytics", reports.getManufacturerAnalytics);
