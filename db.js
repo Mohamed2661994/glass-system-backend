@@ -10,7 +10,7 @@ require("dotenv").config();
    ══════════════════════════════════════════════════════════ */
 
 /* ── Pool configuration ── */
-const POOL_OPTS = { connectionTimeoutMillis: 5000, query_timeout: 10000, max: 10 };
+const POOL_OPTS = { connectionTimeoutMillis: 10000, query_timeout: 60000, max: 30, idleTimeoutMillis: 15000 };
 
 function parseBooleanEnv(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
