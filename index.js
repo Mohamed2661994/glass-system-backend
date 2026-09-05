@@ -2703,7 +2703,7 @@ app.get("/customers/by-phone", async (req, res) => {
 // List all customers with phones
 app.get("/customers", async (req, res) => {
   try {
-    await ensureCustomersMarketColumn();
+    
     const { search, market_only } = req.query;
     let query = `
       SELECT c.id, c.name, c.apply_items_discount,
@@ -2742,7 +2742,7 @@ app.get("/customers", async (req, res) => {
 // Update customer name
 app.put("/customers/:id", async (req, res) => {
   try {
-    await ensureCustomersMarketColumn();
+    
     const { id } = req.params;
     const { name, is_market_customer } = req.body;
     const updates = [];
@@ -8113,7 +8113,7 @@ function canManageBranch(user, branchId) {
 }
 
 async function loadCurrentUserAccess(req) {
-  await ensureUsersAccessControlColumns();
+  
 
   const result = await pool.query(
     `
@@ -10562,7 +10562,7 @@ const jwt = require("jsonwebtoken");
 
 app.post("/login", async (req, res) => {
   try {
-    await ensureUsersAccessControlColumns();
+    
 
     const { username, password } = req.body;
 
