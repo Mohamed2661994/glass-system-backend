@@ -7891,7 +7891,7 @@ app.get("/products/for-replace", async (req, res) => {
         p.manufacturer,
         p.purchase_price,
         p.wholesale_price,
-        COALESCE(m.discount_base, 'purchase') AS discount_base,
+        'purchase' AS discount_base,
         COALESCE(SUM(s.quantity), 0) AS available_quantity
       FROM products p
       LEFT JOIN stock s
@@ -7900,7 +7900,7 @@ app.get("/products/for-replace", async (req, res) => {
       LEFT JOIN manufacturers m
         ON m.name = p.manufacturer
       WHERE p.is_active = true
-      GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price, p.wholesale_price, m.discount_base
+      GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price, p.wholesale_price
       ORDER BY p.name
       `,
       [warehouse_id],
