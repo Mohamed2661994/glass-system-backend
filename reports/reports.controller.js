@@ -1,23 +1,8 @@
 const pool = require("../db");
 
-let ensureInvoiceItemsCostPriceColumnPromise = null;
-
 async function ensureInvoiceItemsCostPriceColumn() {
-  if (!ensureInvoiceItemsCostPriceColumnPromise) {
-    ensureInvoiceItemsCostPriceColumnPromise = pool
-      .query(
-        `
-        ALTER TABLE invoice_items
-        ADD COLUMN IF NOT EXISTS cost_price NUMERIC
-        `,
-      )
-      .catch((error) => {
-        ensureInvoiceItemsCostPriceColumnPromise = null;
-        throw error;
-      });
-  }
-
-  return ensureInvoiceItemsCostPriceColumnPromise;
+  // Column cost_price already exists in schema - avoid unnecessary DDL locks/permission errors
+  return;
 }
 
 /* ===============================
