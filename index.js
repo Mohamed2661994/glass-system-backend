@@ -1,6 +1,13 @@
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("⚠️ Unhandled Rejection (handled):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ Uncaught Exception (handled):", err.message || err);
+});
 const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");

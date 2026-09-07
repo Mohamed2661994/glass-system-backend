@@ -9,8 +9,15 @@ require("dotenv").config();
    ── Multi-master with automatic failover & bi-directional sync
    ══════════════════════════════════════════════════════════ */
 
-/* ── Pool configuration ── */
-const POOL_OPTS = { connectionTimeoutMillis: 10000, query_timeout: 60000, max: 30, idleTimeoutMillis: 15000 };
+/* ─── Pool configuration ─── */
+const POOL_OPTS = {
+  connectionTimeoutMillis: 10000,
+  query_timeout: 60000,
+  max: 30,
+  idleTimeoutMillis: 30000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
+};
 
 function parseBooleanEnv(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
@@ -83,9 +90,16 @@ const dbConnectionConfig = process.env.DATABASE_URL
 
 const primaryPool = new Pool(dbConnectionConfig);
 
-primaryPool.on("connect", (c) => c.query("SET timezone = 'Africa/Cairo'"));
+primaryPool.on("connect", (client) => {
+  client.on("error", (err) => {
+    console.error("⚠️ PostgreSQL Client socket error (handled):", err.message);
+  });
+  client.query("SET timezone = 'Africa/Cairo'").catch((err) => {
+    console.error("Failed to set timezone on client:", err.message);
+  });
+});
 primaryPool.on("error", (err) =>
-  console.error("⚠️  Database pool error:", err.message),
+  console.error("⚠️  Database pool error (handled):", err.message),
 );
 
 // Backward compatibility references for codebase
