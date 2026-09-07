@@ -52,55 +52,65 @@ const PUBLIC_WEBHOOK_CONFIG = Object.freeze({
   ),
 });
 
-const localPool = new Pool({
-  host: process.env.DB_HOST_LOCAL,
-  port: Number(process.env.DB_PORT_LOCAL || 5432),
-  user: process.env.DB_USER_LOCAL,
-  password: process.env.DB_PASSWORD_LOCAL,
-  database: process.env.DB_NAME_LOCAL,
-  ssl:
-    process.env.DB_SSL_LOCAL === "true" ? { rejectUnauthorized: false } : false,
-  ...POOL_OPTS,
-});
+const dbConnectionConfig = process.env.DATABASE_URL
+  ? {
+      connectionString: process.env.DATABASE_URL,
+      ssl:
+        process.env.DB_SSL === "true" || process.env.DB_SSL_LOCAL === "true"
+          ? { rejectUnauthorized: false }
+          : false,
+      ...POOL_OPTS,
+    }
+  : {
+      host:
+        process.env.DB_HOST ||
+        process.env.DB_HOST_LOCAL ||
+        "db.hg-alshour.online",
+      port: Number(process.env.DB_PORT || process.env.DB_PORT_LOCAL || 5432),
+      user: process.env.DB_USER || process.env.DB_USER_LOCAL || "glass_backend",
+      password:
+        process.env.DB_PASSWORD ||
+        process.env.DB_PASSWORD_LOCAL ||
+        "SecGlass_2026_Postgres_HA",
+      database:
+        process.env.DB_NAME || process.env.DB_NAME_LOCAL || "glass_system",
+      ssl:
+        process.env.DB_SSL === "true" || process.env.DB_SSL_LOCAL === "true"
+          ? { rejectUnauthorized: false }
+          : false,
+      ...POOL_OPTS,
+    };
 
-const cloudPool = new Pool({
-  host: process.env.DB_HOST_CLOUD,
-  port: Number(process.env.DB_PORT_CLOUD || 5432),
-  user: process.env.DB_USER_CLOUD,
-  password: process.env.DB_PASSWORD_CLOUD,
-  database: process.env.DB_NAME_CLOUD,
-  ssl:
-    process.env.DB_SSL_CLOUD === "true" ? { rejectUnauthorized: false } : false,
-  ...POOL_OPTS,
-});
+const primaryPool = new Pool(dbConnectionConfig);
 
-/* ── Set timezone on every new connection ── */
-localPool.on("connect", (c) => c.query("SET timezone = 'Africa/Cairo'"));
-cloudPool.on("connect", (c) => c.query("SET timezone = 'Africa/Cairo'"));
-
-/* ── Prevent crashes from idle-client errors ── */
-localPool.on("error", (err) =>
-  console.error("⚠️  Local pool error:", err.message),
+primaryPool.on("connect", (c) => c.query("SET timezone = 'Africa/Cairo'"));
+primaryPool.on("error", (err) =>
+  console.error("⚠️  Database pool error:", err.message),
 );
-cloudPool.on("error", (err) =>
-  console.error("⚠️  Cloud pool error:", err.message),
-);
+
+// Backward compatibility references for codebase
+const localPool = primaryPool;
+const cloudPool = primaryPool;
 
 /* ── State tracking ── */
 const state = {
-  activeDb: "local", // "local" | "cloud"
+  activeDb: "primary", // Single HA Endpoint managed by Data Studio
   localAlive: true,
   cloudAlive: true,
-  lastSyncTime: null, // ISO string
+  lastSyncTime: new Date().toISOString(),
   syncInProgress: false,
-  lastSyncResult: null, // { ok, synced, errors, duration, time }
-  failoverHistory: [], // [{ from, to, time, reason }]
-  manualLock: false, // true = manual switch, prevents auto-failback
-  manualLockTime: null, // timestamp when manual lock was set (for 1-hour timeout)
-  periodicSyncIntervalMs: 15 * 60 * 1000,
-  nextPeriodicSyncAt: null, // ISO string
-  lastRealtimeSyncAt: null, // ISO string
-  syncLogs: [], // recent sync attempts
+  lastSyncResult: {
+    ok: true,
+    synced: 0,
+    message: "Data Studio High Availability Cluster active",
+  },
+  failoverHistory: [],
+  manualLock: false,
+  manualLockTime: null,
+  periodicSyncIntervalMs: 0,
+  nextPeriodicSyncAt: null,
+  lastRealtimeSyncAt: null,
+  syncLogs: [],
   publicWebhook: {
     captureEnabled: PUBLIC_WEBHOOK_CONFIG.captureEnabled,
     deliveryEnabled: Boolean(
@@ -1218,7 +1228,8 @@ async function enqueueInvoiceAggregateSync(
   invoiceId,
   operation = "upsert",
 ) {
-  return enqueueSyncOutbox(target, "invoice", invoiceId, operation);
+  // Data Studio HA cluster handles replication natively
+  return;
 }
 
 async function replaceInvoiceScopedRows(targetClient, meta, invoiceId, rows) {
@@ -1515,40 +1526,14 @@ async function processSyncOutbox(sourcePool, targetPool, label) {
 }
 
 function scheduleRealtimeSync(reason = "write") {
-  realtimeSyncRequested = true;
-  if (realtimeSyncTimer) return;
-
-  realtimeSyncTimer = setTimeout(async () => {
-    realtimeSyncTimer = null;
-    if (!realtimeSyncRequested) return;
-    realtimeSyncRequested = false;
-
-    if (!state.localAlive || !state.cloudAlive) {
-      return;
-    }
-
-    try {
-      const details = consumeRealtimeOperations();
-      await syncBetweenPools({
-        trigger: "realtime",
-        reason,
-        details,
-        selectiveOnly: true,
-      });
-    } catch (err) {
-      console.error(`⚠️  Realtime sync error (${reason}):`, err.message);
-    }
-
-    if (realtimeSyncRequested) {
-      scheduleRealtimeSync("queued");
-    }
-  }, 1200);
+  // Unified Data Studio HA Cluster handles replication natively
 }
 
 /* ── Health check helpers ── */
-async function checkPool(pool, label) {
+async function checkPool(poolInstance, label = "DataStudio DB") {
   try {
-    const client = await pool.connect();
+    const targetPool = poolInstance || primaryPool;
+    const client = await targetPool.connect();
     await client.query("SELECT 1");
     client.release();
     return true;
@@ -1558,89 +1543,20 @@ async function checkPool(pool, label) {
   }
 }
 
-/* ── Periodic health checks (every 15s) ── */
-setInterval(async () => {
-  const wasLocalAlive = state.localAlive;
-  const wasCloudAlive = state.cloudAlive;
-
-  state.localAlive = await checkPool(localPool, "Local");
-  state.cloudAlive = await checkPool(cloudPool, "Cloud");
-
-  // Auto-failover: local dies → switch to cloud (even if manualLock)
-  if (state.activeDb === "local" && !state.localAlive && state.cloudAlive) {
-    state.activeDb = "cloud";
-    state.manualLock = false; // auto-failover clears manual lock
-    const record = {
-      from: "local",
-      to: "cloud",
-      time: new Date().toISOString(),
-      reason: "Local DB unreachable",
-    };
-    state.failoverHistory.push(record);
-    console.log("🔄 FAILOVER: local → cloud", record);
-  }
-
-  // Auto-failback: local recovered → sync first, then switch back
-  // Skip if manualLock is active AND less than 1 hour old (allow override after timeout)
-  const manualLockExpired =
-    state.manualLockTime && Date.now() - state.manualLockTime > 60 * 60 * 1000; // 1 hour timeout
-
-  if (
-    state.activeDb === "cloud" &&
-    state.localAlive &&
-    (!state.manualLock || manualLockExpired)
-  ) {
-    if (manualLockExpired) {
-      console.log("🔓 Manual lock expired — enabling auto-failback");
-      state.manualLock = false;
-    }
-
-    console.log(
-      "🔄 Local DB recovered — syncing cloud → local before failback...",
-    );
-    // Sync cloud data to local BEFORE switching back
-    try {
-      const syncResult = await syncBetweenPools({
-        trigger: "failback",
-        reason: "pre-failback",
-      });
-      if (!syncResult?.ok) {
-        console.log(
-          "⏳ Failback skipped: pre-failback sync not successful (staying on cloud)",
-          syncResult,
-        );
-      } else {
-        console.log("✅ Pre-failback sync complete");
-        state.activeDb = "local";
-        state.manualLock = false; // Clear manual lock after successful failback
-        state.manualLockTime = null;
-        const record = {
-          from: "cloud",
-          to: "local",
-          time: new Date().toISOString(),
-          reason: "Local DB recovered (synced before switch)",
-        };
-        state.failoverHistory.push(record);
-        console.log("🔄 FAILBACK: cloud → local", record);
-      }
-    } catch (err) {
-      console.error(
-        "⚠️  Pre-failback sync error (staying on cloud):",
-        err.message,
-      );
-    }
-  }
-
-  // Log state changes
-  if (wasLocalAlive !== state.localAlive)
-    console.log(`📡 Local DB: ${state.localAlive ? "UP ✅" : "DOWN ❌"}`);
-  if (wasCloudAlive !== state.cloudAlive)
-    console.log(`☁️  Cloud DB: ${state.cloudAlive ? "UP ✅" : "DOWN ❌"}`);
-}, 15000);
+/* ── Periodic health checks (every 30s) ── */
+const healthCheckInterval = setInterval(async () => {
+  if (primaryPool.ending || primaryPool.ended) return;
+  const alive = await checkPool(primaryPool, "DataStudio DB");
+  state.localAlive = alive;
+  state.cloudAlive = alive;
+}, 30000);
+if (typeof healthCheckInterval.unref === "function") {
+  healthCheckInterval.unref();
+}
 
 /* ── Get the active pool ── */
 function getActivePool() {
-  return state.activeDb === "local" ? localPool : cloudPool;
+  return primaryPool;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1967,232 +1883,17 @@ async function syncOperationDetail(detail, sourcePool, targetPool) {
 }
 
 async function syncBetweenPools(options = {}) {
-  const trigger = options.trigger || "manual";
-  const reason = options.reason || null;
-  const details = Array.isArray(options.details) ? options.details : [];
-  const selectiveOnly = Boolean(options.selectiveOnly);
-
-  if (state.syncInProgress) {
-    console.log("⏳ Sync already in progress, waiting...");
-    // Wait for current sync to finish and return its result
-    return new Promise((resolve) => {
-      const check = setInterval(() => {
-        if (!state.syncInProgress) {
-          clearInterval(check);
-          resolve(
-            state.lastSyncResult || {
-              ok: true,
-              message: "المزامنة السابقة انتهت",
-            },
-          );
-        }
-      }, 1000);
-      // Timeout after 2 minutes
-      setTimeout(() => {
-        clearInterval(check);
-        resolve({ ok: false, message: "انتهت مهلة الانتظار" });
-      }, 120000);
-    });
-  }
-  if (!state.localAlive || !state.cloudAlive) {
-    console.log("⚠️  Cannot sync — one or both DBs unreachable");
-    const result = { ok: false, message: "أحد قواعد البيانات غير متصل" };
-    pushSyncLog({
-      time: new Date().toISOString(),
-      trigger,
-      reason,
-      ok: false,
-      synced: 0,
-      errors: 1,
-      duration: "0.0s",
-      message: buildSyncMessage(false, details, result.message),
-      details,
-    });
-    return result;
-  }
-
-  state.syncInProgress = true;
-  const startTime = Date.now();
-  let totalSynced = 0;
-  let totalErrors = 0;
-  const errorDetails = [];
-
-  console.log("🔄 Starting bi-directional sync...");
-
-  try {
-    try {
-      const localToCloudOutbox = await processSyncOutbox(
-        localPool,
-        cloudPool,
-        "Local→Cloud",
-      );
-      const cloudToLocalOutbox = await processSyncOutbox(
-        cloudPool,
-        localPool,
-        "Cloud→Local",
-      );
-      totalSynced += localToCloudOutbox + cloudToLocalOutbox;
-    } catch (err) {
-      totalErrors++;
-      errorDetails.push(`outbox: ${err.message}`);
-      console.error("❌ Outbox sync error:", err.message);
-    }
-
-    if (trigger === "realtime" && selectiveOnly) {
-      const sourcePool = getActivePool();
-      const targetPool = getRealtimeTargetPool();
-      const sinceIso =
-        state.lastRealtimeSyncAt ||
-        new Date(Date.now() - 15 * 60 * 1000).toISOString();
-      const nowIso = new Date().toISOString();
-
-      try {
-        const deleted = await syncDeletions();
-        totalSynced += deleted;
-        if (deleted > 0) console.log(`  🗑️  ${deleted} deletions propagated`);
-      } catch (err) {
-        totalErrors++;
-        errorDetails.push(`deletions: ${err.message}`);
-        console.error("❌ Deletion sync error:", err.message);
-      }
-
-      const fallbackTables = new Set();
-      for (const detail of details) {
-        if (!detail?.table || !SYNC_TABLES_MAP.has(detail.table)) continue;
-        try {
-          const result = await syncOperationDetail(
-            detail,
-            sourcePool,
-            targetPool,
-          );
-          totalSynced += result.synced;
-          if (!result.handled) fallbackTables.add(detail.table);
-        } catch (err) {
-          totalErrors++;
-          errorDetails.push(`${detail.table}: ${err.message}`);
-          console.error(
-            `❌ Realtime selective sync error for ${detail.table}:`,
-            err.message,
-          );
-        }
-      }
-
-      for (const table of fallbackTables) {
-        try {
-          const synced = await syncRecentRowsForTable(
-            table,
-            sinceIso,
-            sourcePool,
-            targetPool,
-          );
-          totalSynced += synced;
-        } catch (err) {
-          totalErrors++;
-          errorDetails.push(`${table}: ${err.message}`);
-          console.error(
-            `❌ Realtime recent sync error for ${table}:`,
-            err.message,
-          );
-        }
-      }
-
-      state.lastRealtimeSyncAt = nowIso;
-
-      // ── Sync sequences: ensure both DBs have sequences >= max(id) ──
-      try {
-        await syncSequences();
-      } catch (err) {
-        console.error("⚠️  Sequence sync error during realtime sync:", err.message);
-        errorDetails.push(`sequences: ${err.message}`);
-      }
-    } else {
-      // ── Step 1: Process deletions FIRST (before row sync re-inserts them) ──
-      try {
-        const deleted = await syncDeletions();
-        totalSynced += deleted;
-        if (deleted > 0) console.log(`  🗑️  ${deleted} deletions propagated`);
-      } catch (err) {
-        totalErrors++;
-        errorDetails.push(`deletions: ${err.message}`);
-        console.error("❌ Deletion sync error:", err.message);
-      }
-
-      // ── Step 2: Sync rows (bi-directional) ──
-      for (const { table, pk } of SYNC_TABLES) {
-        try {
-          const synced = await syncTable(table, pk);
-          totalSynced += synced;
-        } catch (err) {
-          totalErrors++;
-          errorDetails.push(`${table}: ${err.message}`);
-          console.error(`❌ Sync error for ${table}:`, err.message);
-        }
-      }
-
-      // ── Sync sequences: ensure both DBs have sequences >= max(id) ──
-      try {
-        await syncSequences();
-      } catch (err) {
-        console.error("⚠️  Sequence sync error:", err.message);
-        errorDetails.push(`sequences: ${err.message}`);
-      }
-    }
-
-    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    state.lastSyncTime = new Date().toISOString();
-    state.lastSyncResult = {
-      ok: totalErrors === 0,
-      synced: totalSynced,
-      errors: totalErrors,
-      errorDetails: errorDetails.length ? errorDetails : undefined,
-      duration: `${duration}s`,
-      time: state.lastSyncTime,
-    };
-
-    pushSyncLog({
-      time: state.lastSyncTime,
-      trigger,
-      reason,
-      ok: state.lastSyncResult.ok,
-      synced: totalSynced,
-      errors: totalErrors,
-      duration: `${duration}s`,
-      message: buildSyncMessage(
-        totalErrors === 0,
-        details,
-        totalErrors > 0 ? "انتهت مع أخطاء" : "تمت المزامنة بنجاح",
-      ),
-      details,
-    });
-
-    console.log(
-      `✅ Sync complete: ${totalSynced} rows synced, ${totalErrors} errors, ${duration}s`,
-    );
-    return state.lastSyncResult;
-  } catch (err) {
-    console.error("❌ Sync failed:", err.message);
-    state.lastSyncResult = {
-      ok: false,
-      message: err.message,
-      time: new Date().toISOString(),
-    };
-
-    pushSyncLog({
-      time: state.lastSyncResult.time,
-      trigger,
-      reason,
-      ok: false,
-      synced: 0,
-      errors: 1,
-      duration: "0.0s",
-      message: buildSyncMessage(false, details, err.message),
-      details,
-    });
-
-    return state.lastSyncResult;
-  } finally {
-    state.syncInProgress = false;
-  }
+  const result = {
+    ok: true,
+    synced: 0,
+    errors: 0,
+    duration: "0.0s",
+    time: new Date().toISOString(),
+    message: "قاعدة البيانات موحدة عبر خادم Data Studio HA Cluster (المزامنة تدار تلقائياً عبر السيرفر)",
+  };
+  state.lastSyncResult = result;
+  state.lastSyncTime = result.time;
+  return result;
 }
 
 async function syncTable(table, pk) {
@@ -3332,107 +3033,32 @@ async function runPeriodicSyncTick() {
 }
 
 function startPeriodicSync() {
-  state.periodicSyncIntervalMs = PERIODIC_SYNC_INTERVAL_MS;
-  state.nextPeriodicSyncAt = new Date(
-    Date.now() + PERIODIC_SYNC_INTERVAL_MS,
-  ).toISOString();
-
-  syncInterval = setInterval(runPeriodicSyncTick, PERIODIC_SYNC_INTERVAL_MS);
+  // Bi-directional sync disabled: unified on Data Studio HA Cluster
 }
-ensureSyncSchema().finally(() => {
-  startPeriodicSync();
-  startPublicWebhookDelivery();
-});
+
+// Start background services
+startPublicWebhookDelivery();
 
 /* ── Exports ── */
-// Default export is a Proxy that routes queries to the active pool
-const pool = new Proxy(localPool, {
-  get(target, prop) {
-    const activePool = getActivePool();
-    if (prop === "query") {
-      return async (...args) => {
-        const sql = extractSqlText(args);
-        const result = await activePool.query(...args);
-        if (isMutatingQuery(sql)) {
-          const params = Array.isArray(args?.[1]) ? args[1] : args?.[0]?.values;
-          const op = parseOperationInfo(sql, params, result);
-          pushRealtimeOperation(op);
-          scheduleRealtimeSync("pool.query");
-        }
-        return result;
-      };
-    }
-    if (prop === "connect") {
-      return async (...args) => {
-        const client = await activePool.connect(...args);
-        const txState = { active: false, ops: [] };
-        return new Proxy(client, {
-          get(cTarget, cProp) {
-            if (cProp === "query") {
-              return async (...qArgs) => {
-                const sql = extractSqlText(qArgs);
-                const txControl = getTransactionControl(sql);
+const pool = primaryPool;
 
-                if (txControl === "begin") {
-                  const result = await cTarget.query(...qArgs);
-                  txState.active = true;
-                  txState.ops = [];
-                  return result;
-                }
-
-                if (txControl === "rollback") {
-                  try {
-                    return await cTarget.query(...qArgs);
-                  } finally {
-                    txState.active = false;
-                    txState.ops = [];
-                  }
-                }
-
-                if (txControl === "commit") {
-                  const result = await cTarget.query(...qArgs);
-                  const committedOps = txState.ops;
-                  txState.active = false;
-                  txState.ops = [];
-                  if (committedOps.length > 0) {
-                    pushRealtimeOperations(committedOps);
-                    scheduleRealtimeSync("client.commit");
-                  }
-                  return result;
-                }
-
-                const result = await cTarget.query(...qArgs);
-                if (isMutatingQuery(sql)) {
-                  const params = Array.isArray(qArgs?.[1])
-                    ? qArgs[1]
-                    : qArgs?.[0]?.values;
-                  const op = parseOperationInfo(sql, params, result);
-                  if (txState.active) {
-                    if (op) {
-                      txState.ops.push(op);
-                    }
-                  } else {
-                    pushRealtimeOperation(op);
-                    scheduleRealtimeSync("client.query");
-                  }
-                }
-                return result;
-              };
-            }
-            const cVal = cTarget[cProp];
-            return typeof cVal === "function" ? cVal.bind(cTarget) : cVal;
-          },
-        });
-      };
-    }
-    const val = activePool[prop];
-    return typeof val === "function" ? val.bind(activePool) : val;
-  },
-});
+pool.localPool = primaryPool;
+pool.cloudPool = primaryPool;
+pool.dbState = state;
+pool.syncBetweenPools = syncBetweenPools;
+pool.checkPool = checkPool;
+pool.getActivePool = getActivePool;
+pool.getSyncLogs = getSyncLogs;
+pool.enqueueInvoiceAggregateSync = enqueueInvoiceAggregateSync;
+pool.enqueuePublicWebhookDelivery = enqueuePublicWebhookDelivery;
+pool.queuePublicWebhookTestEvent = queuePublicWebhookTestEvent;
+pool.replayPublicWebhookDelivery = replayPublicWebhookDelivery;
+pool.arePublicWebhookTestRoutesEnabled = arePublicWebhookTestRoutesEnabled;
+pool.publicWebhookConfig = PUBLIC_WEBHOOK_CONFIG;
 
 module.exports = pool;
-module.exports.localPool = localPool;
-module.exports.cloudPool = cloudPool;
+module.exports.localPool = primaryPool;
+module.exports.cloudPool = primaryPool;
 module.exports.dbState = state;
 module.exports.syncBetweenPools = syncBetweenPools;
 module.exports.checkPool = checkPool;
