@@ -58,6 +58,7 @@ const STARTUP_DB_TARGETS = [
 ];
 
 async function runStartupSqlOnAllPools(label, sql) {
+  if (process.env.ENABLE_STARTUP_MIGRATIONS !== 'true') return;
   await Promise.allSettled(
     STARTUP_DB_TARGETS.map(async ([targetPool, targetLabel]) => {
       await targetPool.query(sql);
@@ -1052,6 +1053,7 @@ app.get("/", (req, res) => {
   res.send("Glass System Backend Running 🚀");
 });
 
+if (process.env.ENABLE_STARTUP_MIGRATIONS === "true") {
 // 📋 إنشاء جدول سجل النشاط لو مش موجود
 pool
   .query(
@@ -1341,6 +1343,7 @@ pool
     console.error("❌ variant migrations error:", e.message);
   }
 })();
+}
 
 // � جدول الموردين
 (async () => {
@@ -10809,6 +10812,7 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
 /* ===============================
    💬 CHAT SYSTEM - Tables (sequential)
 ================================ */
+if (process.env.ENABLE_STARTUP_MIGRATIONS === "true") {
 (async () => {
   try {
     await pool.query(`
@@ -10943,6 +10947,7 @@ app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
     console.error("❌ chat tables error:", e.message);
   }
 })();
+}
 
 /* ===============================
    💬 CHAT - Get all conversations for current user

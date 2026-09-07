@@ -2510,6 +2510,10 @@ let syncInterval = null;
 const PERIODIC_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 
 async function ensureSyncSchema() {
+  if (process.env.ENABLE_STARTUP_MIGRATIONS !== "true") {
+    console.log("ℹ️  Startup DDL schema checks bypassed (fast production mode).");
+    return;
+  }
   const ensureReceivedSql = `
     ALTER TABLE stock_transfer_items
     ADD COLUMN IF NOT EXISTS received BOOLEAN DEFAULT FALSE
