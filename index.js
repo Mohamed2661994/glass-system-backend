@@ -6327,7 +6327,7 @@ app.get("/dashboard/stats", async (req, res) => {
            AND status IN ('in_transit', 'received')
            AND created_at >= CURRENT_DATE
            AND created_at < CURRENT_DATE + INTERVAL '1 day'`
-      ),
+      ).catch(() => ({ rows: [{ total_sales: 0, total_cost: 0 }] })),
     ]);
 
     const todaySalesTotal = Number(todayProfitSummary.rows[0].sales_total || 0) + Number(interBranchProfitSummary.rows[0].total_sales || 0);
