@@ -72,13 +72,13 @@ const dbConnectionConfig = process.env.DATABASE_URL
       host:
         process.env.DB_HOST ||
         process.env.DB_HOST_LOCAL ||
-        "18.185.48.10",
+        "dbstudio.hg-alshour.online",
       port: Number(process.env.DB_PORT || process.env.DB_PORT_LOCAL || 5432),
-      user: process.env.DB_USER || process.env.DB_USER_LOCAL || "glass_admin",
+      user: process.env.DB_USER || process.env.DB_USER_LOCAL || "glass_backend",
       password:
         process.env.DB_PASSWORD ||
         process.env.DB_PASSWORD_LOCAL ||
-        "@Hadysalah1",
+        "SecGlass_2026_Postgres_HA",
       database:
         process.env.DB_NAME || process.env.DB_NAME_LOCAL || "glass_system",
       ssl:
