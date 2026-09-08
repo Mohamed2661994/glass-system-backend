@@ -182,9 +182,30 @@ app.get("/health", async (req, res) => {
     /* ignore */
   }
 
+  let primaryHost = process.env.DB_HOST || "dbstudio.hg-alshour.online";
+  if (process.env.DATABASE_URL) {
+    try {
+      primaryHost = new URL(process.env.DATABASE_URL).hostname;
+    } catch {}
+  }
+  const standbyHost = process.env.BACKUP_DB_HOST || "18.185.48.10";
+
   res.json({
     status: "ok",
-    activeDb: dbState.activeDb,
+    activeDb: dbState.activeDb || "primary",
+    activeServer: {
+      name: primaryHost.includes("dbstudio") ? "Data Studio HA Cluster" : "AWS Cloud",
+      host: primaryHost,
+      role: "الأساسي (Master)",
+      status: "online",
+      isDataStudio: primaryHost.includes("dbstudio")
+    },
+    standbyServer: {
+      name: "AWS Cloud Standby",
+      host: standbyHost,
+      role: "الاحتياطي اللحظي (Standby)",
+      status: "synchronized"
+    },
     localAlive: dbState.localAlive,
     cloudAlive: dbState.cloudAlive,
     syncInProgress: dbState.syncInProgress,
