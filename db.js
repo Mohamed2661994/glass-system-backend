@@ -72,7 +72,7 @@ const dbConnectionConfig = process.env.DATABASE_URL
       host:
         process.env.DB_HOST ||
         process.env.DB_HOST_LOCAL ||
-        "db.hg-alshour.online",
+        "dbstudio.hg-alshour.online",
       port: Number(process.env.DB_PORT || process.env.DB_PORT_LOCAL || 5432),
       user: process.env.DB_USER || process.env.DB_USER_LOCAL || "glass_backend",
       password:
@@ -3046,12 +3046,48 @@ async function runPeriodicSyncTick() {
   }
 }
 
+/* ── Continuous Standby Backup Sync (Data Studio ➔ AWS Cloud Standby) ── */
+let backupSyncTimer = null;
+
+function startContinuousStandbyBackup() {
+  const isEnabled = parseBooleanEnv(process.env.STANDBY_BACKUP_ENABLED, true);
+  if (!isEnabled) {
+    console.log("ℹ️  Standby backup sync to AWS Cloud is disabled.");
+    return;
+  }
+
+  const intervalMs = Math.max(30000, Number(process.env.STANDBY_BACKUP_INTERVAL_MS) || 120000);
+  console.log(`🛡️  Standby continuous backup initialized (interval: ${intervalMs / 1000}s)`);
+
+  backupSyncTimer = setInterval(() => {
+    try {
+      const { safeRunBackupSync } = require("./sync_studio_to_cloud_backup");
+      safeRunBackupSync().catch((err) => {
+        console.warn("⚠️ Standby backup sync error:", err.message);
+      });
+    } catch (err) {
+      console.warn("⚠️ Standby backup sync loader error:", err.message);
+    }
+  }, intervalMs);
+
+  // Initial sync 15s after startup
+  setTimeout(() => {
+    try {
+      const { safeRunBackupSync } = require("./sync_studio_to_cloud_backup");
+      safeRunBackupSync().catch((err) => {
+        console.warn("⚠️ Standby initial backup sync error:", err.message);
+      });
+    } catch (err) {}
+  }, 15000);
+}
+
 function startPeriodicSync() {
   // Bi-directional sync disabled: unified on Data Studio HA Cluster
 }
 
 // Start background services
 startPublicWebhookDelivery();
+startContinuousStandbyBackup();
 
 /* ── Exports ── */
 const pool = primaryPool;
