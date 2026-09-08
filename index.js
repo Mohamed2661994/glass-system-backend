@@ -8609,7 +8609,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
         Number(branch_id), // 1
         transaction_date || getCairoDate(), // 2
         source_type || "manual", // 3
-        customer_name || "وارد يدوي", // 4
+        customer_name || (source_type === "warehouse_settlement" ? "سداد للمعرض" : "وارد يدوي"), // 4
         description || "", // 5
         Number(amount), // 6
         Number(amount), // 7

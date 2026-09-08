@@ -1270,6 +1270,25 @@ exports.getWarehouseAccount = async (req, res) => {
       params,
     );
 
+    // سداد للمعرض (مدين) — قيود "سداد للمعرض" (وارد نقدي من المخزن)
+    const refundsDateCond = opening_date ? `AND ci.transaction_date >= $1::date` : ``;
+    const refundsRes = await pool.query(
+      `
+      SELECT
+        ci.id,
+        to_char(ci.transaction_date, 'YYYY-MM-DD') AS date,
+        ci.customer_name AS name,
+        ci.description AS notes,
+        ci.branch_id,
+        ci.amount
+      FROM cash_in ci
+      WHERE ci.source_type = 'warehouse_settlement'
+        ${refundsDateCond}
+      ORDER BY ci.transaction_date ASC, ci.id ASC
+      `,
+      params,
+    );
+
     const transfers_total = transfersRes.rows.reduce(
       (s, r) => s + Number(r.amount || 0),
       0,
@@ -1278,9 +1297,13 @@ exports.getWarehouseAccount = async (req, res) => {
       (s, r) => s + Number(r.amount || 0),
       0,
     );
-    const balance_due = opening_balance + transfers_total - payments_total;
+    const warehouse_refunds_total = refundsRes.rows.reduce(
+      (s, r) => s + Number(r.amount || 0),
+      0,
+    );
+    const balance_due = opening_balance + transfers_total - payments_total + warehouse_refunds_total;
 
-    // كشف حساب موحّد مرتّب بالتاريخ (التحويلات مدين، المدفوعات دائن)
+    // كشف حساب موحّد مرتّب بالتاريخ (التحويلات مدين، مدفوعات سداد للمخزن دائن، وسداد للمعرض مدين)
     const ledger = [
       ...transfersRes.rows.map((r) => ({
         kind: "debit",
@@ -1300,6 +1323,16 @@ exports.getWarehouseAccount = async (req, res) => {
         branch_id: r.branch_id,
         amount: Number(r.amount || 0),
       })),
+      ...refundsRes.rows.map((r) => ({
+        kind: "debit",
+        date: r.date,
+        ref: `سداد للمعرض #${r.id}`,
+        cash_in_id: r.id,
+        name: r.name || "المخزن",
+        note: r.notes || null,
+        branch_id: r.branch_id,
+        amount: Number(r.amount || 0),
+      })),
     ].sort((a, b) => {
       const da = new Date(a.date).getTime();
       const db = new Date(b.date).getTime();
@@ -1313,6 +1346,7 @@ exports.getWarehouseAccount = async (req, res) => {
       opening_date,
       transfers_total,
       payments_total,
+      warehouse_refunds_total,
       balance_due,
       ledger,
     });
