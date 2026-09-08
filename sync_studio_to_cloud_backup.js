@@ -234,8 +234,25 @@ async function runBackupSync() {
       }
     }
 
-    // Refresh stock if any stock movements or invoices occurred
-    if (totalSynced > 0) {
+    // Process deletions
+    const delRes = await sClient.query(`
+      SELECT table_name, pk_value 
+      FROM sync_deletions 
+      WHERE deleted_at >= NOW() - INTERVAL '2 days'
+    `);
+    let deletedCount = 0;
+    for (const del of delRes.rows) {
+      try {
+        const res = await bClient.query(`DELETE FROM "${del.table_name}" WHERE id = $1`, [del.pk_value]);
+        if (res.rowCount > 0) deletedCount++;
+      } catch (e) {}
+    }
+    if (deletedCount > 0) {
+      console.log(`   └─ Cleaned up ${deletedCount} deleted rows on backup.`);
+    }
+
+    // Refresh stock if any changes occurred
+    if (totalSynced > 0 || deletedCount > 0) {
       await syncLiveStockToBackup(sClient, bClient);
       console.log(`   └─ Refreshed stock quantities on backup.`);
     }
