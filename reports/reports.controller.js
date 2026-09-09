@@ -1641,6 +1641,279 @@ exports.getInvoiceSalesProfit = async (req, res) => {
 };
 
 /* ===============================
+   📈 الدالة المساعدة لحساب بيانات الرسم البياني الزمني للمصنع
+================================ */
+async function getTimelineAnalytics({
+  normalizedManufacturer,
+  chart_invoice_type,
+  invoice_type,
+  chart_date_from,
+  chart_date_to,
+  date_from,
+  date_to,
+  timeline_interval,
+  isApplyDistribution,
+}) {
+  const effectiveChartDateFrom =
+    chart_date_from !== undefined && chart_date_from !== null && chart_date_from !== ""
+      ? chart_date_from
+      : date_from;
+  const effectiveChartDateTo =
+    chart_date_to !== undefined && chart_date_to !== null && chart_date_to !== ""
+      ? chart_date_to
+      : date_to;
+
+  let timeGroupFormat = "'YYYY-MM'";
+  if (timeline_interval === 'daily') {
+    timeGroupFormat = "'YYYY-MM-DD'";
+  } else if (timeline_interval === 'monthly') {
+    timeGroupFormat = "'YYYY-MM'";
+  } else if (timeline_interval === 'yearly') {
+    timeGroupFormat = "'YYYY'";
+  } else {
+    if (effectiveChartDateFrom && effectiveChartDateTo) {
+      const d1 = new Date(effectiveChartDateFrom);
+      const d2 = new Date(effectiveChartDateTo);
+      const diffDays = Math.ceil(Math.abs(d2 - d1) / (1000 * 60 * 60 * 24));
+      if (diffDays <= 45) {
+        timeGroupFormat = "'YYYY-MM-DD'";
+      }
+    } else if (effectiveChartDateFrom && !effectiveChartDateTo) {
+      const d1 = new Date(effectiveChartDateFrom);
+      const diffDays = Math.ceil(Math.abs(new Date() - d1) / (1000 * 60 * 60 * 24));
+      if (diffDays <= 45) {
+        timeGroupFormat = "'YYYY-MM-DD'";
+      }
+    }
+  }
+
+  const timelineConditions = [
+    `i.movement_type = 'sale'`,
+    `i.is_void IS NOT TRUE`,
+  ];
+  const timelineValues = [];
+  let tIdx = 1;
+
+  let timelineManufacturerCondition =
+    "WHERE (p.is_active IS NOT FALSE OR EXISTS (SELECT 1 FROM stock s WHERE s.product_id = p.id AND s.quantity != 0))";
+  if (normalizedManufacturer && normalizedManufacturer !== "all") {
+    timelineManufacturerCondition += ` AND LOWER(TRIM(p.manufacturer)) = LOWER(TRIM($${tIdx++}))`;
+    timelineValues.push(normalizedManufacturer);
+  }
+
+  // Chart specific invoice type logic
+  const activeChartInvoiceType = chart_invoice_type || invoice_type;
+  if (activeChartInvoiceType === 'retail') {
+    timelineConditions.push(`i.branch_id = $${tIdx++}`);
+    timelineValues.push(1);
+    timelineConditions.push(`i.invoice_type = $${tIdx++}`);
+    timelineValues.push('retail');
+  } else if (activeChartInvoiceType === 'wholesale') {
+    timelineConditions.push(`i.branch_id = $${tIdx++}`);
+    timelineValues.push(2);
+    timelineConditions.push(`i.invoice_type = $${tIdx++}`);
+    timelineValues.push('wholesale');
+  }
+
+  if (effectiveChartDateFrom) {
+    timelineConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) >= $${tIdx++}::date`);
+    timelineValues.push(effectiveChartDateFrom);
+  }
+  if (effectiveChartDateTo) {
+    timelineConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) <= $${tIdx++}::date`);
+    timelineValues.push(effectiveChartDateTo);
+  }
+
+  const timelineQuery = `
+    WITH selected_products AS (
+      SELECT p.id AS product_id
+      FROM products p
+      ${timelineManufacturerCondition}
+    ),
+    invoice_scope AS (
+      SELECT 
+        i.id AS invoice_id, 
+        i.branch_id, 
+        i.invoice_type, 
+        COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date, 
+        COALESCE(i.total, 0) AS invoice_total,
+        COALESCE(i.apply_items_discount, true) AS apply_items_discount
+      FROM invoices i
+      WHERE ${timelineConditions.join(" AND ")}
+    ),
+    selected_invoice_ids AS (
+      SELECT DISTINCT ii.invoice_id
+      FROM invoice_items ii
+      JOIN selected_products sp ON sp.product_id = ii.product_id
+      JOIN invoice_scope inv ON inv.invoice_id = ii.invoice_id
+    ),
+    invoice_items_scoped AS (
+      SELECT
+        ii.invoice_id,
+        ii.product_id,
+        ii.quantity, ii.price, ii.discount, ii.total, ii.is_return, ii.cost_price,
+        inv.branch_id, inv.invoice_type, inv.invoice_date, inv.invoice_total, inv.apply_items_discount,
+        p.purchase_price, p.retail_purchase_price,
+        CASE
+          WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+            CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+            ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+          ELSE
+            CASE WHEN COALESCE(ii.is_return, false)
+              THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+            ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+        END AS signed_item_total,
+        SUM(
+          CASE
+            WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+              CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+              ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+            ELSE
+              CASE WHEN COALESCE(ii.is_return, false)
+                THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+              ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+          END
+        ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
+      FROM invoice_scope inv
+      JOIN selected_invoice_ids sii ON sii.invoice_id = inv.invoice_id
+      JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
+      JOIN products p ON p.id = ii.product_id
+    )
+    SELECT
+      TO_CHAR(iis.invoice_date, ${timeGroupFormat}) AS period,
+      SUM(
+        CASE 
+          WHEN ${isApplyDistribution ? 'true' : 'false'} THEN
+            CASE
+              WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
+              ELSE iis.signed_item_total - ((iis.invoice_items_total - iis.invoice_total) * (iis.signed_item_total / iis.invoice_items_total))
+            END
+          ELSE
+            iis.signed_item_total
+        END
+      ) AS sales_revenue,
+      SUM(
+        CASE WHEN COALESCE(iis.is_return, false)
+          THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END))
+        ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
+      ) AS cost_of_goods
+    FROM invoice_items_scoped iis
+    JOIN selected_products sp ON sp.product_id = iis.product_id
+    GROUP BY period
+    ORDER BY period ASC
+  `;
+
+  const timelineRes = await pool.query(timelineQuery, timelineValues);
+
+  const expensesConditions = [`entry_type = 'expense'`];
+  const expensesValues = [];
+  let eIdx = 1;
+  if (activeChartInvoiceType === 'retail') {
+    expensesConditions.push(`branch_id = $${eIdx++}`);
+    expensesValues.push(1);
+  } else if (activeChartInvoiceType === 'wholesale') {
+    expensesConditions.push(`branch_id = $${eIdx++}`);
+    expensesValues.push(2);
+  }
+  if (effectiveChartDateFrom) {
+    expensesConditions.push(`transaction_date >= $${eIdx++}::date`);
+    expensesValues.push(effectiveChartDateFrom);
+  }
+  if (effectiveChartDateTo) {
+    expensesConditions.push(`transaction_date <= $${eIdx++}::date`);
+    expensesValues.push(effectiveChartDateTo);
+  }
+
+  const expensesQuery = `
+    SELECT TO_CHAR(transaction_date, ${timeGroupFormat}) AS period, SUM(amount) AS total_expenses
+    FROM cash_out
+    WHERE ${expensesConditions.join(" AND ")}
+    GROUP BY period
+  `;
+  const expensesRes = await pool.query(expensesQuery, expensesValues);
+  const expensesMap = {};
+  expensesRes.rows.forEach(r => {
+    expensesMap[r.period] = Math.round(Number(r.total_expenses || 0) * 100) / 100;
+  });
+
+  const timeline = timelineRes.rows.map(r => {
+    const sales = Math.round(Number(r.sales_revenue || 0) * 100) / 100;
+    const cost = Math.round(Number(r.cost_of_goods || 0) * 100) / 100;
+    return {
+      period: r.period,
+      sales: sales,
+      cost: cost,
+      profit: Math.round((sales - cost) * 100) / 100
+    };
+  });
+
+  // Fill missing periods with zeroes
+  let filledTimeline = [];
+  const allPeriods = [...timeline.map(t => t.period), ...Object.keys(expensesMap)];
+  allPeriods.sort();
+
+  if (allPeriods.length > 0 || (effectiveChartDateFrom && effectiveChartDateTo)) {
+    let startDateStr = effectiveChartDateFrom ? String(effectiveChartDateFrom) : allPeriods[0];
+    let endDateStr = effectiveChartDateTo ? String(effectiveChartDateTo) : allPeriods[allPeriods.length - 1];
+
+    const isDaily = timeGroupFormat === "'YYYY-MM-DD'";
+    const isMonthly = timeGroupFormat === "'YYYY-MM'";
+    const isYearly = timeGroupFormat === "'YYYY'";
+
+    const getNextPeriod = (currentStr) => {
+      const d = new Date(currentStr + (isYearly ? "-01-01" : isMonthly ? "-01" : "T12:00:00"));
+      if (isDaily) d.setDate(d.getDate() + 1);
+      if (isMonthly) d.setMonth(d.getMonth() + 1);
+      if (isYearly) d.setFullYear(d.getFullYear() + 1);
+
+      let year = d.getFullYear();
+      let month = String(d.getMonth() + 1).padStart(2, '0');
+      let day = String(d.getDate()).padStart(2, '0');
+
+      if (isDaily) return `${year}-${month}-${day}`;
+      if (isMonthly) return `${year}-${month}`;
+      return `${year}`;
+    };
+
+    let currentPeriod = startDateStr;
+    if (isMonthly) currentPeriod = currentPeriod.substring(0, 7);
+    if (isYearly) currentPeriod = currentPeriod.substring(0, 4);
+
+    let endPeriod = endDateStr;
+    if (isMonthly) endPeriod = endPeriod.substring(0, 7);
+    if (isYearly) endPeriod = endPeriod.substring(0, 4);
+
+    const timelineMap = {};
+    timeline.forEach(t => timelineMap[t.period] = t);
+
+    let iterations = 0;
+    while (currentPeriod <= endPeriod && iterations < 2000) {
+      const periodExpenses = expensesMap[currentPeriod] || 0;
+      if (timelineMap[currentPeriod]) {
+        filledTimeline.push({
+          ...timelineMap[currentPeriod],
+          expenses: periodExpenses
+        });
+      } else {
+        filledTimeline.push({
+          period: currentPeriod,
+          sales: 0,
+          cost: 0,
+          profit: 0,
+          expenses: periodExpenses
+        });
+      }
+      currentPeriod = getNextPeriod(currentPeriod);
+      iterations++;
+    }
+  } else {
+    filledTimeline = timeline;
+  }
+
+  return filledTimeline;
+}
+
+/* ===============================
    🏭 تقرير تحليلات وتفاصيل المصانع الشاملة
    عرض الإحصائيات الكاملة، الأرباح، العدادات، المخزون، والشارات
 ================================ */
@@ -1659,11 +1932,30 @@ exports.getManufacturerAnalytics = async (req, res) => {
       limit = 50,
       chart_invoice_type,
       timeline_interval,
+      chart_date_from,
+      chart_date_to,
+      only_timeline,
       apply_distribution,
     } = req.query;
 
     const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
     const isApplyDistribution = apply_distribution === 'true';
+
+    // إذا كان المطلوب هو تحديث الرسم البياني الزمني فقط (فائق السرعة ~25ms ومستقل 100%)
+    if (only_timeline === 'true') {
+      const filledTimeline = await getTimelineAnalytics({
+        normalizedManufacturer,
+        chart_invoice_type,
+        invoice_type,
+        chart_date_from,
+        chart_date_to,
+        date_from,
+        date_to,
+        timeline_interval,
+        isApplyDistribution,
+      });
+      return res.json({ timeline: filledTimeline });
+    }
 
     // 1. Fetch products (either belonging to a specific manufacturer, or ALL if omitted/'all')
     let productsQuery = `
@@ -1915,252 +2207,18 @@ exports.getManufacturerAnalytics = async (req, res) => {
     }
 
 
-    // 3.5 Build timeline data for charts
-    let timeGroupFormat = "'YYYY-MM'";
-    if (timeline_interval === 'daily') {
-      timeGroupFormat = "'YYYY-MM-DD'";
-    } else if (timeline_interval === 'monthly') {
-      timeGroupFormat = "'YYYY-MM'";
-    } else if (timeline_interval === 'yearly') {
-      timeGroupFormat = "'YYYY'";
-    } else {
-      if (date_from && date_to) {
-        const d1 = new Date(date_from);
-        const d2 = new Date(date_to);
-        const diffDays = Math.ceil(Math.abs(d2 - d1) / (1000 * 60 * 60 * 24)); 
-        if (diffDays <= 45) {
-          timeGroupFormat = "'YYYY-MM-DD'";
-        }
-      } else if (date_from && !date_to) {
-        const d1 = new Date(date_from);
-        const diffDays = Math.ceil(Math.abs(new Date() - d1) / (1000 * 60 * 60 * 24));
-        if (diffDays <= 45) {
-          timeGroupFormat = "'YYYY-MM-DD'";
-        }
-      }
-    }
-
-    const timelineConditions = [
-      `i.movement_type = 'sale'`,
-      `i.is_void IS NOT TRUE`,
-    ];
-    const timelineValues = [];
-    let tIdx = 1;
-    
-    let timelineManufacturerCondition = "WHERE (p.is_active IS NOT FALSE OR EXISTS (SELECT 1 FROM stock s WHERE s.product_id = p.id AND s.quantity != 0))";
-    if (normalizedManufacturer && normalizedManufacturer !== "all") {
-      timelineManufacturerCondition += ` AND LOWER(TRIM(p.manufacturer)) = LOWER(TRIM($${tIdx++}))`;
-      timelineValues.push(normalizedManufacturer);
-    }
-
-    // Chart specific invoice type logic
-    const activeChartInvoiceType = chart_invoice_type || invoice_type;
-    if (activeChartInvoiceType === 'retail') {
-      timelineConditions.push(`i.branch_id = $${tIdx++}`);
-      timelineValues.push(1);
-      timelineConditions.push(`i.invoice_type = $${tIdx++}`);
-      timelineValues.push('retail');
-    } else if (activeChartInvoiceType === 'wholesale') {
-      timelineConditions.push(`i.branch_id = $${tIdx++}`);
-      timelineValues.push(2);
-      timelineConditions.push(`i.invoice_type = $${tIdx++}`);
-      timelineValues.push('wholesale');
-    }
-
-    if (date_from) {
-      timelineConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) >= $${tIdx++}::date`);
-      timelineValues.push(date_from);
-    }
-    if (date_to) {
-      timelineConditions.push(`COALESCE(i.invoice_date::date, i.created_at::date) <= $${tIdx++}::date`);
-      timelineValues.push(date_to);
-    }
-
-    const timelineQuery = `
-      WITH selected_products AS (
-        SELECT p.id AS product_id
-        FROM products p
-        ${timelineManufacturerCondition}
-      ),
-      invoice_scope AS (
-        SELECT 
-          i.id AS invoice_id, 
-          i.branch_id, 
-          i.invoice_type, 
-          COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date, 
-          COALESCE(i.total, 0) AS invoice_total,
-          COALESCE(i.apply_items_discount, true) AS apply_items_discount
-        FROM invoices i
-        WHERE ${timelineConditions.join(" AND ")}
-      ),
-      selected_invoice_ids AS (
-        SELECT DISTINCT ii.invoice_id
-        FROM invoice_items ii
-        JOIN selected_products sp ON sp.product_id = ii.product_id
-        JOIN invoice_scope inv ON inv.invoice_id = ii.invoice_id
-      ),
-      invoice_items_scoped AS (
-        SELECT
-          ii.invoice_id,
-          ii.product_id,
-          ii.quantity, ii.price, ii.discount, ii.total, ii.is_return, ii.cost_price,
-          inv.branch_id, inv.invoice_type, inv.invoice_date, inv.invoice_total, inv.apply_items_discount,
-          p.purchase_price, p.retail_purchase_price,
-          CASE
-            WHEN COALESCE(inv.apply_items_discount, true) = false THEN
-              CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
-              ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
-            ELSE
-              CASE WHEN COALESCE(ii.is_return, false)
-                THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
-              ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
-          END AS signed_item_total,
-          SUM(
-            CASE
-              WHEN COALESCE(inv.apply_items_discount, true) = false THEN
-                CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
-                ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
-              ELSE
-                CASE WHEN COALESCE(ii.is_return, false)
-                  THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
-                ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
-            END
-          ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
-        FROM invoice_scope inv
-        JOIN selected_invoice_ids sii ON sii.invoice_id = inv.invoice_id
-        JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
-        JOIN products p ON p.id = ii.product_id
-      )
-      SELECT
-        TO_CHAR(iis.invoice_date, ${timeGroupFormat}) AS period,
-        SUM(
-          CASE 
-            WHEN ${isApplyDistribution ? 'true' : 'false'} THEN
-              CASE
-                WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
-                ELSE iis.signed_item_total - ((iis.invoice_items_total - iis.invoice_total) * (iis.signed_item_total / iis.invoice_items_total))
-              END
-            ELSE
-              iis.signed_item_total
-          END
-        ) AS sales_revenue,
-        SUM(
-          CASE WHEN COALESCE(iis.is_return, false)
-            THEN -(COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END))
-          ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
-        ) AS cost_of_goods
-      FROM invoice_items_scoped iis
-      JOIN selected_products sp ON sp.product_id = iis.product_id
-      GROUP BY period
-      ORDER BY period ASC
-    `;
-
-    const timelineRes = await pool.query(timelineQuery, timelineValues);
-
-    const expensesConditions = [`entry_type = 'expense'`];
-    const expensesValues = [];
-    let eIdx = 1;
-    if (activeChartInvoiceType === 'retail') {
-      expensesConditions.push(`branch_id = $${eIdx++}`);
-      expensesValues.push(1);
-    } else if (activeChartInvoiceType === 'wholesale') {
-      expensesConditions.push(`branch_id = $${eIdx++}`);
-      expensesValues.push(2);
-    }
-    if (date_from) {
-      expensesConditions.push(`transaction_date >= $${eIdx++}::date`);
-      expensesValues.push(date_from);
-    }
-    if (date_to) {
-      expensesConditions.push(`transaction_date <= $${eIdx++}::date`);
-      expensesValues.push(date_to);
-    }
-
-    const expensesQuery = `
-      SELECT TO_CHAR(transaction_date, ${timeGroupFormat}) AS period, SUM(amount) AS total_expenses
-      FROM cash_out
-      WHERE ${expensesConditions.join(" AND ")}
-      GROUP BY period
-    `;
-    const expensesRes = await pool.query(expensesQuery, expensesValues);
-    const expensesMap = {};
-    expensesRes.rows.forEach(r => {
-      expensesMap[r.period] = Math.round(Number(r.total_expenses || 0) * 100) / 100;
+    // 3.5 Build timeline data for charts (using dedicated chart dates if provided)
+    const filledTimeline = await getTimelineAnalytics({
+      normalizedManufacturer,
+      chart_invoice_type,
+      invoice_type,
+      chart_date_from,
+      chart_date_to,
+      date_from,
+      date_to,
+      timeline_interval,
+      isApplyDistribution,
     });
-
-    const timeline = timelineRes.rows.map(r => {
-      const sales = Math.round(Number(r.sales_revenue || 0) * 100) / 100;
-      const cost = Math.round(Number(r.cost_of_goods || 0) * 100) / 100;
-      return {
-        period: r.period,
-        sales: sales,
-        cost: cost,
-        profit: Math.round((sales - cost) * 100) / 100
-      };
-    });
-
-    // 3.6 Fill missing periods with zeroes
-    let filledTimeline = [];
-    const allPeriods = [...timeline.map(t => t.period), ...Object.keys(expensesMap)];
-    allPeriods.sort();
-
-    if (allPeriods.length > 0 || (date_from && date_to)) {
-      let startDateStr = date_from ? String(date_from) : allPeriods[0];
-      let endDateStr = date_to ? String(date_to) : allPeriods[allPeriods.length - 1];
-      
-      const isDaily = timeGroupFormat === "'YYYY-MM-DD'";
-      const isMonthly = timeGroupFormat === "'YYYY-MM'";
-      const isYearly = timeGroupFormat === "'YYYY'";
-
-      const getNextPeriod = (currentStr) => {
-        const d = new Date(currentStr + (isYearly ? "-01-01" : isMonthly ? "-01" : "T12:00:00"));
-        if (isDaily) d.setDate(d.getDate() + 1);
-        if (isMonthly) d.setMonth(d.getMonth() + 1);
-        if (isYearly) d.setFullYear(d.getFullYear() + 1);
-        
-        let year = d.getFullYear();
-        let month = String(d.getMonth() + 1).padStart(2, '0');
-        let day = String(d.getDate()).padStart(2, '0');
-        
-        if (isDaily) return `${year}-${month}-${day}`;
-        if (isMonthly) return `${year}-${month}`;
-        return `${year}`;
-      };
-
-      let currentPeriod = startDateStr;
-      if (isMonthly) currentPeriod = currentPeriod.substring(0, 7);
-      if (isYearly) currentPeriod = currentPeriod.substring(0, 4);
-
-      let endPeriod = endDateStr;
-      if (isMonthly) endPeriod = endPeriod.substring(0, 7);
-      if (isYearly) endPeriod = endPeriod.substring(0, 4);
-
-      const timelineMap = {};
-      timeline.forEach(t => timelineMap[t.period] = t);
-
-      let iterations = 0;
-      while (currentPeriod <= endPeriod && iterations < 2000) {
-        const periodExpenses = expensesMap[currentPeriod] || 0;
-        if (timelineMap[currentPeriod]) {
-          filledTimeline.push({
-            ...timelineMap[currentPeriod],
-            expenses: periodExpenses
-          });
-        } else {
-          filledTimeline.push({
-            period: currentPeriod,
-            sales: 0,
-            cost: 0,
-            profit: 0,
-            expenses: periodExpenses
-          });
-        }
-        currentPeriod = getNextPeriod(currentPeriod);
-        iterations++;
-      }
-    } else {
-      filledTimeline = timeline;
-    }
 
     // 4. Fetch total purchases/inbound per product
     let purchaseWhere = `
