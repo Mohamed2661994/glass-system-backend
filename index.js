@@ -60,7 +60,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.5";
+const SYSTEM_VERSION = "v.26.9.6";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -8816,8 +8816,6 @@ WHERE id = $1
 });
 
 app.post("/cash/in", authMiddleware, async (req, res) => {
-  const client = await pool.connect();
-
   try {
     console.log("CASH IN BODY:", req.body);
     const branch_id = req.user.branch_id; // 🔐
@@ -8837,9 +8835,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
         .json({ error: "بيانات غير مكتملة", body: req.body });
     }
 
-    await client.query("BEGIN");
-
-    const result = await client.query(
+    const result = await pool.query(
       `
   INSERT INTO cash_in
   (
@@ -8880,22 +8876,13 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       ],
     );
 
-    // سندات الدفع تُسجَّل في cash_in فقط
-    // وتظهر كأسطر منفصلة في كشف حساب العميل
-    // بدون تعديل الفاتورة (لتجنب الحساب المزدوج)
-
-    await client.query("COMMIT");
-
     res.json({
       success: true,
       cash_in_id: result.rows[0].id,
     });
   } catch (err) {
-    await client.query("ROLLBACK");
     console.error("CASH IN ERROR:", err);
     res.status(500).json({ error: "فشل إضافة الوارد" });
-  } finally {
-    client.release();
   }
 });
 

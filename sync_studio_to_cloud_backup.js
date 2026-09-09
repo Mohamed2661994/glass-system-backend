@@ -226,11 +226,23 @@ async function runBackupSync() {
     ];
 
     let totalSynced = 0;
+    let stockRelatedSynced = 0;
+    const stockAffectingTables = new Set([
+      'invoices',
+      'invoice_items',
+      'stock_movements',
+      'stock_transfers',
+      'stock_transfer_items'
+    ]);
+
     for (const t of tables) {
       const cnt = await syncTableToBackup(sClient, bClient, t.name, 'id', t.checkUpdated);
       if (cnt > 0) {
         console.log(`   └─ Synced ${cnt} rows to ${t.name} on backup.`);
         totalSynced += cnt;
+        if (stockAffectingTables.has(t.name)) {
+          stockRelatedSynced += cnt;
+        }
       }
     }
 
@@ -241,18 +253,24 @@ async function runBackupSync() {
       WHERE deleted_at >= NOW() - INTERVAL '2 days'
     `);
     let deletedCount = 0;
+    let stockRelatedDeleted = 0;
     for (const del of delRes.rows) {
       try {
         const res = await bClient.query(`DELETE FROM "${del.table_name}" WHERE id = $1`, [del.pk_value]);
-        if (res.rowCount > 0) deletedCount++;
+        if (res.rowCount > 0) {
+          deletedCount++;
+          if (stockAffectingTables.has(del.table_name)) {
+            stockRelatedDeleted++;
+          }
+        }
       } catch (e) {}
     }
     if (deletedCount > 0) {
       console.log(`   └─ Cleaned up ${deletedCount} deleted rows on backup.`);
     }
 
-    // Refresh stock if any changes occurred
-    if (totalSynced > 0 || deletedCount > 0) {
+    // Refresh stock ONLY if stock-affecting changes occurred (prevents 40s freeze on routine cash/customer writes)
+    if (stockRelatedSynced > 0 || stockRelatedDeleted > 0) {
       await syncLiveStockToBackup(sClient, bClient);
       console.log(`   └─ Refreshed stock quantities on backup.`);
     }
