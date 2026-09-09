@@ -59,6 +59,9 @@ const {
   convertWholesaleToRetail,
 } = require("./services/wholesaleToRetailConverter");
 
+/* ── System Version (Format: v.yr.mon.X) ── */
+const SYSTEM_VERSION = "v.26.9.1";
+
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
   [cloudPool, "Cloud"],
@@ -152,34 +155,137 @@ app.use((req, res, next) => {
   }
 });
 
+/* ── Google Drive Client Helper ── */
+function getGoogleDriveClient() {
+  const { google } = require("googleapis");
+
+  let clientId, clientSecret, refreshToken;
+  const credFile = path.join(__dirname, "credentials", "oauth-client.json");
+  const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
+
+  if (fs.existsSync(credFile) && fs.existsSync(tokenFile)) {
+    const creds = JSON.parse(fs.readFileSync(credFile, "utf8"));
+    const key = Object.keys(creds)[0];
+    clientId = creds[key].client_id;
+    clientSecret = creds[key].client_secret;
+    const tokens = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
+    refreshToken = tokens.refresh_token;
+  } else {
+    clientId = process.env.GDRIVE_CLIENT_ID;
+    clientSecret = process.env.GDRIVE_CLIENT_SECRET;
+    refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
+  }
+
+  const folderId =
+    process.env.GDRIVE_FOLDER_ID || "1sOVQgZ2A_Vfr2KfZ5I1yjjwSIMH3R3Iw";
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    return null;
+  }
+
+  const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
+  oauth2.setCredentials({ refresh_token: refreshToken });
+  const drive = google.drive({ version: "v3", auth: oauth2 });
+
+  return { drive, folderId };
+}
+
+let cachedDriveBackup = null;
+let lastDriveBackupFetchTime = 0;
+const DRIVE_BACKUP_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getLatestDriveBackupInfo(force = false) {
+  const now = Date.now();
+  if (!force && cachedDriveBackup && (now - lastDriveBackupFetchTime < DRIVE_BACKUP_CACHE_TTL_MS)) {
+    return cachedDriveBackup;
+  }
+
+  try {
+    const client = getGoogleDriveClient();
+    if (!client) return cachedDriveBackup;
+    const { drive, folderId } = client;
+
+    const list = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false and name contains 'glass_system'`,
+      orderBy: "createdTime desc",
+      pageSize: 10,
+      fields: "files(id, name, size, createdTime, modifiedTime)",
+    });
+
+    const files = list.data.files || [];
+    if (files.length > 0) {
+      const top = files[0];
+      const sizeBytes = parseInt(top.size || "0", 10);
+      const sizeMB = parseFloat((sizeBytes / (1024 * 1024)).toFixed(2));
+      cachedDriveBackup = {
+        file: top.name,
+        time: top.createdTime || top.modifiedTime,
+        sizeMB: sizeMB,
+        count: files.length,
+        source: "google_drive",
+      };
+      lastDriveBackupFetchTime = now;
+      return cachedDriveBackup;
+    }
+  } catch (err) {
+    console.warn("⚠️ Failed to fetch Google Drive backup info:", err.message);
+  }
+  return cachedDriveBackup;
+}
+
+// Prefetch Google Drive backup metadata on startup
+setTimeout(() => {
+  getLatestDriveBackupInfo().catch(() => {});
+}, 1000);
+
 // Health check endpoint (for Render / monitoring)
 app.get("/health", async (req, res) => {
-  // Find latest backup file
-  let lastBackup = null;
-  try {
-    const bDir =
-      process.platform === "win32"
-        ? "D:\\glass-backups"
-        : path.join(__dirname, "backups");
-    if (fs.existsSync(bDir)) {
-      const files = fs
-        .readdirSync(bDir)
-        .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
-        .map((f) => ({
-          name: f,
-          mtime: fs.statSync(path.join(bDir, f)).mtime,
-        }))
-        .sort((a, b) => b.mtime - a.mtime);
-      if (files.length > 0) {
-        lastBackup = {
-          file: files[0].name,
-          time: files[0].mtime.toISOString(),
-          count: files.length,
-        };
-      }
+  // Check Google Drive backup (fast with cache)
+  if (!cachedDriveBackup || (Date.now() - lastDriveBackupFetchTime > DRIVE_BACKUP_CACHE_TTL_MS)) {
+    if (!cachedDriveBackup) {
+      try {
+        await Promise.race([
+          getLatestDriveBackupInfo(),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]);
+      } catch {}
+    } else {
+      getLatestDriveBackupInfo().catch(() => {});
     }
-  } catch {
-    /* ignore */
+  }
+
+  let lastBackup = cachedDriveBackup || null;
+
+  // Fallback to local disk if Google Drive info is not available
+  if (!lastBackup) {
+    try {
+      const bDir =
+        process.platform === "win32"
+          ? "D:\\glass-backups"
+          : path.join(__dirname, "backups");
+      if (fs.existsSync(bDir)) {
+        const files = fs
+          .readdirSync(bDir)
+          .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
+          .map((f) => ({
+            name: f,
+            mtime: fs.statSync(path.join(bDir, f)).mtime,
+            size: fs.statSync(path.join(bDir, f)).size,
+          }))
+          .sort((a, b) => b.mtime - a.mtime);
+        if (files.length > 0) {
+          lastBackup = {
+            file: files[0].name,
+            time: files[0].mtime.toISOString(),
+            sizeMB: parseFloat((files[0].size / (1024 * 1024)).toFixed(2)),
+            count: files.length,
+            source: "local_disk",
+          };
+        }
+      }
+    } catch {
+      /* ignore */
+    }
   }
 
   let primaryHost = process.env.DB_HOST || "dbstudio.hg-alshour.online";
@@ -192,6 +298,8 @@ app.get("/health", async (req, res) => {
 
   res.json({
     status: "ok",
+    systemVersion: SYSTEM_VERSION,
+    version: SYSTEM_VERSION,
     activeDb: dbState.activeDb || "primary",
     activeServer: {
       name: primaryHost.includes("dbstudio") ? "Data Studio HA Cluster" : "AWS Cloud",
@@ -214,7 +322,11 @@ app.get("/health", async (req, res) => {
     nextPeriodicSyncAt: dbState.nextPeriodicSyncAt,
     failoverHistory: dbState.failoverHistory.slice(-5),
     lastBackup,
-    lastAutoBackup: lastAutoBackup || null,
+    lastAutoBackup: lastAutoBackup || (lastBackup ? {
+      file: lastBackup.file,
+      sizeMB: lastBackup.sizeMB,
+      time: lastBackup.time,
+    } : null),
     manualLock: dbState.manualLock,
     manualLockExpiredAt:
       dbState.manualLock && dbState.manualLockTime
@@ -482,35 +594,11 @@ function buildPgCmd(tool, dbEnv, extraArgs) {
 
 /* ── Google Drive: download latest backup (with progress callback) ── */
 async function downloadLatestFromDrive(onProgress) {
-  const { google } = require("googleapis");
-
-  let clientId, clientSecret, refreshToken;
-  const credFile = path.join(__dirname, "credentials", "oauth-client.json");
-  const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
-
-  if (fs.existsSync(credFile) && fs.existsSync(tokenFile)) {
-    const creds = JSON.parse(fs.readFileSync(credFile, "utf8"));
-    const key = Object.keys(creds)[0];
-    clientId = creds[key].client_id;
-    clientSecret = creds[key].client_secret;
-    const tokens = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
-    refreshToken = tokens.refresh_token;
-  } else {
-    clientId = process.env.GDRIVE_CLIENT_ID;
-    clientSecret = process.env.GDRIVE_CLIENT_SECRET;
-    refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
-  }
-
-  const folderId =
-    process.env.GDRIVE_FOLDER_ID || "1sOVQgZ2A_Vfr2KfZ5I1yjjwSIMH3R3Iw";
-
-  if (!clientId || !clientSecret || !refreshToken) {
+  const client = getGoogleDriveClient();
+  if (!client) {
     throw new Error("Google Drive credentials not configured");
   }
-
-  const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
-  oauth2.setCredentials({ refresh_token: refreshToken });
-  const drive = google.drive({ version: "v3", auth: oauth2 });
+  const { drive, folderId } = client;
 
   const list = await drive.files.list({
     q: `'${folderId}' in parents and trashed = false and name contains 'glass_system'`,
@@ -571,35 +659,11 @@ function setupSSE(res) {
 
 /* ── Google Drive: upload file (works with files OR env vars) ── */
 async function uploadToDrive(filePath) {
-  const { google } = require("googleapis");
-
-  let clientId, clientSecret, refreshToken;
-  const credFile = path.join(__dirname, "credentials", "oauth-client.json");
-  const tokenFile = path.join(__dirname, "credentials", "gdrive-token.json");
-
-  if (fs.existsSync(credFile) && fs.existsSync(tokenFile)) {
-    const creds = JSON.parse(fs.readFileSync(credFile, "utf8"));
-    const key = Object.keys(creds)[0];
-    clientId = creds[key].client_id;
-    clientSecret = creds[key].client_secret;
-    const tokens = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
-    refreshToken = tokens.refresh_token;
-  } else {
-    clientId = process.env.GDRIVE_CLIENT_ID;
-    clientSecret = process.env.GDRIVE_CLIENT_SECRET;
-    refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
-  }
-
-  const folderId =
-    process.env.GDRIVE_FOLDER_ID || "1sOVQgZ2A_Vfr2KfZ5I1yjjwSIMH3R3Iw";
-
-  if (!clientId || !clientSecret || !refreshToken) {
+  const client = getGoogleDriveClient();
+  if (!client) {
     throw new Error("Google Drive credentials not configured");
   }
-
-  const oauth2 = new google.auth.OAuth2(clientId, clientSecret);
-  oauth2.setCredentials({ refresh_token: refreshToken });
-  const drive = google.drive({ version: "v3", auth: oauth2 });
+  const { drive, folderId } = client;
 
   const fileName = path.basename(filePath);
   const res = await drive.files.create({
@@ -894,6 +958,14 @@ async function autoBackupToDrive() {
       sizeMB: parseFloat(sizeMB),
       time: new Date().toISOString(),
     };
+    cachedDriveBackup = {
+      file: path.basename(backupFile),
+      sizeMB: parseFloat(sizeMB),
+      time: new Date().toISOString(),
+      count: (cachedDriveBackup?.count || 0) + 1,
+      source: "google_drive",
+    };
+    lastDriveBackupFetchTime = Date.now();
     console.log(
       `✅ Auto-backup complete: ${lastAutoBackup.file} (${sizeMB} MB)`,
     );
