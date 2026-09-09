@@ -60,7 +60,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.1";
+const SYSTEM_VERSION = "v.26.9.2";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -2673,11 +2673,20 @@ app.get("/products", async (req, res) => {
   }
 });
 
-// جلب الأكواد الفرعية لمجموعة أصناف (لاستخدام الفواتير)
+// جلب الأكواد الفرعية لمجموعة أصناف (لاستخدام الفواتير والتحويلات)
 app.get("/products/variants", async (req, res) => {
   try {
     const { product_ids } = req.query;
-    if (!product_ids) return res.json([]);
+    if (!product_ids || product_ids === "all") {
+      const result = await pool.query(
+        `SELECT pv.*, 
+                COALESCE(NULLIF(pv.retail_package, ''), p.retail_package) AS retail_package
+         FROM product_variants pv
+         JOIN products p ON p.id = pv.product_id
+         ORDER BY pv.product_id, pv.id`,
+      );
+      return res.json(result.rows);
+    }
 
     const ids = product_ids.split(",").map(Number).filter(Boolean);
     if (ids.length === 0) return res.json([]);
@@ -8155,15 +8164,15 @@ app.get("/products/for-replace", async (req, res) => {
         p.purchase_price,
         p.wholesale_price,
         'purchase' AS discount_base,
-        COALESCE(SUM(s.quantity), 0) AS available_quantity
+        COALESCE(s.qty, 0) AS available_quantity
       FROM products p
-      LEFT JOIN stock s
-        ON s.product_id = p.id
-        AND s.warehouse_id = $1
-      LEFT JOIN manufacturers m
-        ON m.name = p.manufacturer
+      LEFT JOIN (
+        SELECT product_id, SUM(quantity) AS qty
+        FROM stock
+        WHERE warehouse_id = $1
+        GROUP BY product_id
+      ) s ON s.product_id = p.id
       WHERE p.is_active = true
-      GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package, p.manufacturer, p.purchase_price, p.wholesale_price
       ORDER BY p.name
       `,
       [warehouse_id],
