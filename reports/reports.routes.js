@@ -6,6 +6,7 @@ router.get("/inventory-summary", reports.getInventorySummary);
 router.get("/product-movement", reports.getProductMovement);
 router.get("/product-current-stock", reports.getProductCurrentStock);
 router.get("/low-stock", reports.getLowStock);
+router.get("/low-stock-reorder-count", reports.getLowStockReorderCount);
 router.get("/negative-stock", reports.getNegativeStock);
 router.get("/inventory-value", reports.getInventoryValue);
 

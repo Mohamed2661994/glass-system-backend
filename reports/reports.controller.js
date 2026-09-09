@@ -345,6 +345,44 @@ exports.getLowStock = async (req, res) => {
 };
 
 /* ===============================
+   ⚡ عدد نواقص طلب التحويل (سريع ومجمع للوحة التحكم)
+================================ */
+exports.getLowStockReorderCount = async (req, res) => {
+  try {
+    const result = await pool.query(`
+      WITH ws_stock AS (
+        SELECT s2.product_id, MAX(s2.quantity) AS max_ws_qty
+        FROM stock s2
+        JOIN warehouses w2 ON w2.id = s2.warehouse_id
+        WHERE w2.name = 'المخزن الرئيسي'
+        GROUP BY s2.product_id
+      )
+      SELECT
+        COUNT(*) AS total_count,
+        COUNT(*) FILTER (WHERE s.quantity = 0) AS zero_count
+      FROM stock s
+      JOIN products p ON p.id = s.product_id
+      JOIN warehouses w ON w.id = s.warehouse_id
+      LEFT JOIN ws_stock ws ON ws.product_id = p.id
+      WHERE w.name = 'مخزن المعرض'
+        AND s.quantity >= 0 AND s.quantity <= 5
+        AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
+        AND p.is_active = true
+        AND (s.quantity > 0 OR COALESCE(ws.max_ws_qty, 0) > 0);
+    `);
+
+    res.json({
+      success: true,
+      totalCount: Number(result.rows[0]?.total_count || 0),
+      zeroCount: Number(result.rows[0]?.zero_count || 0),
+    });
+  } catch (err) {
+    console.error("LOW STOCK REORDER COUNT ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+/* ===============================
    ⚠️ أصناف سالبة (كمية < 0)
    — يحسب الرصيد الفعلي من حركات المخزون
 ================================ */
