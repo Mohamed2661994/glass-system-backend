@@ -2106,6 +2106,78 @@ async function normalizeInvoiceItemsForStorage(
   const normalizedItems = [];
   const variantMetaCache = new Map();
 
+  // 🚀 Batch pre-fetch all product and variant metadata and costs for this invoice
+  const productCostCache = new Map();
+  const variantCostCache = new Map();
+
+  try {
+    const productIds = Array.from(
+      new Set(
+        (items || [])
+          .map((it) => Number(it?.product_id || 0))
+          .filter((id) => id > 0),
+      ),
+    );
+
+    if (productIds.length > 0) {
+      const [productsRes, variantsRes] = await Promise.all([
+        client.query(
+          `SELECT id, wholesale_package, retail_package, purchase_price, retail_purchase_price 
+           FROM products WHERE id = ANY($1)`,
+          [productIds],
+        ),
+        client.query(
+          `SELECT id, product_id, wholesale_package, retail_package, purchase_price, retail_purchase_price 
+           FROM product_variants WHERE product_id = ANY($1)`,
+          [productIds],
+        ),
+      ]);
+
+      for (const p of productsRes.rows) {
+        productCostCache.set(Number(p.id), p);
+      }
+
+      const variantsByProduct = new Map();
+      for (const v of variantsRes.rows) {
+        const pid = Number(v.product_id);
+        if (!variantsByProduct.has(pid)) variantsByProduct.set(pid, []);
+        variantsByProduct.get(pid).push(v);
+        variantCostCache.set(`${pid}:${Number(v.id)}`, v);
+      }
+
+      for (const pid of productIds) {
+        const pRow = productCostCache.get(pid) || {};
+        const basePackages = new Set();
+        const wholesalePkg = normalizePackageName(pRow.wholesale_package);
+        const retailPkg = normalizePackageName(pRow.retail_package);
+        if (wholesalePkg) basePackages.add(wholesalePkg);
+        if (retailPkg) basePackages.add(retailPkg);
+
+        const vRows = variantsByProduct.get(pid) || [];
+        const validVariantIds = new Set();
+        const variantPackageMap = new Map();
+
+        for (const v of vRows) {
+          const vid = Number(v.id || 0);
+          if (!vid) continue;
+          validVariantIds.add(vid);
+          const vWholesale = normalizePackageName(v.wholesale_package);
+          const vRetail = normalizePackageName(v.retail_package);
+          if (vWholesale) variantPackageMap.set(vWholesale, vid);
+          if (vRetail) variantPackageMap.set(vRetail, vid);
+        }
+
+        variantMetaCache.set(pid, {
+          validVariantIds,
+          variantPackageMap,
+          basePackages,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ Batch prefetch fallback:", err.message);
+  }
+
   for (const item of items) {
     const quantity = Number(item.quantity || 0);
     const price = Number(item.price || 0);
@@ -2117,6 +2189,42 @@ async function normalizeInvoiceItemsForStorage(
       variantMetaCache,
     );
 
+    let costPrice = 0;
+    const pid = Number(item.product_id || 0);
+    const vid = Number(variantId || 0);
+    const pRow = productCostCache.get(pid);
+    const vRow = variantCostCache.get(`${pid}:${vid}`);
+
+    if (pRow) {
+      const productPurchasePrice = Number(pRow.purchase_price || 0);
+      const productRetailPurchasePrice = Number(pRow.retail_purchase_price || 0);
+      const variantPurchasePrice = Number(vRow?.purchase_price || 0);
+      const variantRetailPurchasePrice = Number(vRow?.retail_purchase_price || 0);
+
+      if (invoiceType === "retail") {
+        costPrice =
+          variantRetailPurchasePrice ||
+          productRetailPurchasePrice ||
+          variantPurchasePrice ||
+          productPurchasePrice ||
+          0;
+      } else {
+        costPrice =
+          variantPurchasePrice ||
+          productPurchasePrice ||
+          variantRetailPurchasePrice ||
+          productRetailPurchasePrice ||
+          0;
+      }
+    } else {
+      costPrice = await getInvoiceItemCostSnapshot(
+        item.product_id,
+        variantId,
+        invoiceType,
+        client,
+      );
+    }
+
     normalizedItems.push({
       ...item,
       package: item.package || "",
@@ -2126,12 +2234,7 @@ async function normalizeInvoiceItemsForStorage(
       variant_id: variantId,
       itemIsReturn: Boolean(item.is_return),
       itemTotal: price * quantity - discount * quantity,
-      costPrice: await getInvoiceItemCostSnapshot(
-        item.product_id,
-        variantId,
-        invoiceType,
-        client,
-      ),
+      costPrice,
     });
   }
 
@@ -3751,7 +3854,8 @@ VALUES
       );
     }
 
-    // Stock updates per item (need conditional logic)
+    // Stock updates per item (with batch stock_movements insertion)
+    const stockMovementsToInsert = [];
     for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
       const itemIsReturn = item.itemIsReturn;
@@ -3767,12 +3871,14 @@ VALUES
             quantity: item.quantity,
             reason: `لا يمكن تسجيل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
           });
-          await client.query(
-            `INSERT INTO stock_movements
-             (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-             VALUES ($1,$2,$3,$4,$5,'return_purchase')`,
-            [invoiceId, warehouseId, item.product_id, variantId, item.quantity],
-          );
+          stockMovementsToInsert.push({
+            invoiceId,
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            movementType: "return_purchase",
+          });
         } else {
           // 🟢 شراء → زيادة المخزون
           await client.query(
@@ -3784,12 +3890,14 @@ VALUES
             `,
             [warehouseId, item.product_id, variantId, item.quantity],
           );
-          await client.query(
-            `INSERT INTO stock_movements
-             (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-             VALUES ($1,$2,$3,$4,$5,'purchase')`,
-            [invoiceId, warehouseId, item.product_id, variantId, item.quantity],
-          );
+          stockMovementsToInsert.push({
+            invoiceId,
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            movementType: "purchase",
+          });
         }
       }
 
@@ -3805,12 +3913,14 @@ VALUES
             `,
             [warehouseId, item.product_id, variantId, item.quantity],
           );
-          await client.query(
-            `INSERT INTO stock_movements
-             (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-             VALUES ($1,$2,$3,$4,$5,'return_sale')`,
-            [invoiceId, warehouseId, item.product_id, variantId, item.quantity],
-          );
+          stockMovementsToInsert.push({
+            invoiceId,
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            movementType: "return_sale",
+          });
         } else {
           // 🔴 بيع → خصم من المخزون
           await decrementStockOrThrow(client, {
@@ -3820,14 +3930,42 @@ VALUES
             quantity: item.quantity,
             reason: `رصيد غير كافٍ للبيع: ${item.product_name}`,
           });
-          await client.query(
-            `INSERT INTO stock_movements
-             (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-             VALUES ($1,$2,$3,$4,$5,'sale')`,
-            [invoiceId, warehouseId, item.product_id, variantId, item.quantity],
-          );
+          stockMovementsToInsert.push({
+            invoiceId,
+            warehouseId,
+            productId: item.product_id,
+            variantId,
+            quantity: item.quantity,
+            movementType: "sale",
+          });
         }
       }
+    }
+
+    // 🚀 Batch INSERT for stock_movements
+    if (stockMovementsToInsert.length > 0) {
+      const smValues = [];
+      const smParams = [];
+      let smIdx = 1;
+      for (const sm of stockMovementsToInsert) {
+        smValues.push(
+          `($${smIdx++},$${smIdx++},$${smIdx++},$${smIdx++},$${smIdx++},$${smIdx++})`,
+        );
+        smParams.push(
+          sm.invoiceId,
+          sm.warehouseId,
+          sm.productId,
+          sm.variantId,
+          sm.quantity,
+          sm.movementType,
+        );
+      }
+      await client.query(
+        `INSERT INTO stock_movements
+         (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
+         VALUES ${smValues.join(",")}`,
+        smParams,
+      );
     }
 
     // 🔔 إشعار للمخزن لو المعرض عمل فاتورة جملة
@@ -4145,7 +4283,8 @@ app.post("/invoices/retail", async (req, res) => {
       );
     }
 
-    // Stock updates per item
+    // Stock updates per item (with batch stock_movements insertion)
+    const retailStockMovementsToInsert = [];
     for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
       const itemIsReturn = item.itemIsReturn;
@@ -4192,18 +4331,39 @@ app.post("/invoices/retail", async (req, res) => {
         }
       }
 
+      retailStockMovementsToInsert.push({
+        invoiceId,
+        warehouseId,
+        productId: item.product_id,
+        variantId,
+        quantity: item.quantity,
+        movementType: itemIsReturn ? `return_${movement_type}` : movement_type,
+      });
+    }
+
+    // 🚀 Batch INSERT for stock_movements
+    if (retailStockMovementsToInsert.length > 0) {
+      const smValues = [];
+      const smParams = [];
+      let smIdx = 1;
+      for (const sm of retailStockMovementsToInsert) {
+        smValues.push(
+          `($${smIdx++},$${smIdx++},$${smIdx++},$${smIdx++},$${smIdx++},$${smIdx++})`,
+        );
+        smParams.push(
+          sm.invoiceId,
+          sm.warehouseId,
+          sm.productId,
+          sm.variantId,
+          sm.quantity,
+          sm.movementType,
+        );
+      }
       await client.query(
         `INSERT INTO stock_movements
          (invoice_id, warehouse_id, product_id, variant_id, quantity, movement_type)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [
-          invoiceId,
-          warehouseId,
-          item.product_id,
-          variantId,
-          item.quantity,
-          itemIsReturn ? `return_${movement_type}` : movement_type,
-        ],
+         VALUES ${smValues.join(",")}`,
+        smParams,
       );
     }
 
