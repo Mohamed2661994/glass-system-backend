@@ -2539,12 +2539,39 @@ exports.getManufacturerAnalytics = async (req, res) => {
 exports.getStockWatchdog = async (req, res) => {
   try {
     const io = req.app.get("io");
+    const { warehouse_id, branch_id } = req.query;
+    const targetBranch = warehouse_id || branch_id;
+
     if (req.query.force === "true") {
       const freshData = await stockWatchdogService.runAudit({ io, force: true });
+      if (targetBranch) {
+        const filtered = freshData.anomalies.filter(
+          (a) => Number(a.warehouse_id) === Number(targetBranch)
+        );
+        return res.json({
+          ...freshData,
+          anomalies: filtered,
+          count: filtered.length,
+          has_anomalies: filtered.length > 0,
+        });
+      }
       return res.json(freshData);
     }
+
     // Instant 0.1ms retrieval from server memory
     const status = stockWatchdogService.getAnomalies();
+    if (targetBranch) {
+      const filtered = status.anomalies.filter(
+        (a) => Number(a.warehouse_id) === Number(targetBranch)
+      );
+      return res.json({
+        ...status,
+        anomalies: filtered,
+        count: filtered.length,
+        has_anomalies: filtered.length > 0,
+      });
+    }
+
     res.json(status);
   } catch (err) {
     console.error("STOCK WATCHDOG ERROR:", err);
