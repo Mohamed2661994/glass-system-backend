@@ -164,10 +164,72 @@ function initStartupAudit(io) {
   }, 5000);
 }
 
+/**
+ * Automatically reconciles stock table quantities to match the actual
+ * cumulative sum from stock_movements (for specified warehouse or all warehouses).
+ */
+async function reconcileStock({ warehouseId = null, io = null, adminName = "Admin" } = {}) {
+  try {
+    const params = [];
+    let whCondition = "";
+    if (warehouseId && Number(warehouseId) > 0) {
+      params.push(Number(warehouseId));
+      whCondition = "WHERE sm.warehouse_id = $1";
+    }
+
+    const reconcileQuery = `
+      WITH actual_stock AS (
+        SELECT
+          sm.warehouse_id,
+          sm.product_id,
+          COALESCE(sm.variant_id, 0) AS variant_id,
+          COALESCE(SUM(
+            CASE 
+              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in') THEN sm.quantity
+              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out') THEN -sm.quantity
+              ELSE 0
+            END
+          ), 0) AS actual_quantity
+        FROM stock_movements sm
+        ${whCondition}
+        GROUP BY sm.warehouse_id, sm.product_id, sm.variant_id
+      )
+      INSERT INTO stock (warehouse_id, product_id, variant_id, quantity, updated_at)
+      SELECT a.warehouse_id, a.product_id, a.variant_id, a.actual_quantity, NOW()
+      FROM actual_stock a
+      LEFT JOIN stock s ON s.warehouse_id = a.warehouse_id AND s.product_id = a.product_id AND COALESCE(s.variant_id, 0) = a.variant_id
+      WHERE a.actual_quantity != COALESCE(s.quantity, 0)
+      ON CONFLICT (warehouse_id, product_id, variant_id)
+      DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = NOW()
+      RETURNING warehouse_id, product_id, variant_id, quantity;
+    `;
+
+    console.log(`⚡ [Stock Watchdog] Reconciling stock (warehouse: ${warehouseId || "ALL"})...`);
+    const res = await pool.query(reconcileQuery, params);
+    const updatedCount = res.rows.length;
+    console.log(`✅ [Stock Watchdog] Successfully reconciled ${updatedCount} items in stock table by ${adminName}.`);
+
+    // Force an immediate audit refresh and broadcast the new clean status via Socket.IO
+    await runAudit({ io, force: true });
+
+    return {
+      success: true,
+      reconciled_count: updatedCount,
+      warehouse_id: warehouseId || "all",
+      updated_items: res.rows,
+    };
+  } catch (err) {
+    console.error("❌ [Stock Watchdog] Reconcile error:", err.message);
+    throw err;
+  }
+}
+
 module.exports = {
   getAnomalies,
   runAudit,
   scheduleDebouncedAudit,
   broadcastStatus,
   initStartupAudit,
+  reconcileStock,
 };
+

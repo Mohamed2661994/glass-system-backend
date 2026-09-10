@@ -2578,3 +2578,27 @@ exports.getStockWatchdog = async (req, res) => {
     res.status(500).json({ error: "Server error", details: err.message });
   }
 };
+
+/* ===============================
+   ⚡ تسوية ومطابقة الأرصدة تلقائياً
+   تحديث جدول stock ليطابق دفتر الحركات الفعلي stock_movements
+================================ */
+exports.reconcileStockWatchdog = async (req, res) => {
+  try {
+    const io = req.app.get("io");
+    const { warehouse_id } = req.body || {};
+    const adminUser = req.user ? (req.user.name || req.user.username || `User #${req.user.id}`) : "Admin";
+
+    const result = await stockWatchdogService.reconcileStock({
+      warehouseId: warehouse_id ? Number(warehouse_id) : null,
+      io,
+      adminName: adminUser,
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error("RECONCILE STOCK WATCHDOG ERROR:", err);
+    res.status(500).json({ error: "Failed to reconcile stock", details: err.message });
+  }
+};
+

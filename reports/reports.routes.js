@@ -10,8 +10,8 @@ router.get("/low-stock-reorder-count", reports.getLowStockReorderCount);
 router.get("/negative-stock", reports.getNegativeStock);
 router.get("/inventory-value", reports.getInventoryValue);
 
-// ✅ أضف السطر ده
 router.get("/stock-watchdog", reports.getStockWatchdog);
+router.post("/stock-watchdog/reconcile", reports.reconcileStockWatchdog);
 router.get("/products", reports.getAllProducts);
 router.get("/customer-balances", reports.getCustomerBalances);
 router.get("/inventory-details", reports.getInventoryDetails);
