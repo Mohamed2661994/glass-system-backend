@@ -1577,6 +1577,125 @@ app.post("/webhook/github", (req, res) => {
   });
 });
 
+/**
+ * 🚀 High-Performance Atomic Batch Stock Changes
+ * Executes all stock decrements in a single multi-row UPDATE (1 network round-trip)
+ * and all stock increments in a single multi-row UPSERT (1 network round-trip).
+ * Preserves strict zero/negative stock guards and returns exact error on deficit.
+ */
+async function batchApplyStockChanges(client, { warehouseId, operations }) {
+  if (!operations || operations.length === 0) return;
+
+  const decrements = [];
+  const increments = [];
+
+  for (const op of operations) {
+    const qty = Number(op.quantity || 0);
+    if (qty <= 0) continue;
+    const item = {
+      productId: Number(op.productId || op.product_id),
+      variantId: Number(op.variantId || op.variant_id || 0),
+      quantity: qty,
+      productName: op.productName || op.product_name || `صنف #${op.productId || op.product_id}`,
+      reason: op.reason,
+    };
+    if (op.type === "decrement") {
+      decrements.push(item);
+    } else if (op.type === "increment") {
+      increments.push(item);
+    }
+  }
+
+  // 1. Process all increments in ONE single atomic multi-row UPSERT
+  if (increments.length > 0) {
+    const aggregatedIncrements = new Map();
+    for (const inc of increments) {
+      const key = `${inc.productId}:${inc.variantId}`;
+      if (!aggregatedIncrements.has(key)) {
+        aggregatedIncrements.set(key, { ...inc });
+      } else {
+        aggregatedIncrements.get(key).quantity += inc.quantity;
+      }
+    }
+
+    const incList = Array.from(aggregatedIncrements.values());
+    const valPlaceholders = [];
+    const params = [];
+    let pIdx = 1;
+
+    for (const inc of incList) {
+      valPlaceholders.push(`($${pIdx++}, $${pIdx++}, $${pIdx++}, $${pIdx++})`);
+      params.push(warehouseId, inc.productId, inc.variantId, inc.quantity);
+    }
+
+    await client.query(
+      `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+       VALUES ${valPlaceholders.join(", ")}
+       ON CONFLICT (warehouse_id, product_id, variant_id)
+       DO UPDATE SET quantity = stock.quantity + EXCLUDED.quantity`,
+      params
+    );
+  }
+
+  // 2. Process all decrements in ONE single atomic multi-row UPDATE
+  if (decrements.length > 0) {
+    const aggregatedDecrements = new Map();
+    for (const dec of decrements) {
+      const key = `${dec.productId}:${dec.variantId}`;
+      if (!aggregatedDecrements.has(key)) {
+        aggregatedDecrements.set(key, { ...dec });
+      } else {
+        aggregatedDecrements.get(key).quantity += dec.quantity;
+      }
+    }
+
+    const decList = Array.from(aggregatedDecrements.values());
+    const valPlaceholders = [];
+    const params = [warehouseId];
+    let pIdx = 2;
+
+    for (const dec of decList) {
+      valPlaceholders.push(
+        `($1::int, $${pIdx++}::int, $${pIdx++}::int, $${pIdx++}::numeric)`
+      );
+      params.push(dec.productId, dec.variantId, dec.quantity);
+    }
+
+    const updateQuery = `
+      UPDATE stock AS s
+      SET quantity = s.quantity - v.qty
+      FROM (VALUES ${valPlaceholders.join(", ")}) AS v(wh_id, prod_id, var_id, qty)
+      WHERE s.warehouse_id = v.wh_id
+        AND s.product_id = v.prod_id
+        AND s.variant_id = v.var_id
+        AND s.quantity >= v.qty
+      RETURNING s.product_id, s.variant_id;
+    `;
+
+    const updateResult = await client.query(updateQuery, params);
+
+    if (updateResult.rowCount !== decList.length) {
+      const successfulKeys = new Set(
+        updateResult.rows.map((r) => `${r.product_id}:${r.variant_id}`)
+      );
+      for (const dec of decList) {
+        const key = `${dec.productId}:${dec.variantId}`;
+        if (!successfulKeys.has(key)) {
+          const currentRes = await client.query(
+            `SELECT quantity FROM stock WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = $3 LIMIT 1`,
+            [warehouseId, dec.productId, dec.variantId]
+          );
+          const currentQty = currentRes.rows.length ? Number(currentRes.rows[0].quantity) : 0;
+          throw new Error(
+            dec.reason || `رصيد غير كافٍ للبيع: ${dec.productName} (الرصيد المتاح: ${currentQty}، المطلوب: ${dec.quantity})`
+          );
+        }
+      }
+      throw new Error("فشل خصم بعض الأصناف من المخزون لعدم كفاية الرصيد");
+    }
+  }
+}
+
 async function decrementStockOrThrow(
   client,
   { warehouseId, productId, variantId = 0, quantity, reason },
@@ -3765,78 +3884,71 @@ app.post("/invoices", authMiddleware, async (req, res) => {
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
-    const checkExisting = await client.query(
-      "SELECT id FROM invoices WHERE customer_name = $1 AND total = $2 AND paid_amount = $3 AND created_at >= NOW() - INTERVAL '5 seconds'",
-      [customer_name, total, paid_amount],
-    );
+    const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
+
+    // 🚀 Parallel pre-fetch: duplicate check, customer resolution, supplier resolution, and normalized items
+    const [checkExisting, customerId, normalizedItems, supplierId] = await Promise.all([
+      client.query(
+        "SELECT id FROM invoices WHERE customer_name = $1 AND total = $2 AND paid_amount = $3 AND created_at >= NOW() - INTERVAL '5 seconds'",
+        [customer_name, total, paid_amount],
+      ),
+      (async () => {
+        if (!customer_name) return null;
+        let cId = null;
+        const updateRes = await client.query(
+          `UPDATE customers SET apply_items_discount = $1 WHERE name = $2 RETURNING id`,
+          [apply_items_discount, customer_name],
+        );
+        if (updateRes.rows.length > 0) {
+          cId = updateRes.rows[0].id;
+        } else {
+          const newCustomer = await client.query(
+            `INSERT INTO customers (name, customer_type, apply_items_discount)
+             VALUES ($1, $2, $3)
+             RETURNING id`,
+            [customer_name, invoice_type, apply_items_discount],
+          );
+          cId = newCustomer.rows[0].id;
+        }
+        if (customer_phone && cId) {
+          await client.query(
+            `INSERT INTO customer_phones (customer_id, phone)
+             VALUES ($1, $2)
+             ON CONFLICT (phone) DO NOTHING`,
+            [cId, customer_phone],
+          );
+        }
+        return cId;
+      })(),
+      normalizeInvoiceItemsForStorage(items, invoice_type, client),
+      (async () => {
+        if (movement_type !== "purchase" || !supplier_name) return null;
+        let sId = null;
+        const existingSupplier = await client.query(
+          `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
+          [supplier_name],
+        );
+        if (existingSupplier.rows.length > 0) {
+          sId = existingSupplier.rows[0].id;
+        } else {
+          const newSupplier = await client.query(
+            `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
+            [supplier_name],
+          );
+          sId = newSupplier.rows[0].id;
+        }
+        if (supplier_phone && sId) {
+          await client.query(
+            `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
+            [sId, supplier_phone],
+          );
+        }
+        return sId;
+      })(),
+    ]);
 
     if (checkExisting.rows.length) {
       throw new Error("تم منع إنشاء فاتورة مكررة");
-    }
-
-    let customerId = null;
-
-    if (customer_name) {
-      // 1️⃣ هل العميل موجود بالاسم؟
-      const existingCustomer = await client.query(
-        `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
-        [customer_name],
-      );
-
-      if (existingCustomer.rows.length > 0) {
-        customerId = existingCustomer.rows[0].id;
-      } else {
-        // 2️⃣ إنشاء عميل جديد بدون رقم
-        const newCustomer = await client.query(
-          `INSERT INTO customers (name, customer_type)
-       VALUES ($1, $2)
-       RETURNING id`,
-          [customer_name, invoice_type],
-        );
-        customerId = newCustomer.rows[0].id;
-      }
-
-      // 3️⃣ إضافة الرقم في جدول customer_phones لو مش موجود
-      if (customer_phone) {
-        await client.query(
-          `
-      INSERT INTO customer_phones (customer_id, phone)
-      VALUES ($1, $2)
-      ON CONFLICT (phone) DO NOTHING
-      `,
-          [customerId, customer_phone],
-        );
-      }
-
-      // Update customer discount preference
-      await client.query(
-        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
-        [apply_items_discount, customerId],
-      );
-    }
-
-    // ===== حل المورد لفواتير الشراء =====
-    let supplierId = null;
-    if (movement_type === "purchase" && supplier_name) {
-      const existingSupplier = await client.query(
-        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
-        [supplier_name],
-      );
-      if (existingSupplier.rows.length > 0) {
-        supplierId = existingSupplier.rows[0].id;
-      } else {
-        const newSupplier = await client.query(
-          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
-          [supplier_name],
-        );
-        supplierId = newSupplier.rows[0].id;
-      }
-      if (supplier_phone) {
-        await client.query(
-          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
-          [supplierId, supplier_phone],
-        );
-      }
     }
 
     /* ================== إنشاء الفاتورة ================== */
@@ -3901,16 +4013,8 @@ VALUES
     );
 
     const invoiceId = invoiceRes.rows[0].id;
-    // ✅ تسجيل العميل تلقائي لو فيه رقم
 
-    /* ================== المخزن ================== */
-    const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
-    const normalizedItems = await normalizeInvoiceItemsForStorage(
-      items,
-      invoice_type,
-      client,
-    );
-
+    /* ================== الأصناف + المخزن ================== */
     // 🚀 Batch INSERT for invoice_items
     if (normalizedItems.length > 0) {
       const itemValues = [];
@@ -3947,93 +4051,49 @@ VALUES
       );
     }
 
-    // Stock updates per item (with batch stock_movements insertion)
+    // 🚀 High-Performance Atomic Batch Stock Changes & Movements
+    const stockOps = [];
     const stockMovementsToInsert = [];
     for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
       const itemIsReturn = item.itemIsReturn;
 
-      /* ===== تحديث المخزن ===== */
+      let opType;
       if (movement_type === "purchase") {
-        if (itemIsReturn) {
-          // 🔴 مرتجع شراء → خصم من المخزون (إرجاع للمورد)
-          await decrementStockOrThrow(client, {
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            reason: `لا يمكن تسجيل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
-          });
-          stockMovementsToInsert.push({
-            invoiceId,
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            movementType: "return_purchase",
-          });
-        } else {
-          // 🟢 شراء → زيادة المخزون
-          await client.query(
-            `
-            INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-            VALUES ($1,$2,$3,$4)
-            ON CONFLICT (warehouse_id, product_id, variant_id)
-            DO UPDATE SET quantity = stock.quantity + $4
-            `,
-            [warehouseId, item.product_id, variantId, item.quantity],
-          );
-          stockMovementsToInsert.push({
-            invoiceId,
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            movementType: "purchase",
-          });
-        }
+        opType = itemIsReturn ? "decrement" : "increment";
+      } else {
+        opType = itemIsReturn ? "increment" : "decrement";
       }
 
-      if (movement_type === "sale") {
-        if (itemIsReturn) {
-          // 🟢 مرتجع بيع → إضافة للمخزون (إرجاع من العميل)
-          await client.query(
-            `
-            INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-            VALUES ($1,$2,$3,$4)
-            ON CONFLICT (warehouse_id, product_id, variant_id)
-            DO UPDATE SET quantity = stock.quantity + $4
-            `,
-            [warehouseId, item.product_id, variantId, item.quantity],
-          );
-          stockMovementsToInsert.push({
-            invoiceId,
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            movementType: "return_sale",
-          });
-        } else {
-          // 🔴 بيع → خصم من المخزون
-          await decrementStockOrThrow(client, {
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            reason: `رصيد غير كافٍ للبيع: ${item.product_name}`,
-          });
-          stockMovementsToInsert.push({
-            invoiceId,
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            movementType: "sale",
-          });
-        }
-      }
+      stockOps.push({
+        productId: item.product_id,
+        variantId,
+        quantity: item.quantity,
+        type: opType,
+        productName: item.product_name,
+        reason:
+          movement_type === "sale" && !itemIsReturn
+            ? `رصيد غير كافٍ للبيع: ${item.product_name}`
+            : movement_type === "purchase" && itemIsReturn
+            ? `لا يمكن تسجيل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`
+            : undefined,
+      });
+
+      stockMovementsToInsert.push({
+        invoiceId,
+        warehouseId,
+        productId: item.product_id,
+        variantId,
+        quantity: item.quantity,
+        movementType: itemIsReturn ? `return_${movement_type}` : movement_type,
+      });
     }
+
+    // Execute all stock changes in 1 single atomic multi-row query
+    await batchApplyStockChanges(client, {
+      warehouseId,
+      operations: stockOps,
+    });
 
     // 🚀 Batch INSERT for stock_movements
     if (stockMovementsToInsert.length > 0) {
@@ -4212,65 +4272,64 @@ app.post("/invoices/retail", async (req, res) => {
     const payment_status =
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
-    let customerId = null;
+    const warehouseId = getWarehouseIdByInvoiceType("retail");
 
-    if (customer_name) {
-      const existingCustomer = await client.query(
-        `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
-        [customer_name],
-      );
-
-      if (existingCustomer.rows.length > 0) {
-        customerId = existingCustomer.rows[0].id;
-      } else {
-        const newCustomer = await client.query(
-          `INSERT INTO customers (name, customer_type)
-       VALUES ($1, 'retail')
-       RETURNING id`,
-          [customer_name],
+    // 🚀 Parallel pre-fetch: resolve customer, supplier, and normalized items simultaneously
+    const [customerId, normalizedItems, supplierId] = await Promise.all([
+      (async () => {
+        if (!customer_name) return null;
+        let cId = null;
+        const updateRes = await client.query(
+          `UPDATE customers SET apply_items_discount = $1 WHERE name = $2 RETURNING id`,
+          [apply_items_discount, customer_name],
         );
-        customerId = newCustomer.rows[0].id;
-      }
-
-      if (customer_phone) {
-        await client.query(
-          `INSERT INTO customer_phones (customer_id, phone)
-       VALUES ($1, $2)
-       ON CONFLICT (phone) DO NOTHING`,
-          [customerId, customer_phone],
-        );
-      }
-
-      // Update customer discount preference
-      await client.query(
-        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
-        [apply_items_discount, customerId],
-      );
-    }
-
-    // ===== حل المورد لفواتير الشراء =====
-    let supplierId = null;
-    if (movement_type === "purchase" && supplier_name) {
-      const existingSupplier = await client.query(
-        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
-        [supplier_name],
-      );
-      if (existingSupplier.rows.length > 0) {
-        supplierId = existingSupplier.rows[0].id;
-      } else {
-        const newSupplier = await client.query(
-          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
+        if (updateRes.rows.length > 0) {
+          cId = updateRes.rows[0].id;
+        } else {
+          const newCustomer = await client.query(
+            `INSERT INTO customers (name, customer_type, apply_items_discount)
+             VALUES ($1, 'retail', $2)
+             RETURNING id`,
+            [customer_name, apply_items_discount],
+          );
+          cId = newCustomer.rows[0].id;
+        }
+        if (customer_phone && cId) {
+          await client.query(
+            `INSERT INTO customer_phones (customer_id, phone)
+             VALUES ($1, $2)
+             ON CONFLICT (phone) DO NOTHING`,
+            [cId, customer_phone],
+          );
+        }
+        return cId;
+      })(),
+      normalizeInvoiceItemsForStorage(items, "retail", client),
+      (async () => {
+        if (movement_type !== "purchase" || !supplier_name) return null;
+        let sId = null;
+        const existingSupplier = await client.query(
+          `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
           [supplier_name],
         );
-        supplierId = newSupplier.rows[0].id;
-      }
-      if (supplier_phone) {
-        await client.query(
-          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
-          [supplierId, supplier_phone],
-        );
-      }
-    }
+        if (existingSupplier.rows.length > 0) {
+          sId = existingSupplier.rows[0].id;
+        } else {
+          const newSupplier = await client.query(
+            `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
+            [supplier_name],
+          );
+          sId = newSupplier.rows[0].id;
+        }
+        if (supplier_phone && sId) {
+          await client.query(
+            `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
+            [sId, supplier_phone],
+          );
+        }
+        return sId;
+      })(),
+    ]);
 
     /* ================== إنشاء الفاتورة ================== */
     const invoiceRes = await client.query(
@@ -4331,14 +4390,6 @@ app.post("/invoices/retail", async (req, res) => {
     );
 
     const invoiceId = invoiceRes.rows[0].id;
-    // ✅ تسجيل العميل تلقائي لو فيه رقم
-
-    const warehouseId = getWarehouseIdByInvoiceType("retail");
-    const normalizedItems = await normalizeInvoiceItemsForStorage(
-      items,
-      "retail",
-      client,
-    );
 
     /* ================== الأصناف + المخزن ================== */
     // 🚀 Batch INSERT for invoice_items
@@ -4376,53 +4427,33 @@ app.post("/invoices/retail", async (req, res) => {
       );
     }
 
-    // Stock updates per item (with batch stock_movements insertion)
+    // 🚀 High-Performance Atomic Batch Stock Changes & Movements
+    const stockOps = [];
     const retailStockMovementsToInsert = [];
     for (const item of normalizedItems) {
       const variantId = item.variant_id || 0;
       const itemIsReturn = item.itemIsReturn;
 
+      let opType;
       if (movement_type === "sale") {
-        if (itemIsReturn) {
-          // 🟢 مرتجع بيع → إضافة للمخزون
-          await client.query(
-            `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-             VALUES ($1,$2,$3,$4)
-             ON CONFLICT (warehouse_id, product_id, variant_id)
-             DO UPDATE SET quantity = stock.quantity + $4`,
-            [warehouseId, item.product_id, variantId, item.quantity],
-          );
-        } else {
-          // 🔴 بيع → خصم من المخزون
-          await decrementStockOrThrow(client, {
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            reason: `رصيد غير كافٍ للبيع: ${item.product_name}`,
-          });
-        }
+        opType = itemIsReturn ? "increment" : "decrement";
       } else {
-        if (itemIsReturn) {
-          // 🔴 مرتجع شراء → خصم من المخزون
-          await decrementStockOrThrow(client, {
-            warehouseId,
-            productId: item.product_id,
-            variantId,
-            quantity: item.quantity,
-            reason: `لا يمكن تسجيل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`,
-          });
-        } else {
-          // 🟢 شراء → زيادة المخزون
-          await client.query(
-            `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-             VALUES ($1,$2,$3,$4)
-             ON CONFLICT (warehouse_id, product_id, variant_id)
-             DO UPDATE SET quantity = stock.quantity + $4`,
-            [warehouseId, item.product_id, variantId, item.quantity],
-          );
-        }
+        opType = itemIsReturn ? "decrement" : "increment";
       }
+
+      stockOps.push({
+        productId: item.product_id,
+        variantId,
+        quantity: item.quantity,
+        type: opType,
+        productName: item.product_name,
+        reason:
+          movement_type === "sale" && !itemIsReturn
+            ? `رصيد غير كافٍ للبيع: ${item.product_name}`
+            : movement_type === "purchase" && itemIsReturn
+            ? `لا يمكن تسجيل مرتجع الشراء بدون رصيد كافٍ: ${item.product_name}`
+            : undefined,
+      });
 
       retailStockMovementsToInsert.push({
         invoiceId,
@@ -4433,6 +4464,12 @@ app.post("/invoices/retail", async (req, res) => {
         movementType: itemIsReturn ? `return_${movement_type}` : movement_type,
       });
     }
+
+    // Execute all stock changes in 1 single atomic multi-row query
+    await batchApplyStockChanges(client, {
+      warehouseId,
+      operations: stockOps,
+    });
 
     // 🚀 Batch INSERT for stock_movements
     if (retailStockMovementsToInsert.length > 0) {
@@ -12092,5 +12129,8 @@ runStartupMigrations().finally(() => {
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server + Socket running on port ${PORT}`);
     stockWatchdogService.initStartupAudit(io);
+    if (typeof pool.startContinuousStandbyBackup === "function") {
+      pool.startContinuousStandbyBackup();
+    }
   });
 });

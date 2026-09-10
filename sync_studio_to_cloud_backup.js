@@ -170,8 +170,18 @@ async function syncLiveStockToBackup(sClient, bClient) {
   const columns = colDefs.map(c => c.column_name);
   const colList = columns.map(c => `"${c}"`).join(', ');
 
-  const stockRows = await sClient.query(`SELECT ${colList} FROM stock`);
-  await bClient.query(`TRUNCATE TABLE stock`);
+  // 🚀 Incremental sync: only sync products that moved in the last 30 minutes
+  const recentMovedRes = await sClient.query(`
+    SELECT DISTINCT product_id 
+    FROM stock_movements 
+    WHERE created_at >= NOW() - INTERVAL '30 minutes'
+  `);
+
+  if (recentMovedRes.rows.length === 0) return 0;
+  const pids = recentMovedRes.rows.map(r => r.product_id);
+
+  const stockRows = await sClient.query(`SELECT ${colList} FROM stock WHERE product_id = ANY($1)`, [pids]);
+  if (stockRows.rows.length === 0) return 0;
 
   let offset = 0;
   while (offset < stockRows.rows.length) {
@@ -189,9 +199,14 @@ async function syncLiveStockToBackup(sClient, bClient) {
       valuePlaceholders.push(`(${rowPlaceholders.join(', ')})`);
     }
 
+    const updateCols = columns.filter(c => !['warehouse_id', 'product_id', 'variant_id'].includes(c));
+    const updateClause = updateCols.map(c => `"${c}" = EXCLUDED."${c}"`).join(', ');
+
     await bClient.query(`
       INSERT INTO stock (${colList})
       VALUES ${valuePlaceholders.join(', ')}
+      ON CONFLICT (warehouse_id, product_id, variant_id)
+      DO UPDATE SET ${updateClause}
     `, insertParams);
     offset += batch.length;
   }

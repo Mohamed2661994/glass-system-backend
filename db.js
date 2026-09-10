@@ -3087,7 +3087,9 @@ function startPeriodicSync() {
 
 // Start background services
 startPublicWebhookDelivery();
-startContinuousStandbyBackup();
+if (process.env.STANDBY_BACKUP_ENABLED === "true" && process.env.IS_STANDBY_WORKER === "true") {
+  startContinuousStandbyBackup();
+}
 
 /* ── Exports ── */
 const pool = primaryPool;
@@ -3105,6 +3107,7 @@ pool.queuePublicWebhookTestEvent = queuePublicWebhookTestEvent;
 pool.replayPublicWebhookDelivery = replayPublicWebhookDelivery;
 pool.arePublicWebhookTestRoutesEnabled = arePublicWebhookTestRoutesEnabled;
 pool.publicWebhookConfig = PUBLIC_WEBHOOK_CONFIG;
+pool.startContinuousStandbyBackup = startContinuousStandbyBackup;
 
 module.exports = pool;
 module.exports.localPool = primaryPool;
@@ -3121,3 +3124,4 @@ module.exports.replayPublicWebhookDelivery = replayPublicWebhookDelivery;
 module.exports.arePublicWebhookTestRoutesEnabled =
   arePublicWebhookTestRoutesEnabled;
 module.exports.publicWebhookConfig = PUBLIC_WEBHOOK_CONFIG;
+module.exports.startContinuousStandbyBackup = startContinuousStandbyBackup;
