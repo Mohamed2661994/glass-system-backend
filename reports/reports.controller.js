@@ -1,4 +1,5 @@
 const pool = require("../db");
+const stockWatchdogService = require("../services/stockWatchdog.service");
 
 async function ensureInvoiceItemsCostPriceColumn() {
   // Column cost_price already exists in schema - avoid unnecessary DDL locks/permission errors
@@ -2537,44 +2538,16 @@ exports.getManufacturerAnalytics = async (req, res) => {
 ================================ */
 exports.getStockWatchdog = async (req, res) => {
   try {
-    const result = await pool.query(`
-      WITH actual_stock AS (
-        SELECT
-          sm.warehouse_id,
-          sm.product_id,
-          COALESCE(sm.variant_id, 0) AS variant_id,
-          COALESCE(SUM(
-            CASE 
-              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in') THEN sm.quantity
-              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out') THEN -sm.quantity
-              ELSE 0
-            END
-          ), 0) AS actual_quantity
-        FROM stock_movements sm
-        GROUP BY sm.warehouse_id, sm.product_id, sm.variant_id
-      )
-      SELECT 
-        a.warehouse_id,
-        w.name AS warehouse_name,
-        a.product_id,
-        p.name AS product_name,
-        a.variant_id,
-        a.actual_quantity,
-        COALESCE(s.quantity, 0) AS current_quantity,
-        (a.actual_quantity - COALESCE(s.quantity, 0)) AS diff
-      FROM actual_stock a
-      JOIN products p ON p.id = a.product_id
-      JOIN warehouses w ON w.id = a.warehouse_id
-      LEFT JOIN stock s ON s.warehouse_id = a.warehouse_id AND s.product_id = a.product_id AND COALESCE(s.variant_id, 0) = a.variant_id
-      WHERE a.actual_quantity != COALESCE(s.quantity, 0)
-    `);
-
-    res.json({
-      anomalies: result.rows,
-      has_anomalies: result.rows.length > 0
-    });
+    const io = req.app.get("io");
+    if (req.query.force === "true") {
+      const freshData = await stockWatchdogService.runAudit({ io, force: true });
+      return res.json(freshData);
+    }
+    // Instant 0.1ms retrieval from server memory
+    const status = stockWatchdogService.getAnomalies();
+    res.json(status);
   } catch (err) {
     console.error("STOCK WATCHDOG ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error", details: err.message });
   }
 };

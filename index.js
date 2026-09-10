@@ -29,6 +29,7 @@ const launchPuppeteer = async () => {
   });
 };
 const webPush = require("web-push");
+const stockWatchdogService = require("./services/stockWatchdog.service");
 
 // VAPID keys for Web Push
 const VAPID_PUBLIC_KEY =
@@ -60,7 +61,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.10";
+const SYSTEM_VERSION = "v.26.9.11";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -1131,6 +1132,17 @@ app.use((req, res, next) => {
             path: p,
             ts: Date.now(),
           });
+
+          // 🚨 Trigger debounced non-blocking stock watchdog check
+          if (
+            channel === "data:invoices" ||
+            channel === "data:stock" ||
+            p.includes("/transfer") ||
+            p.includes("/replace") ||
+            p.includes("/opening-stock")
+          ) {
+            stockWatchdogService.scheduleDebouncedAudit({ io });
+          }
         }
       }
       return originalJson(data);
@@ -11970,6 +11982,9 @@ io.on("connection", (socket) => {
       const onlineIds = Array.from(onlineUsers.keys());
       socket.emit("online_users", { user_ids: onlineIds });
 
+      // 🛡️ Send current watchdog status directly to the connected user
+      socket.emit("stock:watchdog:status", stockWatchdogService.getAnomalies());
+
       console.log(
         `User ${user_id} joined branch_${branch_id} + user_${user_id} (online)`,
       );
@@ -12076,5 +12091,6 @@ runStartupMigrations().finally(() => {
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server + Socket running on port ${PORT}`);
+    stockWatchdogService.initStartupAudit(io);
   });
 });
