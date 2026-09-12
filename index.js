@@ -7077,9 +7077,191 @@ app.delete("/admin/products/all", async (req, res) => {
   }
 });
 
+// ==================== Retail Merge Management ====================
+
+// 📋 جلب كل الأصناف المدمجة قطاعياً
+app.get(["/admin/products/retail-merges", "/api/admin/products/retail-merges"], async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        s.id AS secondary_id,
+        s.name AS secondary_name,
+        s.barcode AS secondary_barcode,
+        s.wholesale_package AS secondary_wholesale_package,
+        s.retail_package AS secondary_retail_package,
+        s.wholesale_price AS secondary_wholesale_price,
+        s.purchase_price AS secondary_purchase_price,
+        s.retail_price AS secondary_retail_price,
+        m.id AS master_id,
+        m.name AS master_name,
+        m.barcode AS master_barcode,
+        m.wholesale_package AS master_wholesale_package,
+        m.retail_package AS master_retail_package,
+        m.wholesale_price AS master_wholesale_price,
+        m.retail_price AS master_retail_price,
+        COALESCE(st_sec_wh2.quantity, 0) AS secondary_wholesale_stock,
+        COALESCE(st_sec_wh1.quantity, 0) AS secondary_retail_stock,
+        COALESCE(st_mas_wh1.quantity, 0) AS master_retail_stock,
+        COALESCE(st_mas_wh2.quantity, 0) AS master_wholesale_stock,
+        s.updated_at
+      FROM products s
+      JOIN products m ON m.id = s.retail_master_product_id
+      LEFT JOIN stock st_sec_wh2 ON st_sec_wh2.product_id = s.id AND st_sec_wh2.warehouse_id = 2 AND st_sec_wh2.variant_id = 0
+      LEFT JOIN stock st_sec_wh1 ON st_sec_wh1.product_id = s.id AND st_sec_wh1.warehouse_id = 1 AND st_sec_wh1.variant_id = 0
+      LEFT JOIN stock st_mas_wh1 ON st_mas_wh1.product_id = m.id AND st_mas_wh1.warehouse_id = 1 AND st_mas_wh1.variant_id = 0
+      LEFT JOIN stock st_mas_wh2 ON st_mas_wh2.product_id = m.id AND st_mas_wh2.warehouse_id = 2 AND st_mas_wh2.variant_id = 0
+      ORDER BY s.updated_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching retail merges:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 🔗 ربط ودمج صنف قطاعي يدويًا
+app.post(["/admin/products/retail-merge", "/api/admin/products/retail-merge"], async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const secondaryId = Number(req.body.secondary_product_id);
+    const masterId = Number(req.body.master_product_id);
+
+    if (!secondaryId || !masterId) {
+      return res.status(400).json({ error: "الصنف التابع والصنف الأساسي مطلوبان" });
+    }
+
+    if (secondaryId === masterId) {
+      return res.status(400).json({ error: "لا يمكن دمج الصنف مع نفسه" });
+    }
+
+    await client.query("BEGIN");
+
+    // 1. التحقق من وجود الصنفين
+    const prods = await client.query(
+      `SELECT id, name, retail_master_product_id FROM products WHERE id IN ($1, $2)`,
+      [secondaryId, masterId],
+    );
+
+    if (prods.rows.length < 2) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "أحد الصنفين أو كلاهما غير موجود" });
+    }
+
+    const secRow = prods.rows.find((p) => p.id === secondaryId);
+    const masRow = prods.rows.find((p) => p.id === masterId);
+
+    // منع الحلقات التكرارية: لا يمكن اختيار صنف ماستر إذا كان هو نفسه تابعاً لصنف آخر
+    if (masRow.retail_master_product_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ 
+        error: `لا يمكن اختيار [${masRow.name}] كصنف أساسي لأنه مدمج بالفعل كتابع لصنف آخر` 
+      });
+    }
+
+    // 2. تحديث الربط في جدول products
+    await client.query(
+      `UPDATE products SET retail_master_product_id = $1, updated_at = NOW() WHERE id = $2`,
+      [masterId, secondaryId],
+    );
+
+    // 3. ترحيل الرصيد الفعلي الحالي في المعرض (Warehouse 1)
+    const secStockRes = await client.query(
+      `SELECT quantity FROM stock WHERE warehouse_id = 1 AND product_id = $1 AND variant_id = 0 FOR UPDATE`,
+      [secondaryId],
+    );
+
+    const currentSecRetailQty = Number(secStockRes.rows[0]?.quantity || 0);
+
+    if (currentSecRetailQty > 0) {
+      // تصفير رصيد الصنف التابع في المعرض
+      await client.query(
+        `UPDATE stock SET quantity = 0, updated_at = NOW() WHERE warehouse_id = 1 AND product_id = $1 AND variant_id = 0`,
+        [secondaryId],
+      );
+
+      // إضافة الكمية المرحلة للصنف الماستر في المعرض
+      await client.query(
+        `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity, updated_at)
+         VALUES (1, $1, 0, $2, NOW())
+         ON CONFLICT (warehouse_id, product_id, variant_id)
+         DO UPDATE SET quantity = stock.quantity + EXCLUDED.quantity, updated_at = NOW()`,
+        [masterId, currentSecRetailQty],
+      );
+
+      // تسجيل حركة المخزون في stock_movements (خروج للصنف التابع ودخول للماستر)
+      await client.query(
+        `INSERT INTO stock_movements (warehouse_id, product_id, variant_id, quantity, movement_type, reference_type, reference_id, note)
+         VALUES 
+         (1, $1, 0, $2, 'transfer_out', 'retail_merge', $3, $4),
+         (1, $3, 0, $2, 'transfer_in', 'retail_merge', $1, $5)`,
+        [
+          secondaryId,
+          currentSecRetailQty,
+          masterId,
+          `دمج رصيد قطاعي وترحيله للصنف الماستر #${masterId} (${masRow.name})`,
+          `استلام رصيد قطاعي مدمج من الصنف التابع #${secondaryId} (${secRow.name})`,
+        ],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: `تم دمج الصنف [${secRow.name}] بنجاح تحت الصنف [${masRow.name}]`,
+      migrated_quantity: currentSecRetailQty,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Error merging retail products:", err);
+    res.status(500).json({ error: err.message || "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+// 🔓 فك دمج صنف قطاعي
+app.post(["/admin/products/retail-unmerge", "/api/admin/products/retail-unmerge"], async (req, res) => {
+  try {
+    const secondaryId = Number(req.body.secondary_product_id);
+    if (!secondaryId) {
+      return res.status(400).json({ error: "كود الصنف التابع مطلوب" });
+    }
+
+    const checkRes = await pool.query(
+      `SELECT id, name, retail_master_product_id FROM products WHERE id = $1`,
+      [secondaryId],
+    );
+
+    if (checkRes.rows.length === 0) {
+      return res.status(404).json({ error: "الصنف غير موجود" });
+    }
+
+    if (!checkRes.rows[0].retail_master_product_id) {
+      return res.status(400).json({ error: "هذا الصنف غير مدمج حاليًا" });
+    }
+
+    await pool.query(
+      `UPDATE products SET retail_master_product_id = NULL, updated_at = NOW() WHERE id = $1`,
+      [secondaryId],
+    );
+
+    res.json({
+      success: true,
+      message: `تم فك دمج الصنف [${checkRes.rows[0].name}] بنجاح وعاد صنفاً مستقلاً`,
+    });
+  } catch (err) {
+    console.error("Error unmerging retail product:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // جلب صنف واحد بالتفصيل
-app.get("/admin/products/:id", async (req, res) => {
+app.get("/admin/products/:id", async (req, res, next) => {
   const { id } = req.params;
+  if (isNaN(Number(id))) {
+    return next();
+  }
   try {
     const result = await pool.query("SELECT * FROM products WHERE id = $1", [
       id,
@@ -7921,184 +8103,7 @@ app.delete("/admin/products/variants/:variantId", async (req, res) => {
   }
 });
 
-// ==================== Retail Merge Management ====================
 
-// 📋 جلب كل الأصناف المدمجة قطاعياً
-app.get("/admin/products/retail-merges", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT 
-        s.id AS secondary_id,
-        s.name AS secondary_name,
-        s.barcode AS secondary_barcode,
-        s.wholesale_package AS secondary_wholesale_package,
-        s.retail_package AS secondary_retail_package,
-        s.wholesale_price AS secondary_wholesale_price,
-        s.purchase_price AS secondary_purchase_price,
-        s.retail_price AS secondary_retail_price,
-        m.id AS master_id,
-        m.name AS master_name,
-        m.barcode AS master_barcode,
-        m.wholesale_package AS master_wholesale_package,
-        m.retail_package AS master_retail_package,
-        m.wholesale_price AS master_wholesale_price,
-        m.retail_price AS master_retail_price,
-        COALESCE(st_sec_wh2.quantity, 0) AS secondary_wholesale_stock,
-        COALESCE(st_sec_wh1.quantity, 0) AS secondary_retail_stock,
-        COALESCE(st_mas_wh1.quantity, 0) AS master_retail_stock,
-        COALESCE(st_mas_wh2.quantity, 0) AS master_wholesale_stock,
-        s.updated_at
-      FROM products s
-      JOIN products m ON m.id = s.retail_master_product_id
-      LEFT JOIN stock st_sec_wh2 ON st_sec_wh2.product_id = s.id AND st_sec_wh2.warehouse_id = 2 AND st_sec_wh2.variant_id = 0
-      LEFT JOIN stock st_sec_wh1 ON st_sec_wh1.product_id = s.id AND st_sec_wh1.warehouse_id = 1 AND st_sec_wh1.variant_id = 0
-      LEFT JOIN stock st_mas_wh1 ON st_mas_wh1.product_id = m.id AND st_mas_wh1.warehouse_id = 1 AND st_mas_wh1.variant_id = 0
-      LEFT JOIN stock st_mas_wh2 ON st_mas_wh2.product_id = m.id AND st_mas_wh2.warehouse_id = 2 AND st_mas_wh2.variant_id = 0
-      ORDER BY s.updated_at DESC
-    `);
-    res.json(result.rows);
-  } catch (err) {
-    console.error("Error fetching retail merges:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// 🔗 ربط ودمج صنف قطاعي يدويًا
-app.post("/admin/products/retail-merge", async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const secondaryId = Number(req.body.secondary_product_id);
-    const masterId = Number(req.body.master_product_id);
-
-    if (!secondaryId || !masterId) {
-      return res.status(400).json({ error: "الصنف التابع والصنف الأساسي مطلوبان" });
-    }
-
-    if (secondaryId === masterId) {
-      return res.status(400).json({ error: "لا يمكن دمج الصنف مع نفسه" });
-    }
-
-    await client.query("BEGIN");
-
-    // 1. التحقق من وجود الصنفين
-    const prods = await client.query(
-      `SELECT id, name, retail_master_product_id FROM products WHERE id IN ($1, $2)`,
-      [secondaryId, masterId],
-    );
-
-    if (prods.rows.length < 2) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "أحد الصنفين أو كلاهما غير موجود" });
-    }
-
-    const secRow = prods.rows.find((p) => p.id === secondaryId);
-    const masRow = prods.rows.find((p) => p.id === masterId);
-
-    // منع الحلقات التكرارية: لا يمكن اختيار صنف ماستر إذا كان هو نفسه تابعاً لصنف آخر
-    if (masRow.retail_master_product_id) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ 
-        error: `لا يمكن اختيار [${masRow.name}] كصنف أساسي لأنه مدمج بالفعل كتابع لصنف آخر` 
-      });
-    }
-
-    // 2. تحديث الربط في جدول products
-    await client.query(
-      `UPDATE products SET retail_master_product_id = $1, updated_at = NOW() WHERE id = $2`,
-      [masterId, secondaryId],
-    );
-
-    // 3. ترحيل الرصيد الفعلي الحالي في المعرض (Warehouse 1)
-    const secStockRes = await client.query(
-      `SELECT quantity FROM stock WHERE warehouse_id = 1 AND product_id = $1 AND variant_id = 0 FOR UPDATE`,
-      [secondaryId],
-    );
-
-    const currentSecRetailQty = Number(secStockRes.rows[0]?.quantity || 0);
-
-    if (currentSecRetailQty > 0) {
-      // تصفير رصيد الصنف التابع في المعرض
-      await client.query(
-        `UPDATE stock SET quantity = 0, updated_at = NOW() WHERE warehouse_id = 1 AND product_id = $1 AND variant_id = 0`,
-        [secondaryId],
-      );
-
-      // إضافة الكمية المرحلة للصنف الماستر في المعرض
-      await client.query(
-        `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity, updated_at)
-         VALUES (1, $1, 0, $2, NOW())
-         ON CONFLICT (warehouse_id, product_id, variant_id)
-         DO UPDATE SET quantity = stock.quantity + EXCLUDED.quantity, updated_at = NOW()`,
-        [masterId, currentSecRetailQty],
-      );
-
-      // تسجيل حركة المخزون في stock_movements (خروج للصنف التابع ودخول للماستر)
-      await client.query(
-        `INSERT INTO stock_movements (warehouse_id, product_id, variant_id, quantity, movement_type, reference_type, reference_id, note)
-         VALUES 
-         (1, $1, 0, $2, 'transfer_out', 'retail_merge', $3, $4),
-         (1, $3, 0, $2, 'transfer_in', 'retail_merge', $1, $5)`,
-        [
-          secondaryId,
-          currentSecRetailQty,
-          masterId,
-          `دمج رصيد قطاعي وترحيله للصنف الماستر #${masterId} (${masRow.name})`,
-          `استلام رصيد قطاعي مدمج من الصنف التابع #${secondaryId} (${secRow.name})`,
-        ],
-      );
-    }
-
-    await client.query("COMMIT");
-
-    res.json({
-      success: true,
-      message: `تم دمج الصنف [${secRow.name}] بنجاح تحت الصنف [${masRow.name}]`,
-      migrated_quantity: currentSecRetailQty,
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("Error merging retail products:", err);
-    res.status(500).json({ error: err.message || "Server error" });
-  } finally {
-    client.release();
-  }
-});
-
-// 🔓 فك دمج صنف قطاعي
-app.post("/admin/products/retail-unmerge", async (req, res) => {
-  try {
-    const secondaryId = Number(req.body.secondary_product_id);
-    if (!secondaryId) {
-      return res.status(400).json({ error: "كود الصنف التابع مطلوب" });
-    }
-
-    const checkRes = await pool.query(
-      `SELECT id, name, retail_master_product_id FROM products WHERE id = $1`,
-      [secondaryId],
-    );
-
-    if (checkRes.rows.length === 0) {
-      return res.status(404).json({ error: "الصنف غير موجود" });
-    }
-
-    if (!checkRes.rows[0].retail_master_product_id) {
-      return res.status(400).json({ error: "هذا الصنف غير مدمج حاليًا" });
-    }
-
-    await pool.query(
-      `UPDATE products SET retail_master_product_id = NULL, updated_at = NOW() WHERE id = $1`,
-      [secondaryId],
-    );
-
-    res.json({
-      success: true,
-      message: `تم فك دمج الصنف [${checkRes.rows[0].name}] بنجاح وعاد صنفاً مستقلاً`,
-    });
-  } catch (err) {
-    console.error("Error unmerging retail product:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
 
 // ==================== Manufacturers CRUD ====================
 
