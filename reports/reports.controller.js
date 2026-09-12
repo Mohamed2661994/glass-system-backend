@@ -393,6 +393,83 @@ exports.getLowStockReorderCount = async (req, res) => {
 };
 
 /* ===============================
+   ⚡ بنود تقرير طلب التحويل فائق السرعة (مجمعة ومحسوبة مباشرة من السيرفر)
+================================ */
+exports.getLowStockReorderItems = async (req, res) => {
+  try {
+    const result = await pool.query(`
+      WITH ws_stock AS (
+        SELECT 
+          COALESCE(p2.retail_master_product_id, p2.id) AS product_id,
+          SUM(s2.quantity) AS ws_qty
+        FROM stock s2
+        JOIN products p2 ON p2.id = s2.product_id
+        JOIN warehouses w2 ON w2.id = s2.warehouse_id
+        WHERE w2.name = 'المخزن الرئيسي'
+        GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
+      )
+      SELECT
+        p.id AS product_id,
+        p.name AS product_name,
+        p.manufacturer AS manufacturer_name,
+        w.name AS warehouse_name,
+        s.quantity AS current_stock,
+        s.variant_id,
+        p.wholesale_package,
+        p.retail_package,
+        COALESCE(ws.ws_qty, 0) AS wholesale_stock
+      FROM stock s
+      JOIN products p ON p.id = s.product_id
+      JOIN warehouses w ON w.id = s.warehouse_id
+      LEFT JOIN ws_stock ws ON ws.product_id = p.id
+      WHERE w.name = 'مخزن المعرض'
+        AND s.quantity >= 0 AND s.quantity <= 5
+        AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
+        AND p.is_active = true
+        AND p.retail_master_product_id IS NULL
+        AND (s.quantity > 0 OR COALESCE(ws.ws_qty, 0) > 0)
+      ORDER BY CASE WHEN s.quantity <= 0 THEN 1 ELSE 0 END, s.quantity ASC;
+    `);
+
+    // Get all variants to map variant_id → package names
+    const variantsRes = await pool.query(
+      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`,
+    );
+    const variantsById = {};
+    for (const v of variantsRes.rows) {
+      variantsById[v.id] = v;
+    }
+
+    const rows = result.rows.map((row) => {
+      const vid = Number(row.variant_id) || 0;
+      let pkgLabel;
+      if (vid === 0) {
+        pkgLabel =
+          [row.wholesale_package, row.retail_package]
+            .filter(Boolean)
+            .join(" / ") || "-";
+      } else {
+        const v = variantsById[vid];
+        pkgLabel = v
+          ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ")
+          : "-";
+      }
+      return {
+        ...row,
+        current_stock: Number(row.current_stock) || 0,
+        wholesale_stock: Number(row.wholesale_stock) || 0,
+        package_name: pkgLabel,
+      };
+    });
+
+    res.json(rows);
+  } catch (err) {
+    console.error("LOW STOCK REORDER ITEMS ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+};
+
+/* ===============================
    ⚠️ أصناف سالبة (كمية < 0)
    — يحسب الرصيد الفعلي من حركات المخزون
 ================================ */
