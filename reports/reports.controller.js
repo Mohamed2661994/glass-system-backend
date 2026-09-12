@@ -290,6 +290,11 @@ exports.getLowStock = async (req, res) => {
     if (warehouse_id) {
       where += ` AND s.warehouse_id = $${index++}`;
       values.push(warehouse_id);
+      if (Number(warehouse_id) === 1) {
+        where += ` AND p.retail_master_product_id IS NULL`;
+      }
+    } else {
+      where += ` AND NOT (s.warehouse_id = 1 AND p.retail_master_product_id IS NOT NULL)`;
     }
 
     const result = await pool.query(
@@ -352,11 +357,14 @@ exports.getLowStockReorderCount = async (req, res) => {
   try {
     const result = await pool.query(`
       WITH ws_stock AS (
-        SELECT s2.product_id, MAX(s2.quantity) AS max_ws_qty
+        SELECT 
+          COALESCE(p2.retail_master_product_id, p2.id) AS product_id,
+          SUM(s2.quantity) AS max_ws_qty
         FROM stock s2
+        JOIN products p2 ON p2.id = s2.product_id
         JOIN warehouses w2 ON w2.id = s2.warehouse_id
         WHERE w2.name = 'المخزن الرئيسي'
-        GROUP BY s2.product_id
+        GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
       )
       SELECT
         COUNT(*) AS total_count,
@@ -369,6 +377,7 @@ exports.getLowStockReorderCount = async (req, res) => {
         AND s.quantity >= 0 AND s.quantity <= 5
         AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
         AND p.is_active = true
+        AND p.retail_master_product_id IS NULL
         AND (s.quantity > 0 OR COALESCE(ws.max_ws_qty, 0) > 0);
     `);
 
