@@ -61,7 +61,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.12";
+const SYSTEM_VERSION = "v.26.9.13";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -2325,7 +2325,7 @@ async function normalizeInvoiceItemsForStorage(
     if (productIds.length > 0) {
       const [productsRes, variantsRes] = await Promise.all([
         client.query(
-          `SELECT id, wholesale_package, retail_package, purchase_price, retail_purchase_price 
+          `SELECT id, wholesale_package, retail_package, purchase_price, retail_purchase_price, retail_master_product_id 
            FROM products WHERE id = ANY($1)`,
           [productIds],
         ),
@@ -2385,6 +2385,17 @@ async function normalizeInvoiceItemsForStorage(
     const quantity = Number(item.quantity || 0);
     const price = Number(item.price || 0);
     const discount = Number(item.discount || 0);
+
+    // 🔥 دمج كود القطاعي: لو الفاتورة قطاعي والصنف مدموج تحت صنف ماستر، يتم تحويله للماستر
+    let pid = Number(item.product_id || 0);
+    if (invoiceType === "retail" && pid > 0) {
+      const pRowInitial = productCostCache.get(pid);
+      if (pRowInitial?.retail_master_product_id) {
+        pid = Number(pRowInitial.retail_master_product_id);
+        item.product_id = pid;
+      }
+    }
+
     const variantId = await resolveInvoiceItemVariantId(
       item,
       invoiceType,
@@ -2393,7 +2404,6 @@ async function normalizeInvoiceItemsForStorage(
     );
 
     let costPrice = 0;
-    const pid = Number(item.product_id || 0);
     const vid = Number(variantId || 0);
     const pRow = productCostCache.get(pid);
     const vRow = variantCostCache.get(`${pid}:${vid}`);
@@ -2724,6 +2734,12 @@ app.get("/products", async (req, res) => {
       p.manufacturer,
       p.description,
       p.has_wholesale,
+      p.retail_master_product_id,
+      (
+        SELECT json_agg(sp.barcode)
+        FROM products sp
+        WHERE sp.retail_master_product_id = p.id AND sp.barcode IS NOT NULL AND sp.barcode <> ''
+      ) AS secondary_barcodes,
       CASE
         WHEN $1 = 'wholesale' THEN p.wholesale_price
         ELSE p.retail_price
@@ -2748,8 +2764,9 @@ app.get("/products", async (req, res) => {
       ON s.product_id = p.id
       AND s.warehouse_id = $2
     WHERE p.is_active = true
+      AND ($1 = 'wholesale' OR p.retail_master_product_id IS NULL)
     GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.description, p.has_wholesale, p.wholesale_price, p.retail_price, p.discount_amount
+             p.manufacturer, p.description, p.has_wholesale, p.wholesale_price, p.retail_price, p.discount_amount, p.retail_master_product_id
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
@@ -2767,6 +2784,7 @@ app.get("/products", async (req, res) => {
       p.manufacturer,
       p.description,
       p.has_wholesale,
+      p.retail_master_product_id,
       CASE
         WHEN $1 = 'wholesale' THEN p.purchase_price
         ELSE p.retail_purchase_price
@@ -2789,8 +2807,9 @@ app.get("/products", async (req, res) => {
       ON s.product_id = p.id
       AND s.warehouse_id = $2
     WHERE p.is_active = true
+      AND ($1 = 'wholesale' OR p.retail_master_product_id IS NULL)
     GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.description, p.has_wholesale, p.purchase_price, p.retail_purchase_price, p.discount_amount
+             p.manufacturer, p.description, p.has_wholesale, p.purchase_price, p.retail_purchase_price, p.discount_amount, p.retail_master_product_id
     ORDER BY p.name
     `,
         [invoice_type, warehouseId],
@@ -6808,8 +6827,12 @@ app.get("/admin/products", async (req, res) => {
   p.description,
   p.is_active,
   p.has_wholesale,
+  p.retail_master_product_id,
+  mp.name AS retail_master_name,
+  mp.barcode AS retail_master_barcode,
   COALESCE(v.variant_count, 0) AS variant_count
 FROM products p
+LEFT JOIN products mp ON mp.id = p.retail_master_product_id
 LEFT JOIN (
   SELECT product_id, COUNT(*) AS variant_count
   FROM product_variants
@@ -7894,6 +7917,185 @@ app.delete("/admin/products/variants/:variantId", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ==================== Retail Merge Management ====================
+
+// 📋 جلب كل الأصناف المدمجة قطاعياً
+app.get("/admin/products/retail-merges", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        s.id AS secondary_id,
+        s.name AS secondary_name,
+        s.barcode AS secondary_barcode,
+        s.wholesale_package AS secondary_wholesale_package,
+        s.retail_package AS secondary_retail_package,
+        s.wholesale_price AS secondary_wholesale_price,
+        s.purchase_price AS secondary_purchase_price,
+        s.retail_price AS secondary_retail_price,
+        m.id AS master_id,
+        m.name AS master_name,
+        m.barcode AS master_barcode,
+        m.wholesale_package AS master_wholesale_package,
+        m.retail_package AS master_retail_package,
+        m.wholesale_price AS master_wholesale_price,
+        m.retail_price AS master_retail_price,
+        COALESCE(st_sec_wh2.quantity, 0) AS secondary_wholesale_stock,
+        COALESCE(st_sec_wh1.quantity, 0) AS secondary_retail_stock,
+        COALESCE(st_mas_wh1.quantity, 0) AS master_retail_stock,
+        COALESCE(st_mas_wh2.quantity, 0) AS master_wholesale_stock,
+        s.updated_at
+      FROM products s
+      JOIN products m ON m.id = s.retail_master_product_id
+      LEFT JOIN stock st_sec_wh2 ON st_sec_wh2.product_id = s.id AND st_sec_wh2.warehouse_id = 2 AND st_sec_wh2.variant_id = 0
+      LEFT JOIN stock st_sec_wh1 ON st_sec_wh1.product_id = s.id AND st_sec_wh1.warehouse_id = 1 AND st_sec_wh1.variant_id = 0
+      LEFT JOIN stock st_mas_wh1 ON st_mas_wh1.product_id = m.id AND st_mas_wh1.warehouse_id = 1 AND st_mas_wh1.variant_id = 0
+      LEFT JOIN stock st_mas_wh2 ON st_mas_wh2.product_id = m.id AND st_mas_wh2.warehouse_id = 2 AND st_mas_wh2.variant_id = 0
+      ORDER BY s.updated_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.error("Error fetching retail merges:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// 🔗 ربط ودمج صنف قطاعي يدويًا
+app.post("/admin/products/retail-merge", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const secondaryId = Number(req.body.secondary_product_id);
+    const masterId = Number(req.body.master_product_id);
+
+    if (!secondaryId || !masterId) {
+      return res.status(400).json({ error: "الصنف التابع والصنف الأساسي مطلوبان" });
+    }
+
+    if (secondaryId === masterId) {
+      return res.status(400).json({ error: "لا يمكن دمج الصنف مع نفسه" });
+    }
+
+    await client.query("BEGIN");
+
+    // 1. التحقق من وجود الصنفين
+    const prods = await client.query(
+      `SELECT id, name, retail_master_product_id FROM products WHERE id IN ($1, $2)`,
+      [secondaryId, masterId],
+    );
+
+    if (prods.rows.length < 2) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "أحد الصنفين أو كلاهما غير موجود" });
+    }
+
+    const secRow = prods.rows.find((p) => p.id === secondaryId);
+    const masRow = prods.rows.find((p) => p.id === masterId);
+
+    // منع الحلقات التكرارية: لا يمكن اختيار صنف ماستر إذا كان هو نفسه تابعاً لصنف آخر
+    if (masRow.retail_master_product_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ 
+        error: `لا يمكن اختيار [${masRow.name}] كصنف أساسي لأنه مدمج بالفعل كتابع لصنف آخر` 
+      });
+    }
+
+    // 2. تحديث الربط في جدول products
+    await client.query(
+      `UPDATE products SET retail_master_product_id = $1, updated_at = NOW() WHERE id = $2`,
+      [masterId, secondaryId],
+    );
+
+    // 3. ترحيل الرصيد الفعلي الحالي في المعرض (Warehouse 1)
+    const secStockRes = await client.query(
+      `SELECT quantity FROM stock WHERE warehouse_id = 1 AND product_id = $1 AND variant_id = 0 FOR UPDATE`,
+      [secondaryId],
+    );
+
+    const currentSecRetailQty = Number(secStockRes.rows[0]?.quantity || 0);
+
+    if (currentSecRetailQty > 0) {
+      // تصفير رصيد الصنف التابع في المعرض
+      await client.query(
+        `UPDATE stock SET quantity = 0, updated_at = NOW() WHERE warehouse_id = 1 AND product_id = $1 AND variant_id = 0`,
+        [secondaryId],
+      );
+
+      // إضافة الكمية المرحلة للصنف الماستر في المعرض
+      await client.query(
+        `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity, updated_at)
+         VALUES (1, $1, 0, $2, NOW())
+         ON CONFLICT (warehouse_id, product_id, variant_id)
+         DO UPDATE SET quantity = stock.quantity + EXCLUDED.quantity, updated_at = NOW()`,
+        [masterId, currentSecRetailQty],
+      );
+
+      // تسجيل حركة المخزون في stock_movements (خروج للصنف التابع ودخول للماستر)
+      await client.query(
+        `INSERT INTO stock_movements (warehouse_id, product_id, variant_id, quantity, movement_type, reference_type, reference_id, note)
+         VALUES 
+         (1, $1, 0, $2, 'transfer_out', 'retail_merge', $3, $4),
+         (1, $3, 0, $2, 'transfer_in', 'retail_merge', $1, $5)`,
+        [
+          secondaryId,
+          currentSecRetailQty,
+          masterId,
+          `دمج رصيد قطاعي وترحيله للصنف الماستر #${masterId} (${masRow.name})`,
+          `استلام رصيد قطاعي مدمج من الصنف التابع #${secondaryId} (${secRow.name})`,
+        ],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: `تم دمج الصنف [${secRow.name}] بنجاح تحت الصنف [${masRow.name}]`,
+      migrated_quantity: currentSecRetailQty,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Error merging retail products:", err);
+    res.status(500).json({ error: err.message || "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+// 🔓 فك دمج صنف قطاعي
+app.post("/admin/products/retail-unmerge", async (req, res) => {
+  try {
+    const secondaryId = Number(req.body.secondary_product_id);
+    if (!secondaryId) {
+      return res.status(400).json({ error: "كود الصنف التابع مطلوب" });
+    }
+
+    const checkRes = await pool.query(
+      `SELECT id, name, retail_master_product_id FROM products WHERE id = $1`,
+      [secondaryId],
+    );
+
+    if (checkRes.rows.length === 0) {
+      return res.status(404).json({ error: "الصنف غير موجود" });
+    }
+
+    if (!checkRes.rows[0].retail_master_product_id) {
+      return res.status(400).json({ error: "هذا الصنف غير مدمج حاليًا" });
+    }
+
+    await pool.query(
+      `UPDATE products SET retail_master_product_id = NULL, updated_at = NOW() WHERE id = $1`,
+      [secondaryId],
+    );
+
+    res.json({
+      success: true,
+      message: `تم فك دمج الصنف [${checkRes.rows[0].name}] بنجاح وعاد صنفاً مستقلاً`,
+    });
+  } catch (err) {
+    console.error("Error unmerging retail product:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -9346,7 +9548,7 @@ app.post(
         // 🔹 بيانات الصنف
         const productRes = await client.query(
           `
-        SELECT id, name, wholesale_package, retail_package
+        SELECT id, name, wholesale_package, retail_package, retail_master_product_id
         FROM products
         WHERE id = $1 AND is_active = true
         `,
@@ -9412,7 +9614,12 @@ app.post(
 
         // 4️⃣ إضافة للقطاعي
         // 🔥 دمج كود القطاعي: إجبار البضاعة المحولة للقطاعي أينما كانت على الكود الأساسي (0)
+        // ولو الصنف مدموج تحت صنف ماستر، يتم توجيهه للماستر مباشرة
         const targetVariantId = retailWarehouseId === 1 ? 0 : variantId;
+        const targetProductId =
+          retailWarehouseId === 1 && product.retail_master_product_id
+            ? Number(product.retail_master_product_id)
+            : product_id;
 
         await client.query(
           `
@@ -9423,7 +9630,7 @@ app.post(
         `,
           [
             retailWarehouseId,
-            product_id,
+            targetProductId,
             targetVariantId,
             conversion.retail_quantity,
           ],
@@ -9436,17 +9643,19 @@ app.post(
         (
           transfer_id,
           product_id,
+          target_product_id,
           from_warehouse_id,
           to_warehouse_id,
           from_quantity,
           to_quantity,
           total_price
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         `,
           [
             transferId,
             product_id,
+            targetProductId,
             wholesaleWarehouseId,
             retailWarehouseId,
             quantity,
@@ -9499,7 +9708,7 @@ app.post(
         `,
           [
             retailWarehouseId,
-            product_id,
+            targetProductId,
             targetVariantId,
             conversion.retail_quantity,
             transferId,
@@ -9800,6 +10009,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
       SELECT
         id,
         product_id,
+        target_product_id,
         from_warehouse_id,
         to_warehouse_id,
         from_quantity,
@@ -9844,7 +10054,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         ? Number(moveRes.rows[0].variant_id)
         : 0;
 
-      // ➕ رجوع للجملة
+      // ➕ رجوع للجملة (دائماً لصنف الجملة الأصلي)
       await client.query(
         `
         UPDATE stock
@@ -9859,7 +10069,8 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         ],
       );
 
-      // ➖ خصم من القطاعي
+      // ➖ خصم من القطاعي (من الصنف المستلم سواء كان ماستر أو الأصلي)
+      const targetProdId = Number(item.target_product_id || item.product_id);
       const retailStockRes = await client.query(
         `
         SELECT quantity
@@ -9867,7 +10078,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = 0
         FOR UPDATE
         `,
-        [item.to_warehouse_id, item.product_id],
+        [item.to_warehouse_id, targetProdId],
       );
 
       const available = Number(retailStockRes.rows[0]?.quantity || 0);
@@ -9875,7 +10086,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
 
       if (available < required) {
         throw new Error(
-          `لا يمكن إلغاء التحويل: رصيد القطاعي غير كافي للصنف ${item.product_id}`,
+          `لا يمكن إلغاء التحويل: رصيد القطاعي غير كافي للصنف #${targetProdId} (المتاح: ${available}، المطلوب: ${required})`,
         );
       }
 
@@ -9885,7 +10096,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         SET quantity = quantity - $1
         WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
         `,
-        [item.to_quantity, item.to_warehouse_id, item.product_id],
+        [item.to_quantity, item.to_warehouse_id, targetProdId],
       );
 
       // 🧾 حركة عكسية (دخول الجملة)
@@ -9932,7 +10143,7 @@ app.post("/stock-transfers/:id/cancel", async (req, res) => {
         `,
         [
           item.to_warehouse_id,
-          item.product_id,
+          targetProdId,
           item.to_quantity,
           transferId,
           "إلغاء تحويل – خصم من القطاعي",
@@ -9999,6 +10210,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
         sti.id,
         sti.transfer_id,
         sti.product_id,
+        sti.target_product_id,
         sti.from_warehouse_id,
         sti.to_warehouse_id,
         sti.from_quantity,
@@ -10041,20 +10253,23 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
     }
 
     // 2️⃣ تأكد إن رصيد المخزن الهدف يسمح بالعكس
+    const targetProdId = Number(item.target_product_id || item.product_id);
     const targetStockRes = await client.query(
       `
       SELECT SUM(quantity) AS quantity
       FROM stock
-      WHERE warehouse_id = $1 AND product_id = $2
+      WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = 0
       `,
-      [item.to_warehouse_id, item.product_id],
+      [item.to_warehouse_id, targetProdId],
     );
 
     const availableTargetQty = Number(targetStockRes.rows[0]?.quantity || 0);
     const requiredTargetQty = Number(item.to_quantity || 0);
 
     if (availableTargetQty < requiredTargetQty) {
-      throw new Error("لا يمكن إلغاء الصنف: رصيد المخزن المستلم غير كافي");
+      throw new Error(
+        `لا يمكن إلغاء الصنف: رصيد المخزن المستلم غير كافي (المتاح: ${availableTargetQty}، المطلوب: ${requiredTargetQty})`,
+      );
     }
 
     // 3️⃣ عكس الكميات
@@ -10067,7 +10282,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       ? Number(moveRes.rows[0].variant_id)
       : 0;
 
-    // ➕ رجوع للمخزن الأصلي
+    // ➕ رجوع للمخزن الأصلي (دائماً لصنف الجملة الأصلي المسحوب)
     await client.query(
       `
       UPDATE stock
@@ -10082,14 +10297,14 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       ],
     );
 
-    // ➖ خصم من المخزن الهدف
+    // ➖ خصم من المخزن الهدف (من الصنف المستلم سواء ماستر أو غيره)
     await client.query(
       `
       UPDATE stock
       SET quantity = quantity - $1
       WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
       `,
-      [item.to_quantity, item.to_warehouse_id, item.product_id],
+      [item.to_quantity, item.to_warehouse_id, targetProdId],
     );
 
     // 4️⃣ تسجيل حركات المخزن (عكسية)
@@ -10138,7 +10353,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       `,
       [
         item.to_warehouse_id,
-        item.product_id,
+        targetProdId,
         item.to_quantity,
         item.id,
         "إلغاء صنف من تحويل – خصم من المخزن المستلم",
