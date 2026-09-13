@@ -889,7 +889,18 @@ exports.getProductSalesProfit = async (req, res) => {
             ELSE COALESCE(ii.quantity, 0)
           END AS signed_quantity,
           CASE
-            WHEN COALESCE(ii.is_return, false) THEN 0
+            WHEN COALESCE(ii.is_return, false)
+              THEN -(
+                COALESCE(ii.quantity, 0)
+                * COALESCE(
+                    ii.cost_price,
+                    CASE
+                      WHEN inv.invoice_type = 'retail'
+                        THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
+                      ELSE COALESCE(p.purchase_price, 0)
+                    END
+                  )
+              )
             ELSE COALESCE(ii.quantity, 0)
               * COALESCE(
                   ii.cost_price,
@@ -1609,7 +1620,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
    - فواتير بيع فقط
   - قيمة البيع المعتمدة = الإجمالي النهائي للفواتير بعد استبعاد الحساب السابق
   - صافي الربح = قيمة البيع المعتمدة - إجمالي تكلفة الشراء
-  - بنود المرتجع لا تدخل في تكلفة التقرير
+   - بنود المرتجع تخصم من تكلفة التقرير لاسترداد تكلفة البضاعة للمخزن
 ================================ */
 exports.getInvoiceSalesProfit = async (req, res) => {
   try {
@@ -1678,7 +1689,18 @@ exports.getInvoiceSalesProfit = async (req, res) => {
 
         SUM(
           CASE
-            WHEN COALESCE(ii.is_return, false) THEN 0
+            WHEN COALESCE(ii.is_return, false)
+              THEN -(
+                COALESCE(ii.quantity, 0)
+                * COALESCE(
+                    ii.cost_price,
+                    CASE
+                      WHEN i.invoice_type = 'retail'
+                        THEN COALESCE(p.retail_purchase_price, p.purchase_price, 0)
+                      ELSE COALESCE(p.purchase_price, 0)
+                    END
+                  )
+              )
             ELSE COALESCE(ii.quantity, 0)
               * COALESCE(
                   ii.cost_price,
