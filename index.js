@@ -6771,7 +6771,7 @@ app.delete("/invoices/:id", authMiddleware, async (req, res) => {
 // جلب كل الأصناف (للإدارة)
 app.get("/admin/products", async (req, res) => {
   try {
-    const { search, manufacturer, limit = 0, offset = 0, active } = req.query;
+    const { search, manufacturer, limit = 0, offset = 0, active, stock } = req.query;
 
     let conditions = [];
     let values = [];
@@ -6801,6 +6801,16 @@ app.get("/admin/products", async (req, res) => {
       values.push(manufacturer);
     }
 
+    if (stock === "in_stock") {
+      conditions.push(`COALESCE(sa.total_stock, 0) > 0`);
+    } else if (stock === "in_stock_showroom") {
+      conditions.push(`COALESCE(sa.stock_branch_1, 0) > 0`);
+    } else if (stock === "in_stock_warehouse") {
+      conditions.push(`COALESCE(sa.stock_branch_2, 0) > 0`);
+    } else if (stock === "out_of_stock") {
+      conditions.push(`COALESCE(sa.total_stock, 0) <= 0`);
+    }
+
     const whereClause =
       conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const limitClause =
@@ -6810,37 +6820,50 @@ app.get("/admin/products", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT 
-  p.id,
-  p.name,
-  p.wholesale_package,
-  p.retail_package,
-  p.manufacturer,
-  p.purchase_price,
-  p.purchase_price_adjustment,
-  p.purchase_price_adjustment_is_percentage,
-  p.retail_purchase_price,
-  p.wholesale_price,
-  p.retail_price,
-  p.barcode,
-  p.discount_amount,
-  p.description,
-  p.is_active,
-  p.has_wholesale,
-  p.retail_master_product_id,
-  mp.name AS retail_master_name,
-  mp.barcode AS retail_master_barcode,
-  COALESCE(v.variant_count, 0) AS variant_count
-FROM products p
-LEFT JOIN products mp ON mp.id = p.retail_master_product_id
-LEFT JOIN (
-  SELECT product_id, COUNT(*) AS variant_count
-  FROM product_variants
-  GROUP BY product_id
-) v ON v.product_id = p.id
-${whereClause}
-ORDER BY p.name
-${limitClause}`,
+      `WITH stock_agg AS (
+        SELECT 
+          product_id,
+          COALESCE(SUM(CASE WHEN warehouse_id = 1 THEN quantity ELSE 0 END), 0)::int AS stock_branch_1,
+          COALESCE(SUM(CASE WHEN warehouse_id = 2 THEN quantity ELSE 0 END), 0)::int AS stock_branch_2,
+          COALESCE(SUM(quantity), 0)::int AS total_stock
+        FROM stock
+        GROUP BY product_id
+      )
+      SELECT 
+        p.id,
+        p.name,
+        p.wholesale_package,
+        p.retail_package,
+        p.manufacturer,
+        p.purchase_price,
+        p.purchase_price_adjustment,
+        p.purchase_price_adjustment_is_percentage,
+        p.retail_purchase_price,
+        p.wholesale_price,
+        p.retail_price,
+        p.barcode,
+        p.discount_amount,
+        p.description,
+        p.is_active,
+        p.has_wholesale,
+        p.retail_master_product_id,
+        mp.name AS retail_master_name,
+        mp.barcode AS retail_master_barcode,
+        COALESCE(v.variant_count, 0) AS variant_count,
+        COALESCE(sa.stock_branch_1, 0)::int AS stock_branch_1,
+        COALESCE(sa.stock_branch_2, 0)::int AS stock_branch_2,
+        COALESCE(sa.total_stock, 0)::int AS total_stock
+      FROM products p
+      LEFT JOIN products mp ON mp.id = p.retail_master_product_id
+      LEFT JOIN (
+        SELECT product_id, COUNT(*) AS variant_count
+        FROM product_variants
+        GROUP BY product_id
+      ) v ON v.product_id = p.id
+      LEFT JOIN stock_agg sa ON sa.product_id = p.id
+      ${whereClause}
+      ORDER BY p.name
+      ${limitClause}`,
       values,
     );
     res.json(result.rows);
