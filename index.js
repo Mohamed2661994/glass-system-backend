@@ -1110,39 +1110,50 @@ const soundUpload = multer({
 
 /* ========== Real-time: auto-emit socket events on successful writes ========== */
 app.use((req, res, next) => {
-  if (["POST", "PUT", "DELETE"].includes(req.method)) {
+  if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
     const originalJson = res.json.bind(res);
     res.json = function (data) {
       if (res.statusCode < 400) {
+        const broadcast = req.app.get("broadcastRealtime");
         const io = req.app.get("io");
-        if (io) {
-          const p = req.originalUrl || req.url;
-          let channel = "data:misc";
-          if (p.includes("/invoices")) channel = "data:invoices";
-          else if (p.includes("/cash")) channel = "data:cash";
-          else if (p.includes("/stock") || p.includes("/transfer"))
-            channel = "data:stock";
-          else if (p.includes("/products") || p.includes("/manufacturers"))
-            channel = "data:products";
-          else if (p.includes("/customers")) channel = "data:customers";
-          else if (p.includes("/users")) channel = "data:users";
-          else if (p.includes("/opening-stock")) channel = "data:stock";
-          io.emit(channel, {
-            action: req.method,
-            path: p,
-            ts: Date.now(),
-          });
+        const p = req.originalUrl || req.url;
+        let channel = "data:misc";
+        if (p.includes("/invoices")) channel = "data:invoices";
+        else if (p.includes("/cash")) channel = "data:cash";
+        else if (p.includes("/stock") || p.includes("/transfer"))
+          channel = "data:stock";
+        else if (p.includes("/products") || p.includes("/manufacturers"))
+          channel = "data:products";
+        else if (p.includes("/customers")) channel = "data:customers";
+        else if (p.includes("/suppliers")) channel = "data:suppliers";
+        else if (p.includes("/users")) channel = "data:users";
+        else if (p.includes("/opening-stock")) channel = "data:stock";
 
-          // 🚨 Trigger debounced non-blocking stock watchdog check
-          if (
-            channel === "data:invoices" ||
-            channel === "data:stock" ||
-            p.includes("/transfer") ||
-            p.includes("/replace") ||
-            p.includes("/opening-stock")
-          ) {
-            stockWatchdogService.scheduleDebouncedAudit({ io });
+        const payload = {
+          action: req.method,
+          path: p,
+          ts: Date.now(),
+        };
+
+        if (typeof broadcast === "function") {
+          broadcast(channel, payload);
+          // Also broadcast specific cross-client invalidation if stock or product changed
+          if (channel === "data:stock" || channel === "data:products" || channel === "data:invoices") {
+            broadcast("product_updated", { invalidateProducts: true, path: p, ts: Date.now() });
           }
+        } else if (io) {
+          io.emit(channel, payload);
+        }
+
+        // 🚨 Trigger debounced non-blocking stock watchdog check
+        if (
+          channel === "data:invoices" ||
+          channel === "data:stock" ||
+          p.includes("/transfer") ||
+          p.includes("/replace") ||
+          p.includes("/opening-stock")
+        ) {
+          if (io) stockWatchdogService.scheduleDebouncedAudit({ io });
         }
       }
       return originalJson(data);
@@ -12187,19 +12198,114 @@ app.post("/settings/print-settings", authMiddleware, async (req, res) => {
 });
 
 /* ===============================
-   🔌 SOCKET.IO
+   🔌 SOCKET.IO - CLUSTER & REAL-TIME
 ================================ */
 const http = require("http");
 const { Server } = require("socket.io");
+const { Client: PgListenerClient } = require("pg");
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: { origin: "*" },
+  pingTimeout: 30000,
+  pingInterval: 25000,
+  transports: ["websocket", "polling"],
 });
 
-// نخلي io متاح في أي مكان
 app.set("io", io);
+
+// ===== Cross-Worker Cluster Sync via PostgreSQL LISTEN / NOTIFY =====
+let clusterListener = null;
+let clusterSyncActive = false;
+
+async function initClusterRealtimeSync() {
+  if (clusterSyncActive && clusterListener) return;
+  try {
+    const connStr =
+      process.env.DATABASE_URL ||
+      "postgresql://glass_backend:SecGlass_2026_Postgres_HA@dbstudio.hg-alshour.online:5432/glass_system";
+    clusterListener = new PgListenerClient({
+      connectionString: connStr,
+      connectionTimeoutMillis: 10000,
+      keepAlive: true,
+    });
+    await clusterListener.connect();
+    await clusterListener.query("LISTEN glass_cluster_events");
+    clusterSyncActive = true;
+
+    clusterListener.on("notification", (msg) => {
+      try {
+        if (msg.channel === "glass_cluster_events" && msg.payload) {
+          const { event, payload, room } = JSON.parse(msg.payload);
+          if (room) {
+            io.to(room).emit(event, payload);
+          } else {
+            io.emit(event, payload);
+          }
+        }
+      } catch (err) {
+        console.error("Cluster message decode error:", err.message);
+      }
+    });
+
+    clusterListener.on("error", (err) => {
+      console.error("Cluster listener error (reconnecting in 5s):", err.message);
+      clusterSyncActive = false;
+      try { clusterListener.end(); } catch {}
+      clusterListener = null;
+      setTimeout(initClusterRealtimeSync, 5000);
+    });
+
+    console.log("✅ Realtime Cluster Sync active (PostgreSQL LISTEN glass_cluster_events)");
+  } catch (err) {
+    clusterSyncActive = false;
+    clusterListener = null;
+    console.error("Cluster sync init failed (retrying in 5s):", err.message);
+    setTimeout(initClusterRealtimeSync, 5000);
+  }
+}
+
+function broadcastRealtime(event, payload, room = null) {
+  // 1. Emit locally on this worker process immediately
+  if (room) {
+    io.to(room).emit(event, payload);
+  } else {
+    io.emit(event, payload);
+  }
+
+  // 2. Notify other PM2 cluster workers via PostgreSQL NOTIFY
+  try {
+    const notificationPayload = JSON.stringify({ event, payload, room });
+    pool.query("SELECT pg_notify('glass_cluster_events', $1)", [notificationPayload]).catch(() => {});
+  } catch {}
+}
+
+app.set("broadcastRealtime", broadcastRealtime);
+
+// ===== Secure WebSocket JWT Handshake Authentication =====
+io.use((socket, next) => {
+  const token =
+    socket.handshake.auth?.token ||
+    socket.handshake.headers?.authorization?.replace(/^Bearer\s+/i, "");
+
+  if (token) {
+    try {
+      const decoded = jwt_auth.verify(
+        token,
+        process.env.JWT_SECRET || "glass_system_super_secret_2026",
+      );
+      socket.user = decoded;
+      socket.userId = decoded.id;
+      socket.branchId = decoded.branch_id;
+    } catch (err) {
+      socket.user = null;
+    }
+  } else {
+    socket.user = null;
+  }
+  next();
+});
 
 // ===== Simple in-memory cache to reduce DB load =====
 const _cache = new Map();
@@ -12222,7 +12328,32 @@ function clearCache(prefix) {
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log(
+    "User connected:",
+    socket.id,
+    socket.user
+      ? `(User: ${socket.user.id}, Branch: ${socket.user.branch_id})`
+      : "(Guest)",
+  );
+
+  // Auto-register authenticated user from JWT handshake
+  if (socket.user && socket.user.id) {
+    const uid = socket.user.id;
+    const bid = socket.user.branch_id;
+    socket.userId = uid;
+    if (bid) socket.join(`branch_${bid}`);
+    socket.join(`user_${uid}`);
+
+    if (!onlineUsers.has(uid)) {
+      onlineUsers.set(uid, new Set());
+    }
+    onlineUsers.get(uid).add(socket.id);
+
+    broadcastRealtime("user_online", { user_id: uid });
+    const onlineIds = Array.from(onlineUsers.keys());
+    socket.emit("online_users", { user_ids: onlineIds });
+    socket.emit("stock:watchdog:status", stockWatchdogService.getAnomalies());
+  }
 
   socket.on("register_user", async ({ user_id }) => {
     try {
@@ -12256,7 +12387,7 @@ io.on("connection", (socket) => {
       onlineUsers.get(user_id).add(socket.id);
 
       // Broadcast to all that this user is online
-      io.emit("user_online", { user_id });
+      broadcastRealtime("user_online", { user_id });
 
       // Send current online users list to this socket
       const onlineIds = Array.from(onlineUsers.keys());
@@ -12371,6 +12502,7 @@ runStartupMigrations().finally(() => {
 
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server + Socket running on port ${PORT}`);
+    initClusterRealtimeSync();
     stockWatchdogService.initStartupAudit(io);
     if (typeof pool.startContinuousStandbyBackup === "function") {
       pool.startContinuousStandbyBackup();
