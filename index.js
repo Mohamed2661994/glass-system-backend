@@ -61,7 +61,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.13";
+const SYSTEM_VERSION = "v.26.9.14";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -1120,7 +1120,8 @@ app.use((req, res, next) => {
         let channel = "data:misc";
         if (p.includes("/invoices")) channel = "data:invoices";
         else if (p.includes("/cash")) channel = "data:cash";
-        else if (p.includes("/stock") || p.includes("/transfer"))
+        else if (p.includes("/inter-branch")) channel = "data:inter-branch";
+        else if (p.includes("/stock-transfer") || p.includes("/stock") || p.includes("/transfer"))
           channel = "data:stock";
         else if (p.includes("/products") || p.includes("/manufacturers"))
           channel = "data:products";
@@ -1137,8 +1138,12 @@ app.use((req, res, next) => {
 
         if (typeof broadcast === "function") {
           broadcast(channel, payload);
+          // Inter-branch transfers also change stock levels across branches
+          if (channel === "data:inter-branch") {
+            broadcast("data:stock", payload);
+          }
           // Also broadcast specific cross-client invalidation if stock or product changed
-          if (channel === "data:stock" || channel === "data:products" || channel === "data:invoices") {
+          if (channel === "data:stock" || channel === "data:products" || channel === "data:invoices" || channel === "data:inter-branch") {
             broadcast("product_updated", { invalidateProducts: true, path: p, ts: Date.now() });
           }
         } else if (io) {
@@ -1149,6 +1154,7 @@ app.use((req, res, next) => {
         if (
           channel === "data:invoices" ||
           channel === "data:stock" ||
+          channel === "data:inter-branch" ||
           p.includes("/transfer") ||
           p.includes("/replace") ||
           p.includes("/opening-stock")
@@ -4175,14 +4181,26 @@ VALUES
         ],
       );
 
-      // 🚀 إرسال لحظي
-      const io = req.app.get("io");
-      io.to(`branch_${MAIN_WAREHOUSE_ID}`).emit("new_notification", {
-        title,
-        message,
-        type: "invoice_wholesale",
-        reference_id: invoiceId,
-      });
+      // 🚀 إرسال لحظي موحد عبر الكلاستر
+      const broadcast = req.app.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        broadcast("new_notification", {
+          title,
+          message,
+          type: "invoice_wholesale",
+          reference_id: invoiceId,
+        }, `branch_${MAIN_WAREHOUSE_ID}`);
+      } else {
+        const io = req.app.get("io");
+        if (io) {
+          io.to(`branch_${MAIN_WAREHOUSE_ID}`).emit("new_notification", {
+            title,
+            message,
+            type: "invoice_wholesale",
+            reference_id: invoiceId,
+          });
+        }
+      }
 
       // 📲 Push notification حتى لو الويب مقفول
       sendPushToBranch(MAIN_WAREHOUSE_ID, title, message, {
@@ -8343,13 +8361,25 @@ app.post("/stock/transfer", authMiddleware, async (req, res) => {
         [title, message, req.user.id, to_branch_id, "stock_transfer", null],
       );
 
-      const io = req.app.get("io");
-      io.to(`branch_${to_branch_id}`).emit("new_notification", {
-        title,
-        message,
-        type: "stock_transfer",
-        reference_id: null,
-      });
+      const broadcast = req.app.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        broadcast("new_notification", {
+          title,
+          message,
+          type: "stock_transfer",
+          reference_id: null,
+        }, `branch_${to_branch_id}`);
+      } else {
+        const io = req.app.get("io");
+        if (io) {
+          io.to(`branch_${to_branch_id}`).emit("new_notification", {
+            title,
+            message,
+            type: "stock_transfer",
+            reference_id: null,
+          });
+        }
+      }
 
       sendPushToBranch(to_branch_id, title, message, {
         type: "stock_transfer",
@@ -9788,13 +9818,25 @@ app.post(
           ],
         );
 
-        const io = req.app.get("io");
-        io.to(`branch_${from_branch_id}`).emit("new_notification", {
-          title,
-          message,
-          type: "stock_transfer",
-          reference_id: transferId,
-        });
+        const broadcast = req.app.get("broadcastRealtime");
+        if (typeof broadcast === "function") {
+          broadcast("new_notification", {
+            title,
+            message,
+            type: "stock_transfer",
+            reference_id: transferId,
+          }, `branch_${from_branch_id}`);
+        } else {
+          const io = req.app.get("io");
+          if (io) {
+            io.to(`branch_${from_branch_id}`).emit("new_notification", {
+              title,
+              message,
+              type: "stock_transfer",
+              reference_id: transferId,
+            });
+          }
+        }
 
         sendPushToBranch(from_branch_id, title, message, {
           type: "stock_transfer",
@@ -11780,13 +11822,23 @@ app.post(
         [convId, userId],
       );
 
-      const io = req.app.get("io");
-      if (io && otherUser.rows.length) {
+      const broadcast = req.app.get("broadcastRealtime");
+      if (otherUser.rows.length) {
         const otherUserId = otherUser.rows[0].user_id;
-        io.to(`user_${otherUserId}`).emit("new_message", {
-          conversation_id: convId,
-          message,
-        });
+        if (typeof broadcast === "function") {
+          broadcast("new_message", {
+            conversation_id: convId,
+            message,
+          }, `user_${otherUserId}`);
+        } else {
+          const io = req.app.get("io");
+          if (io) {
+            io.to(`user_${otherUserId}`).emit("new_message", {
+              conversation_id: convId,
+              message,
+            });
+          }
+        }
       }
 
       // Send push notification to other user
@@ -11876,14 +11928,24 @@ app.post(
         [convId, userId],
       );
 
-      // Emit to the other user via socket
-      const io = req.app.get("io");
-      if (io && otherUser.rows.length) {
+      // Emit to the other user via socket (Cluster-safe)
+      const broadcast = req.app.get("broadcastRealtime");
+      if (otherUser.rows.length) {
         const otherUserId = otherUser.rows[0].user_id;
-        io.to(`user_${otherUserId}`).emit("new_message", {
-          conversation_id: convId,
-          message,
-        });
+        if (typeof broadcast === "function") {
+          broadcast("new_message", {
+            conversation_id: convId,
+            message,
+          }, `user_${otherUserId}`);
+        } else {
+          const io = req.app.get("io");
+          if (io) {
+            io.to(`user_${otherUserId}`).emit("new_message", {
+              conversation_id: convId,
+              message,
+            });
+          }
+        }
       }
 
       // Send push notification to other user
@@ -12121,18 +12183,25 @@ app.get("/chat/users", authMiddleware, async (req, res) => {
 app.post("/print/invoice/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
+    const branchId = req.user?.branch_id || 1;
+    const broadcast = req.app.get("broadcastRealtime");
     const io = req.app.get("io");
-    const token = req.headers.authorization?.split(" ")[1] || "";
-    
-    // Emit event to a dedicated room for local print services
-    // The print service will listen to 'print-job' and process it
-    io.emit("print-job", {
+
+    const payload = {
       type: "invoice",
       id: id,
       path: `/invoices/${id}/print-thermal`,
-      token: token,
+      branch_id: branchId,
       timestamp: Date.now()
-    });
+    };
+
+    if (typeof broadcast === "function") {
+      broadcast("print-job", payload, `branch_${branchId}_printers`);
+      broadcast("print-job", payload, "printers");
+    } else if (io) {
+      io.to(`branch_${branchId}_printers`).emit("print-job", payload);
+      io.to("printers").emit("print-job", payload);
+    }
 
     res.json({ success: true, message: "Print job sent successfully" });
   } catch (err) {
@@ -12145,16 +12214,25 @@ app.post("/print/barcode/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const { count = 1 } = req.body;
+    const branchId = req.user?.branch_id || 1;
+    const broadcast = req.app.get("broadcastRealtime");
     const io = req.app.get("io");
-    const token = req.headers.authorization?.split(" ")[1] || "";
-    
-    io.emit("print-job", {
+
+    const payload = {
       type: "barcode",
       id: id,
       path: `/products/${id}/barcode-thermal?count=${count}`,
-      token: token,
+      branch_id: branchId,
       timestamp: Date.now()
-    });
+    };
+
+    if (typeof broadcast === "function") {
+      broadcast("print-job", payload, `branch_${branchId}_printers`);
+      broadcast("print-job", payload, "printers");
+    } else if (io) {
+      io.to(`branch_${branchId}_printers`).emit("print-job", payload);
+      io.to("printers").emit("print-job", payload);
+    }
 
     res.json({ success: true, message: "Barcode print job sent successfully" });
   } catch (err) {
@@ -12266,29 +12344,50 @@ async function initClusterRealtimeSync() {
   }
 }
 
+/**
+ * Broadcast an event in real-time across all PM2 workers / server nodes.
+ * Uses PostgreSQL LISTEN/NOTIFY as the single-source broker to prevent duplicate emissions.
+ */
 function broadcastRealtime(event, payload, room = null) {
-  // 1. Emit locally on this worker process immediately
-  if (room) {
-    io.to(room).emit(event, payload);
+  if (clusterSyncActive) {
+    try {
+      const notificationPayload = JSON.stringify({ event, payload, room });
+      pool.query("SELECT pg_notify('glass_cluster_events', $1)", [notificationPayload]).catch((err) => {
+        // Fallback local emit if pg_notify query rejected
+        if (room) io.to(room).emit(event, payload);
+        else io.emit(event, payload);
+      });
+    } catch {
+      if (room) io.to(room).emit(event, payload);
+      else io.emit(event, payload);
+    }
   } else {
-    io.emit(event, payload);
+    // Local fallback when cluster sync is offline
+    if (room) io.to(room).emit(event, payload);
+    else io.emit(event, payload);
   }
-
-  // 2. Notify other PM2 cluster workers via PostgreSQL NOTIFY
-  try {
-    const notificationPayload = JSON.stringify({ event, payload, room });
-    pool.query("SELECT pg_notify('glass_cluster_events', $1)", [notificationPayload]).catch(() => {});
-  } catch {}
 }
 
 app.set("broadcastRealtime", broadcastRealtime);
 
-// ===== Secure WebSocket JWT Handshake Authentication =====
+// ===== Secure WebSocket JWT & Service Token Handshake Authentication =====
+const PRINT_SERVICE_SECRET = process.env.PRINT_SERVICE_SECRET || "glass_print_daemon_2026";
+
 io.use((socket, next) => {
   const token =
     socket.handshake.auth?.token ||
     socket.handshake.headers?.authorization?.replace(/^Bearer\s+/i, "");
+  const serviceToken = socket.handshake.auth?.serviceToken;
 
+  // 1. Service daemon authentication (e.g. thermal print service daemon)
+  if (serviceToken && serviceToken === PRINT_SERVICE_SECRET) {
+    socket.isService = true;
+    socket.serviceType = "printer";
+    socket.branchId = Number(socket.handshake.auth?.branchId) || 1;
+    return next();
+  }
+
+  // 2. User JWT token authentication
   if (token) {
     try {
       const decoded = jwt_auth.verify(
@@ -12298,13 +12397,20 @@ io.use((socket, next) => {
       socket.user = decoded;
       socket.userId = decoded.id;
       socket.branchId = decoded.branch_id;
+      return next();
     } catch (err) {
-      socket.user = null;
+      return next(new Error("Unauthorized: Invalid token"));
     }
-  } else {
-    socket.user = null;
   }
-  next();
+
+  // 3. Fallback: reject unauthenticated connections in production
+  if (process.env.NODE_ENV === "production") {
+    return next(new Error("Unauthorized: Missing auth token"));
+  }
+
+  // Development guest fallback with zero room privileges
+  socket.user = null;
+  return next();
 });
 
 // ===== Simple in-memory cache to reduce DB load =====
@@ -12328,6 +12434,15 @@ function clearCache(prefix) {
 const onlineUsers = new Map();
 
 io.on("connection", (socket) => {
+  // 🖨️ Service socket auto-setup
+  if (socket.isService) {
+    const bid = socket.branchId || 1;
+    socket.join(`branch_${bid}_printers`);
+    socket.join("printers");
+    console.log(`🖨️ Print Service connected (Branch: ${bid}, Socket: ${socket.id})`);
+    return;
+  }
+
   console.log(
     "User connected:",
     socket.id,
@@ -12336,7 +12451,7 @@ io.on("connection", (socket) => {
       : "(Guest)",
   );
 
-  // Auto-register authenticated user from JWT handshake
+  // Auto-register authenticated user from verified JWT handshake
   if (socket.user && socket.user.id) {
     const uid = socket.user.id;
     const bid = socket.user.branch_id;
@@ -12355,78 +12470,85 @@ io.on("connection", (socket) => {
     socket.emit("stock:watchdog:status", stockWatchdogService.getAnomalies());
   }
 
-  socket.on("register_user", async ({ user_id }) => {
+  socket.on("register_user", async ({ user_id } = {}) => {
     try {
-      // 🧠 هات الفرع الحقيقي من الداتابيز
-      const result = await pool.query(
-        "SELECT branch_id FROM users WHERE id = $1",
-        [user_id],
-      );
-
-      const branch_id = result.rows[0]?.branch_id;
-
-      if (!branch_id) {
-        console.log(`User ${user_id} has no branch_id`);
+      // 🛡️ Security Check: Prevent identity spoofing
+      const verifiedUid = socket.user?.id || (process.env.NODE_ENV !== "production" ? user_id : null);
+      if (!verifiedUid) {
+        console.warn(`[Security Warning] Blocked unauthenticated register_user from socket ${socket.id}`);
         return;
       }
 
-      // 🧹 يخرج من أي رومات قديمة
+      // 🧠 Fetch real branch from DB
+      const result = await pool.query(
+        "SELECT branch_id FROM users WHERE id = $1",
+        [verifiedUid],
+      );
+
+      const branch_id = result.rows[0]?.branch_id;
+      if (!branch_id) {
+        console.log(`User ${verifiedUid} has no branch_id`);
+        return;
+      }
+
+      // 🧹 Leave old branch/user rooms (keep socket.id)
       for (const room of socket.rooms) {
         if (room !== socket.id) socket.leave(room);
       }
 
-      // ✅ يدخل روم الفرع الصح + روم اليوزر الشخصي (للشات)
+      // ✅ Join verified rooms
       socket.join(`branch_${branch_id}`);
-      socket.join(`user_${user_id}`);
+      socket.join(`user_${verifiedUid}`);
 
       // Track online status
-      socket.userId = user_id;
-      if (!onlineUsers.has(user_id)) {
-        onlineUsers.set(user_id, new Set());
+      socket.userId = verifiedUid;
+      if (!onlineUsers.has(verifiedUid)) {
+        onlineUsers.set(verifiedUid, new Set());
       }
-      onlineUsers.get(user_id).add(socket.id);
+      onlineUsers.get(verifiedUid).add(socket.id);
 
-      // Broadcast to all that this user is online
-      broadcastRealtime("user_online", { user_id });
+      // Broadcast online status across cluster
+      broadcastRealtime("user_online", { user_id: verifiedUid });
 
       // Send current online users list to this socket
       const onlineIds = Array.from(onlineUsers.keys());
       socket.emit("online_users", { user_ids: onlineIds });
-
-      // 🛡️ Send current watchdog status directly to the connected user
       socket.emit("stock:watchdog:status", stockWatchdogService.getAnomalies());
 
       console.log(
-        `User ${user_id} joined branch_${branch_id} + user_${user_id} (online)`,
+        `User ${verifiedUid} joined branch_${branch_id} + user_${verifiedUid} (online)`,
       );
     } catch (err) {
       console.error("Socket register error:", err);
     }
   });
 
-  // 💬 Chat: typing indicator
-  socket.on("chat_typing", ({ conversation_id, user_id, to_user_id }) => {
-    io.to(`user_${to_user_id}`).emit("chat_typing", {
+  // 💬 Chat: typing indicator (Cluster-safe)
+  socket.on("chat_typing", ({ conversation_id, to_user_id }) => {
+    if (!socket.userId) return;
+    broadcastRealtime("chat_typing", {
       conversation_id,
-      user_id,
-    });
+      user_id: socket.userId,
+    }, `user_${to_user_id}`);
   });
 
-  socket.on("chat_stop_typing", ({ conversation_id, user_id, to_user_id }) => {
-    io.to(`user_${to_user_id}`).emit("chat_stop_typing", {
+  socket.on("chat_stop_typing", ({ conversation_id, to_user_id }) => {
+    if (!socket.userId) return;
+    broadcastRealtime("chat_stop_typing", {
       conversation_id,
-      user_id,
-    });
+      user_id: socket.userId,
+    }, `user_${to_user_id}`);
   });
 
-  // 💬 Chat: mark messages as read in real-time
+  // 💬 Chat: mark messages as read in real-time (Cluster-safe)
   socket.on(
     "chat_messages_read",
-    ({ conversation_id, reader_id, to_user_id }) => {
-      io.to(`user_${to_user_id}`).emit("chat_messages_read", {
+    ({ conversation_id, to_user_id }) => {
+      if (!socket.userId) return;
+      broadcastRealtime("chat_messages_read", {
         conversation_id,
-        reader_id,
-      });
+        reader_id: socket.userId,
+      }, `user_${to_user_id}`);
     },
   );
 

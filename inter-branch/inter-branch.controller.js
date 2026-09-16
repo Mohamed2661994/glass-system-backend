@@ -375,6 +375,18 @@ exports.webhookRequest = async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    // 🔔 Live Notification to branch
+    const broadcast = req.app.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("new_notification", {
+        title: "طلب بضاعة بين الفروع",
+        message: `وصل طلب تحويل أصناف جديد بإجمالي ${total_value} ج.م`,
+        type: "inter_branch",
+        reference_id: transferId
+      });
+    }
+
     res.json({ success: true });
   } catch (e) {
     await client.query("ROLLBACK");
@@ -393,6 +405,18 @@ exports.webhookDispatch = async (req, res) => {
       [transfer_uuid]
     );
     if (upd.rowCount === 0) return res.status(404).json({ error: "Transfer not found" });
+
+    // 🔔 Live Notification to branch
+    const broadcast = req.app.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("new_notification", {
+        title: "شحن أصناف بين الفروع",
+        message: `تم شحن البضاعة المطلوبة من الفرع الآخر وهي في الطريق إليكم`,
+        type: "inter_branch",
+        reference_id: transfer_uuid
+      });
+    }
+
     res.json({ success: true });
   } catch (e) {
     console.error("webhookDispatch error:", e);
@@ -424,6 +448,18 @@ exports.webhookReceive = async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    // 🔔 Live Notification to branch
+    const broadcast = req.app.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("new_notification", {
+        title: "تأكيد استلام شحنة",
+        message: `تم تأكيد استلام الشحنة وإضافتها للحساب التبادلي بنجاح`,
+        type: "inter_branch",
+        reference_id: transfer.id
+      });
+    }
+
     res.json({ success: true });
   } catch (e) {
     await client.query("ROLLBACK");
