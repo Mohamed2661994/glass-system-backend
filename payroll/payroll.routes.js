@@ -13,24 +13,22 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-router.use(requireAdmin);
-
 // 1. Employees Routes
 router.get("/employees", controller.getEmployees);
 router.post("/employees", controller.createEmployee);
-router.put("/employees/:id", controller.updateEmployee);
+router.put("/employees/:id", requireAdmin, controller.updateEmployee);
 
 // 2. Advances Routes (السُلف والمسحوبات)
 router.get("/advances", controller.getAdvances);
 router.post("/advances", controller.createAdvance);
-router.delete("/advances/:id", controller.deleteAdvance);
+router.delete("/advances/:id", requireAdmin, controller.deleteAdvance);
 
-// 3. Payroll Calculation & Payout Confirmation
-router.get("/sheet", controller.getPayrollSheet);
-router.post("/payout", controller.confirmPayrollPayout);
+// 3. Payroll Calculation & Payout Confirmation (Admin Only)
+router.get("/sheet", requireAdmin, controller.getPayrollSheet);
+router.post("/payout", requireAdmin, controller.confirmPayrollPayout);
 
-// 4. Payroll History & Revert
-router.get("/history", controller.getPayrollHistory);
-router.delete("/history/:id", controller.revertPayrollRecord);
+// 4. Payroll History & Revert (Admin Only)
+router.get("/history", requireAdmin, controller.getPayrollHistory);
+router.delete("/history/:id", requireAdmin, controller.revertPayrollRecord);
 
 module.exports = router;
