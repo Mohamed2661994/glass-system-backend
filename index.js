@@ -61,7 +61,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.16";
+const SYSTEM_VERSION = "v.26.9.17";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -1128,6 +1128,7 @@ app.use((req, res, next) => {
         else if (p.includes("/customers")) channel = "data:customers";
         else if (p.includes("/suppliers")) channel = "data:suppliers";
         else if (p.includes("/users")) channel = "data:users";
+        else if (p.includes("/payroll")) channel = "data:payroll";
         else if (p.includes("/opening-stock")) channel = "data:stock";
 
         const payload = {
@@ -1180,6 +1181,9 @@ app.use("/reports", reportsRoutes);
 
 const interBranchRoutes = require("./inter-branch/inter-branch.routes");
 app.use("/api/inter-branch", interBranchRoutes);
+
+const payrollRoutes = require("./payroll/payroll.routes");
+app.use("/payroll", payrollRoutes);
 
 const productsRoutes = require("./modules/products/products.routes");
 
@@ -12648,6 +12652,67 @@ async function runStartupMigrations() {
       sql: `
         ALTER TABLE invoices
         ADD COLUMN IF NOT EXISTS additional_amount NUMERIC NOT NULL DEFAULT 0
+      `,
+    },
+    {
+      name: "payroll.tables",
+      sql: `
+        CREATE TABLE IF NOT EXISTS payroll_employees (
+          id SERIAL PRIMARY KEY,
+          branch_id INTEGER NOT NULL REFERENCES branches(id),
+          name VARCHAR(150) NOT NULL,
+          phone VARCHAR(50),
+          national_id VARCHAR(50),
+          job_title VARCHAR(100),
+          salary_type VARCHAR(20) NOT NULL DEFAULT 'weekly',
+          base_salary NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          status VARCHAR(20) NOT NULL DEFAULT 'active',
+          hire_date DATE DEFAULT CURRENT_DATE,
+          notes TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_payroll_emp_branch ON payroll_employees(branch_id, status);
+
+        CREATE TABLE IF NOT EXISTS payroll_advances (
+          id SERIAL PRIMARY KEY,
+          branch_id INTEGER NOT NULL REFERENCES branches(id),
+          employee_id INTEGER NOT NULL REFERENCES payroll_employees(id) ON DELETE CASCADE,
+          amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+          advance_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          status VARCHAR(20) NOT NULL DEFAULT 'pending',
+          payroll_record_id INTEGER,
+          cash_out_id INTEGER,
+          notes TEXT,
+          created_by INTEGER,
+          created_by_name VARCHAR(100),
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_payroll_adv_branch ON payroll_advances(branch_id, status);
+
+        CREATE TABLE IF NOT EXISTS payroll_records (
+          id SERIAL PRIMARY KEY,
+          branch_id INTEGER NOT NULL REFERENCES branches(id),
+          employee_id INTEGER NOT NULL REFERENCES payroll_employees(id) ON DELETE CASCADE,
+          cycle_type VARCHAR(20) NOT NULL,
+          period_start DATE NOT NULL,
+          period_end DATE NOT NULL,
+          base_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          days_worked NUMERIC(5, 1) DEFAULT 0,
+          overtime_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          bonus_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          deductions_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          advances_deducted NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          net_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          cash_out_id INTEGER,
+          payment_status VARCHAR(20) NOT NULL DEFAULT 'paid',
+          paid_at TIMESTAMPTZ DEFAULT NOW(),
+          paid_by INTEGER,
+          paid_by_name VARCHAR(100),
+          notes TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_payroll_rec_branch ON payroll_records(branch_id, period_start);
       `,
     },
   ];
