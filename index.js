@@ -12403,12 +12403,7 @@ io.use((socket, next) => {
     }
   }
 
-  // 3. Fallback: reject unauthenticated connections in production
-  if (process.env.NODE_ENV === "production") {
-    return next(new Error("Unauthorized: Missing auth token"));
-  }
-
-  // Development guest fallback with zero room privileges
+  // 3. Fallback: allow guest with zero privileges (no rooms, cannot spoof identity, avoids reconnect storm on login page)
   socket.user = null;
   return next();
 });
