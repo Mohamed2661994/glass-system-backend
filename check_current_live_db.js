@@ -3,7 +3,7 @@ const { Pool } = require('pg');
 async function checkRenderHealth() {
   console.log('=== 1. CHECKING LIVE BACKEND (/health) ===');
   try {
-    const res = await fetch('https://glass-system-backend.onrender.com/health');
+    const res = await fetch('https://api.hg-alshour.online/health');
     const data = await res.json();
     console.log(JSON.stringify(data, null, 2));
   } catch (err) {
