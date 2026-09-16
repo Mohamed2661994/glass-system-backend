@@ -384,19 +384,36 @@ async function deleteAdvance(req, res) {
 async function getPayrollSheet(req, res) {
   try {
     const branchId = Number(req.query.branch_id) || 1;
-    const cycleType = req.query.cycle_type === "monthly" ? "monthly" : "weekly";
+    const rawCycle = String(req.query.cycle_type || "all").toLowerCase();
     const periodStart = req.query.period_start || new Date().toISOString().slice(0, 10);
     const periodEnd = req.query.period_end || new Date().toISOString().slice(0, 10);
 
-    // 1. Fetch active employees of this branch and cycle
+    let cycleClause = "";
+    const params = [branchId];
+
+    if (rawCycle === "weekly") {
+      params.push("weekly");
+      cycleClause = "AND (salary_type = $2 OR salary_type = 'daily')";
+    } else if (rawCycle === "monthly") {
+      params.push("monthly");
+      cycleClause = "AND salary_type = $2";
+    }
+
+    // 1. Fetch active employees of this branch (sorted: weekly -> daily -> monthly)
     const empRes = await pool.query(
       `
       SELECT id, name, phone, job_title, salary_type, base_salary, status
       FROM payroll_employees
-      WHERE branch_id = $1 AND status = 'active' AND (salary_type = $2 OR salary_type = 'daily')
-      ORDER BY id ASC
+      WHERE branch_id = $1 AND status = 'active' ${cycleClause}
+      ORDER BY 
+        CASE 
+          WHEN salary_type = 'weekly' THEN 1 
+          WHEN salary_type = 'daily' THEN 2 
+          ELSE 3 
+        END ASC, 
+        id ASC
       `,
-      [branchId, cycleType],
+      params,
     );
 
     const employees = empRes.rows;
@@ -509,6 +526,8 @@ async function confirmPayrollPayout(req, res) {
         ) / 100,
       );
 
+      const itemCycle = item.cycle_type || item.salary_type || cycle_type;
+
       // 1. Create cash_out voucher if netAmount > 0 and requested
       let cashOutId = null;
       let permissionNumber = null;
@@ -525,7 +544,7 @@ async function confirmPayrollPayout(req, res) {
             safeBranchId,
             `راتب: ${item.name || "عامل"}`,
             netAmount,
-            `صرف راتب ${cycle_type === "weekly" ? "أسبوعي" : "شهري"} للعامل: ${item.name || ""} - الفترة من ${safeStart} إلى ${safeEnd}${advancesDeducted > 0 ? ` (بعد خصم سلف ${advancesDeducted} ج)` : ""}`,
+            `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} للعامل: ${item.name || ""} - الفترة من ${safeStart} إلى ${safeEnd}${advancesDeducted > 0 ? ` (بعد خصم سلف ${advancesDeducted} ج)` : ""}`,
             safeEnd,
             permissionNumber,
           ],
@@ -547,7 +566,7 @@ async function confirmPayrollPayout(req, res) {
         [
           safeBranchId,
           empId,
-          cycle_type,
+          itemCycle,
           safeStart,
           safeEnd,
           baseAmount,
