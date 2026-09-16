@@ -466,7 +466,7 @@ async function getPayrollSheet(req, res) {
     res.json({
       success: true,
       branch_id: branchId,
-      cycle_type: cycleType,
+      cycle_type: rawCycle,
       period_start: periodStart,
       period_end: periodEnd,
       rows: sheetRows,
