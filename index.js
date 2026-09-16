@@ -1142,12 +1142,19 @@ app.use((req, res, next) => {
           if (channel === "data:inter-branch") {
             broadcast("data:stock", payload);
           }
+          // Ensure specific cash-in channel is also broadcasted
+          if (p.includes("/cash-in")) {
+            broadcast("data:cash-in", payload);
+          }
           // Also broadcast specific cross-client invalidation if stock or product changed
           if (channel === "data:stock" || channel === "data:products" || channel === "data:invoices" || channel === "data:inter-branch") {
             broadcast("product_updated", { invalidateProducts: true, path: p, ts: Date.now() });
           }
         } else if (io) {
           io.emit(channel, payload);
+          if (p.includes("/cash-in")) {
+            io.emit("data:cash-in", payload);
+          }
         }
 
         // 🚨 Trigger debounced non-blocking stock watchdog check
