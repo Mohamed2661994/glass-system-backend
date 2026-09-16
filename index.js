@@ -61,7 +61,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.15";
+const SYSTEM_VERSION = "v.26.9.16";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -12303,6 +12303,7 @@ app.set("io", io);
 // ===== Cross-Worker Cluster Sync via PostgreSQL LISTEN / NOTIFY =====
 let clusterListener = null;
 let clusterSyncActive = false;
+let clusterPingInterval = null;
 
 async function initClusterRealtimeSync() {
   if (clusterSyncActive && clusterListener) return;
@@ -12314,6 +12315,7 @@ async function initClusterRealtimeSync() {
       connectionString: connStr,
       connectionTimeoutMillis: 10000,
       keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
     });
     await clusterListener.connect();
     await clusterListener.query("LISTEN glass_cluster_events");
@@ -12322,7 +12324,15 @@ async function initClusterRealtimeSync() {
     clusterListener.on("notification", (msg) => {
       try {
         if (msg.channel === "glass_cluster_events" && msg.payload) {
-          const { event, payload, room } = JSON.parse(msg.payload);
+          const { event, payload, room, sender } = JSON.parse(msg.payload);
+          const currentWorker =
+            process.env.pm_id !== undefined
+              ? String(process.env.pm_id)
+              : String(process.pid);
+          // If this event was already emitted locally on the originating worker, skip it to prevent duplicates
+          if (sender && sender === currentWorker) {
+            return;
+          }
           if (room) {
             io.to(room).emit(event, payload);
           } else {
@@ -12337,10 +12347,24 @@ async function initClusterRealtimeSync() {
     clusterListener.on("error", (err) => {
       console.error("Cluster listener error (reconnecting in 5s):", err.message);
       clusterSyncActive = false;
-      try { clusterListener.end(); } catch {}
+      if (clusterPingInterval) {
+        clearInterval(clusterPingInterval);
+        clusterPingInterval = null;
+      }
+      try {
+        clusterListener.end();
+      } catch {}
       clusterListener = null;
       setTimeout(initClusterRealtimeSync, 5000);
     });
+
+    // Periodic lightweight TCP keepalive check every 45s
+    if (clusterPingInterval) clearInterval(clusterPingInterval);
+    clusterPingInterval = setInterval(() => {
+      if (clusterListener && clusterSyncActive) {
+        clusterListener.query("SELECT 1").catch(() => {});
+      }
+    }, 45000);
 
     console.log("✅ Realtime Cluster Sync active (PostgreSQL LISTEN glass_cluster_events)");
   } catch (err) {
@@ -12353,25 +12377,42 @@ async function initClusterRealtimeSync() {
 
 /**
  * Broadcast an event in real-time across all PM2 workers / server nodes.
- * Uses PostgreSQL LISTEN/NOTIFY as the single-source broker to prevent duplicate emissions.
+ * 1. Emits immediately to all local sockets connected to this worker (zero delay).
+ * 2. Emits across the PM2 cluster via PostgreSQL NOTIFY with sender deduplication.
  */
 function broadcastRealtime(event, payload, room = null) {
+  // 1. Immediate local emit
+  try {
+    if (room) {
+      io.to(room).emit(event, payload);
+    } else {
+      io.emit(event, payload);
+    }
+  } catch (localErr) {
+    console.error("Local broadcast error:", localErr.message);
+  }
+
+  // 2. Cross-worker broadcast via PostgreSQL LISTEN/NOTIFY
   if (clusterSyncActive) {
     try {
-      const notificationPayload = JSON.stringify({ event, payload, room });
-      pool.query("SELECT pg_notify('glass_cluster_events', $1)", [notificationPayload]).catch((err) => {
-        // Fallback local emit if pg_notify query rejected
-        if (room) io.to(room).emit(event, payload);
-        else io.emit(event, payload);
+      const currentWorker =
+        process.env.pm_id !== undefined
+          ? String(process.env.pm_id)
+          : String(process.pid);
+      const notificationPayload = JSON.stringify({
+        event,
+        payload,
+        room,
+        sender: currentWorker,
       });
-    } catch {
-      if (room) io.to(room).emit(event, payload);
-      else io.emit(event, payload);
+      pool
+        .query("SELECT pg_notify('glass_cluster_events', $1)", [notificationPayload])
+        .catch((err) => {
+          console.error("pg_notify cluster sync error:", err.message);
+        });
+    } catch (err) {
+      console.error("broadcastRealtime stringify error:", err.message);
     }
-  } else {
-    // Local fallback when cluster sync is offline
-    if (room) io.to(room).emit(event, payload);
-    else io.emit(event, payload);
   }
 }
 
