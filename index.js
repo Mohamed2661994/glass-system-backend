@@ -9417,24 +9417,73 @@ app.get("/cash/out/:id", authMiddleware, async (req, res) => {
 });
 
 app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
+  const client = await pool.connect();
   try {
     const currentUser = await requirePermission(req, res, "cash_out_delete");
-    if (!currentUser) return;
+    if (!currentUser) {
+      client.release();
+      return;
+    }
 
     const branch_id = currentUser.branch_id;
     const { id } = req.params;
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+
+    // 1. Check if linked to payroll_records (salary disbursement)
+    const linkedPayroll = await client.query(
+      `SELECT id FROM payroll_records WHERE cash_out_id = $1 AND branch_id = $2`,
+      [id, branch_id],
+    );
+
+    if (linkedPayroll.rows.length > 0) {
+      const payrollRecordIds = linkedPayroll.rows.map((r) => r.id);
+      // Revert any deducted advances back to 'pending'
+      await client.query(
+        `UPDATE payroll_advances SET status = 'pending', payroll_record_id = NULL WHERE payroll_record_id = ANY($1)`,
+        [payrollRecordIds],
+      );
+      // Delete the payroll_records entries
+      await client.query(
+        `DELETE FROM payroll_records WHERE id = ANY($1)`,
+        [payrollRecordIds],
+      );
+    }
+
+    // 2. Check if linked to payroll_advances (direct advance cash_out)
+    await client.query(
+      `DELETE FROM payroll_advances WHERE cash_out_id = $1 AND branch_id = $2`,
+      [id, branch_id],
+    );
+
+    // 3. Delete the cash_out record
+    const result = await client.query(
       `DELETE FROM cash_out WHERE id=$1 AND branch_id=$2 RETURNING id`,
       [id, branch_id],
     );
 
     if (!result.rowCount) {
-      return res.status(403).json({ error: "غير مسموح بالحذف" });
+      await client.query("ROLLBACK");
+      client.release();
+      return res.status(403).json({ error: "غير مسموح بالحذف أو السند غير موجود" });
     }
 
-    res.json({ success: true });
+    await client.query("COMMIT");
+    client.release();
+
+    // Broadcast realtime updates for cash and payroll
+    const broadcast = req.app?.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("data:cash", { action: "cash_out_deleted", id, branch_id, ts: Date.now() });
+      if (linkedPayroll.rows.length > 0) {
+        broadcast("data:payroll", { action: "payroll_reverted", branch_id, ts: Date.now() });
+      }
+    }
+
+    res.json({ success: true, message: "تم حذف إذن الصرف وتحديث مسير الرواتب بنجاح" });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    client.release();
     console.error("DELETE CASH OUT ERROR:", err);
     res.status(500).json({ error: "خطأ أثناء الحذف" });
   }

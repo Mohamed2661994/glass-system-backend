@@ -441,25 +441,82 @@ async function getPayrollSheet(req, res) {
       advancesByEmp[adv.employee_id].push(adv);
     }
 
-    // 3. Build sheet rows
+    // 3. Fetch paid records for these employees in this period window
+    // (Only records whose linked cash_out still exists in the treasury, or cash_out_id is NULL)
+    const paidRes = await pool.query(
+      `
+      SELECT 
+        pr.id, pr.employee_id, pr.cycle_type, pr.period_start, pr.period_end, 
+        pr.base_amount, pr.days_worked, pr.overtime_amount, pr.bonus_amount, pr.deductions_amount,
+        pr.advances_deducted, pr.net_amount, pr.permission_number, pr.payment_status, 
+        pr.paid_at, pr.paid_by_name, pr.cash_out_id, pr.notes
+      FROM payroll_records pr
+      LEFT JOIN cash_out co ON pr.cash_out_id = co.id
+      WHERE pr.branch_id = $1
+        AND pr.employee_id = ANY($2)
+        AND pr.payment_status = 'paid'
+        AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
+        AND (
+          (pr.period_start = $3 AND pr.period_end = $4)
+          OR (pr.period_end >= $3 AND pr.period_start <= $4)
+        )
+      ORDER BY pr.paid_at DESC
+      `,
+      [branchId, empIds, periodStart, periodEnd],
+    );
+
+    const paidByEmp = {};
+    for (const rec of paidRes.rows) {
+      if (!paidByEmp[rec.employee_id]) {
+        paidByEmp[rec.employee_id] = rec;
+      }
+    }
+
+    // 4. Build sheet rows
     const sheetRows = employees.map((emp) => {
       const empAdvances = advancesByEmp[emp.id] || [];
       const totalAdvances = empAdvances.reduce((sum, a) => sum + Number(a.amount || 0), 0);
       const baseSalary = Number(emp.base_salary || 0);
+
+      const paidRecord = paidByEmp[emp.id];
+      const isPaid = Boolean(paidRecord);
+      const paidNetAmount = isPaid ? Number(paidRecord.net_amount || 0) : Math.max(0, baseSalary - totalAdvances);
 
       return {
         employee_id: emp.id,
         name: emp.name,
         job_title: emp.job_title,
         salary_type: emp.salary_type,
-        base_salary: baseSalary,
-        days_worked: emp.salary_type === "daily" ? 6 : 0,
-        overtime_amount: 0,
-        bonus_amount: 0,
-        deductions_amount: 0,
-        pending_advances: totalAdvances,
-        advances_list: empAdvances,
-        net_amount: Math.max(0, baseSalary - totalAdvances),
+        base_salary: isPaid ? Number(paidRecord.base_amount || baseSalary) : baseSalary,
+        days_worked: isPaid ? Number(paidRecord.days_worked || (emp.salary_type === "daily" ? 6 : 0)) : (emp.salary_type === "daily" ? 6 : 0),
+        overtime_amount: isPaid ? Number(paidRecord.overtime_amount || 0) : 0,
+        bonus_amount: isPaid ? Number(paidRecord.bonus_amount || 0) : 0,
+        deductions_amount: isPaid ? Number(paidRecord.deductions_amount || 0) : 0,
+        pending_advances: isPaid ? Number(paidRecord.advances_deducted || 0) : totalAdvances,
+        advances_list: isPaid ? [] : empAdvances,
+        net_amount: paidNetAmount,
+        notes: isPaid ? (paidRecord.notes || "") : "",
+        is_paid: isPaid,
+        payout_info: isPaid
+          ? {
+              record_id: paidRecord.id,
+              paid_at: paidRecord.paid_at,
+              paid_by_name: paidRecord.paid_by_name,
+              net_amount: paidNetAmount,
+              cash_out_id: paidRecord.cash_out_id,
+              permission_number: paidRecord.permission_number,
+              cycle_type: paidRecord.cycle_type,
+              period_start: paidRecord.period_start,
+              period_end: paidRecord.period_end,
+              base_amount: Number(paidRecord.base_amount || baseSalary),
+              days_worked: Number(paidRecord.days_worked || 0),
+              overtime_amount: Number(paidRecord.overtime_amount || 0),
+              bonus_amount: Number(paidRecord.bonus_amount || 0),
+              deductions_amount: Number(paidRecord.deductions_amount || 0),
+              advances_deducted: Number(paidRecord.advances_deducted || 0),
+              notes: paidRecord.notes || "",
+            }
+          : null,
       };
     });
 
@@ -527,6 +584,26 @@ async function confirmPayrollPayout(req, res) {
       );
 
       const itemCycle = item.cycle_type || item.salary_type || cycle_type;
+
+      // 0. Double payout guard: ensure employee has not already been paid for this period with an active cash_out
+      const dupCheck = await client.query(
+        `
+        SELECT pr.id, pr.paid_at 
+        FROM payroll_records pr
+        LEFT JOIN cash_out co ON pr.cash_out_id = co.id
+        WHERE pr.branch_id = $1 AND pr.employee_id = $2 AND pr.payment_status = 'paid'
+          AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
+          AND (
+            (pr.period_start = $3 AND pr.period_end = $4)
+            OR (pr.period_end >= $3 AND pr.period_start <= $4)
+          )
+        LIMIT 1
+        `,
+        [safeBranchId, empId, safeStart, safeEnd],
+      );
+      if (dupCheck.rows.length > 0) {
+        throw new Error(`تم اعتماد وصرف راتب العامل [${item.name || empId}] بالفعل عن هذه الفترة.`);
+      }
 
       // 1. Create cash_out voucher if netAmount > 0 and requested
       let cashOutId = null;
