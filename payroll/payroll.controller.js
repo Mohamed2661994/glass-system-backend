@@ -867,7 +867,7 @@ async function confirmPayrollPayout(req, res) {
             safeBranchId,
             `راتب: ${item.name || "عامل"}`,
             netAmount,
-            `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} للعامل: ${item.name || ""} - الفترة من ${safeStart} إلى ${safeEnd}${advancesDeducted > 0 ? ` (بعد خصم سلف ${advancesDeducted} ج)` : ""}`,
+            `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} : ${item.name || ""} - الفترة من ${safeStart} إلى ${safeEnd}${advancesDeducted > 0 ? ` (بعد خصم سلف ${advancesDeducted} ج)` : ""}`,
             safeEnd,
             permissionNumber,
           ],
