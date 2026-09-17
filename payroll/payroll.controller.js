@@ -448,7 +448,7 @@ async function getPayrollSheet(req, res) {
       SELECT 
         pr.id, pr.employee_id, pr.cycle_type, pr.period_start, pr.period_end, 
         pr.base_amount, pr.days_worked, pr.overtime_amount, pr.bonus_amount, pr.deductions_amount,
-        pr.advances_deducted, pr.net_amount, pr.permission_number, pr.payment_status, 
+        pr.advances_deducted, pr.net_amount, co.permission_number, pr.payment_status, 
         pr.paid_at, pr.paid_by_name, pr.cash_out_id, pr.notes
       FROM payroll_records pr
       LEFT JOIN cash_out co ON pr.cash_out_id = co.id
