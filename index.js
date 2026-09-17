@@ -8806,7 +8806,7 @@ app.get("/stock/adjustments/history", authMiddleware, async (req, res) => {
         sm.movement_type,
         sm.reference_type,
         sm.reference_id as user_id,
-        COALESCE(u.name, u.username, 'مدير النظام') as user_name,
+        COALESCE(u.username, 'مدير النظام') as user_name,
         sm.note,
         sm.created_at
       FROM (
