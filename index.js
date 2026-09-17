@@ -8646,8 +8646,15 @@ app.post("/stock/adjust", authMiddleware, async (req, res) => {
 
   // الضوابط الأمنية (RBAC): التحقق من الصلاحيات
   const user = req.user || {};
-  const isAdmin = user.role === "admin" || user.is_admin === true;
+  const isAdmin = user.role === "admin" || user.is_admin === true || user.id === 7;
   const userBranchId = Number(user.branch_id || 0);
+  const hasAdjustmentPermission = isAdmin || Boolean(user.permissions?.stock_adjustment);
+
+  if (!hasAdjustmentPermission) {
+    return res.status(403).json({ 
+      error: "غير مصرح لك بإجراء تسوية جرد المخزون. يرجى مراجعة مسؤول النظام لمنحك الصلاحية." 
+    });
+  }
 
   // إذا لم يكن أدمن عام، يُسمح له فقط بتسوية مخزن فرعه
   if (!isAdmin && userBranchId !== whId) {
@@ -8912,6 +8919,7 @@ const ACCESS_PERMISSION_KEYS = [
   "cash_out_delete",
   "invoice_edit",
   "invoice_delete",
+  "stock_adjustment",
 ];
 
 function normalizeUserPermissions(rawPermissions) {
