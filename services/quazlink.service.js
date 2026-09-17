@@ -22,6 +22,7 @@ const QUAZLINK_CONFIG = {
   apiKey: process.env.QUAZLINK_API_KEY || 'ql_live_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI4MzJiOWQxMS04MmI3LTQzN2EtOGY3ZC0zYjljNjUyNDE0NDEiLCJ0eXBlIjoiYXBpX2tleSIsImlhdCI6MTc4OTY0OTEzMSwiZXhwIjoyMTA1MDA5MTMxfQ.D_EJgbJQvaAtUeQA-isNo0h6ec4jITzCZvM_9DlVi5U',
   enabled: process.env.QUAZLINK_ENABLED !== 'false',
   timeoutMs: Number(process.env.QUAZLINK_TIMEOUT_MS) || 4500,
+  storeName: process.env.QUAZLINK_STORE_NAME || 'معرض ال عاشور عدس - House of Glass',
 };
 
 // Memory cache for debounce/anti-spam (stores invoiceId -> lastSentTimestamp)
@@ -186,14 +187,14 @@ async function dispatchInvoiceWhatsApp({
   if (!targetPhone || !targetAmount) {
     try {
       const invRes = await pool.query(
-        'SELECT customer_phone, customer_name, total, final_total FROM invoices WHERE id = $1',
+        'SELECT customer_phone, customer_name, total FROM invoices WHERE id = $1',
         [id]
       );
       if (invRes.rows.length > 0) {
         const row = invRes.rows[0];
         targetPhone = targetPhone || row.customer_phone;
         targetName = targetName || row.customer_name;
-        targetAmount = targetAmount || row.final_total || row.total;
+        targetAmount = targetAmount || row.total;
       }
     } catch (dbErr) {
       console.error(`[QuazLink] Error fetching invoice #${id} details for WhatsApp:`, dbErr.message);
@@ -218,7 +219,7 @@ async function dispatchInvoiceWhatsApp({
     return { success: false, reason: 'no_valid_phone' };
   }
 
-  const invoiceNumber = `INV-${id}`;
+  const invoiceNumber = `INV-${id} (${QUAZLINK_CONFIG.storeName})`;
   const formattedAmount = formatAmount(targetAmount);
   const displayName = (targetName && targetName.trim()) ? targetName.trim() : 'عميلنا العزيز';
 
@@ -231,6 +232,10 @@ async function dispatchInvoiceWhatsApp({
       invoiceNumber: invoiceNumber,
       amount: formattedAmount,
       currency: currency,
+      storeName: QUAZLINK_CONFIG.storeName,
+      companyName: QUAZLINK_CONFIG.storeName,
+      company: QUAZLINK_CONFIG.storeName,
+      store: QUAZLINK_CONFIG.storeName,
     });
 
     if (result.statusCode >= 200 && result.statusCode < 300 && result.data?.success) {
@@ -303,7 +308,7 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
   if (!id) throw new Error('معرف الفاتورة غير صالح');
 
   const invRes = await pool.query(
-    'SELECT id, customer_phone, customer_name, total, final_total FROM invoices WHERE id = $1',
+    'SELECT id, customer_phone, customer_name, total FROM invoices WHERE id = $1',
     [id]
   );
   if (invRes.rows.length === 0) {
@@ -319,7 +324,7 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
     invoiceId: invoice.id,
     customerPhone: invoice.customer_phone,
     customerName: invoice.customer_name,
-    amount: invoice.final_total || invoice.total,
+    amount: invoice.total,
     currency: 'ج.م',
     force: true, // Bypass debounce for manual user resend
   });
