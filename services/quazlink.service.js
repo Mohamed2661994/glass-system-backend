@@ -219,9 +219,17 @@ async function dispatchInvoiceWhatsApp({
     return { success: false, reason: 'no_valid_phone' };
   }
 
-  const invoiceNumber = `INV-${id} (${QUAZLINK_CONFIG.storeName})`;
+  const invoiceNumber = `INV-${id}`;
   const formattedAmount = formatAmount(targetAmount);
   const displayName = (targetName && targetName.trim()) ? targetName.trim() : 'عميلنا العزيز';
+
+  const customMessage = `(${QUAZLINK_CONFIG.storeName})
+
+أهلاً بك يا ${displayName}، شرفتنا ونورتنا بشرائك من عندنا! ❤️
+📄 رقم الفاتورة: #${invoiceNumber}
+💰 الإجمالي: ${formattedAmount} ${currency}
+
+شكراً جزيلاً لثقتك بنا ونراك قريباً إن شاء الله! ✨`;
 
   console.log(`[QuazLink] 🚀 Dispatching WhatsApp invoice #${id} to ${maskPhone(cleanPhone)} (${displayName}, ${formattedAmount} ${currency})...`);
 
@@ -232,6 +240,7 @@ async function dispatchInvoiceWhatsApp({
       invoiceNumber: invoiceNumber,
       amount: formattedAmount,
       currency: currency,
+      message: customMessage,
       storeName: QUAZLINK_CONFIG.storeName,
       companyName: QUAZLINK_CONFIG.storeName,
       company: QUAZLINK_CONFIG.storeName,
