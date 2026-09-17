@@ -30,6 +30,7 @@ const launchPuppeteer = async () => {
 };
 const webPush = require("web-push");
 const stockWatchdogService = require("./services/stockWatchdog.service");
+const quazlinkService = require("./services/quazlink.service");
 
 // VAPID keys for Web Push
 const VAPID_PUBLIC_KEY =
@@ -4259,6 +4260,29 @@ VALUES
 
     await client.query("COMMIT");
 
+    if (
+      movement_type === "sale" &&
+      !is_return &&
+      (customer_phone || req.body.customer_phone)
+    ) {
+      setImmediate(() => {
+        quazlinkService
+          .dispatchInvoiceWhatsApp({
+            invoiceId,
+            customerPhone: customer_phone || req.body.customer_phone,
+            customerName: customer_name || req.body.customer_name,
+            amount: total,
+            currency: "ج.م",
+          })
+          .catch((err) =>
+            console.error(
+              "[QuazLink] Wholesale WhatsApp background error:",
+              err.message,
+            ),
+          );
+      });
+    }
+
     res.json({
       success: true,
       invoice_id: invoiceId,
@@ -4590,6 +4614,29 @@ app.post("/invoices/retail", async (req, res) => {
     await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
 
     await client.query("COMMIT");
+
+    if (
+      movement_type === "sale" &&
+      !is_return &&
+      (customer_phone || req.body.customer_phone)
+    ) {
+      setImmediate(() => {
+        quazlinkService
+          .dispatchInvoiceWhatsApp({
+            invoiceId,
+            customerPhone: customer_phone || req.body.customer_phone,
+            customerName: customer_name || req.body.customer_name,
+            amount: final_total,
+            currency: "ج.م",
+          })
+          .catch((err) =>
+            console.error(
+              "[QuazLink] Retail WhatsApp background error:",
+              err.message,
+            ),
+          );
+      });
+    }
 
     res.json({
       success: true,
@@ -5201,6 +5248,47 @@ app.patch("/invoices/:id/list-visibility", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "فشل تحديث ظهور الفاتورة" });
   } finally {
     client.release();
+  }
+});
+
+/* ================================
+   إعادة إرسال الفاتورة عبر واتساب (QuazLink)
+================================= */
+app.post("/invoices/:id/resend-whatsapp", authMiddleware, async (req, res) => {
+  try {
+    const invoiceId = Number(req.params.id);
+    if (!invoiceId || invoiceId <= 0) {
+      return res.status(400).json({ error: "معرف الفاتورة غير صحيح" });
+    }
+
+    const result = await quazlinkService.resendInvoiceWhatsApp(
+      invoiceId,
+      req.user?.id,
+    );
+
+    const io = req.app.get("io");
+    if (io) {
+      io.emit("data:invoices", {
+        action: "update",
+        invoice_id: invoiceId,
+      });
+    }
+
+    if (result.success) {
+      res.json({
+        success: true,
+        message: "تم إرسال الفاتورة عبر واتساب بنجاح",
+        data: result,
+      });
+    } else {
+      res.status(400).json({
+        error: result.error || "فشل إرسال الفاتورة عبر واتساب",
+        reason: result.reason,
+      });
+    }
+  } catch (err) {
+    console.error("[QuazLink Resend Error]:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -6371,6 +6459,10 @@ app.get("/invoices", async (req, res) => {
         hidden_from_list_by,
         invoice_source,
         external_order_id,
+        whatsapp_status,
+        whatsapp_phone,
+        whatsapp_sent_at,
+        whatsapp_error,
         notes
       FROM invoices
       ${whereClause}
