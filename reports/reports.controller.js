@@ -27,13 +27,13 @@ exports.getInventorySummary = async (req, res) => {
 
       COALESCE(SUM(
         CASE 
-          WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in')
+          WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in','in','adjustment_in')
           THEN sm.quantity ELSE 0 END
       ), 0) AS total_in,
 
       COALESCE(SUM(
         CASE 
-          WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out')
+          WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out','out','adjustment_out')
           THEN sm.quantity ELSE 0 END
       ), 0) AS total_out,
 
@@ -53,8 +53,8 @@ exports.getInventorySummary = async (req, res) => {
     GROUP BY p.id, p.name, p.manufacturer, w.name, p.wholesale_package, p.retail_package, s.quantity, s.variant_id
 
     HAVING 
-      COALESCE(SUM(CASE WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in') THEN sm.quantity ELSE 0 END),0) > 0
-      OR COALESCE(SUM(CASE WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out') THEN sm.quantity ELSE 0 END),0) > 0
+      COALESCE(SUM(CASE WHEN sm.movement_type IN ('purchase','transfer_in','replace_in','return_sale','inter_branch_in','in','adjustment_in') THEN sm.quantity ELSE 0 END),0) > 0
+      OR COALESCE(SUM(CASE WHEN sm.movement_type IN ('sale','transfer_out','replace_out','return_purchase','inter_branch_out','out','adjustment_out') THEN sm.quantity ELSE 0 END),0) > 0
       OR COALESCE(s.quantity,0) > 0
 
     ORDER BY p.name

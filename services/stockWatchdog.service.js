@@ -61,8 +61,8 @@ async function runAudit({ io = null, force = false } = {}) {
           COALESCE(sm.variant_id, 0) AS variant_id,
           COALESCE(SUM(
             CASE 
-              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in') THEN sm.quantity
-              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out') THEN -sm.quantity
+              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in', 'adjustment_in') THEN sm.quantity
+              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out', 'adjustment_out') THEN -sm.quantity
               ELSE 0
             END
           ), 0) AS actual_quantity
@@ -185,8 +185,8 @@ async function reconcileStock({ warehouseId = null, io = null, adminName = "Admi
           COALESCE(sm.variant_id, 0) AS variant_id,
           COALESCE(SUM(
             CASE 
-              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in') THEN sm.quantity
-              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out') THEN -sm.quantity
+              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in', 'adjustment_in') THEN sm.quantity
+              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out', 'adjustment_out') THEN -sm.quantity
               ELSE 0
             END
           ), 0) AS actual_quantity
