@@ -8779,15 +8779,17 @@ app.get("/stock/adjustments/history", authMiddleware, async (req, res) => {
     const { warehouse_id, limit = 50, offset = 0 } = req.query;
     const values = [];
     let idx = 1;
-    let whereClause = `WHERE (sm.reference_type = 'manual_stock_adjustment' OR sm.movement_type IN ('adjustment', 'adjustment_in', 'adjustment_out'))`;
+    let whereClause = `WHERE (reference_type = 'manual_stock_adjustment' OR movement_type IN ('adjustment', 'adjustment_in', 'adjustment_out'))`;
 
     if (warehouse_id && (Number(warehouse_id) === 1 || Number(warehouse_id) === 2)) {
-      whereClause += ` AND sm.warehouse_id = $${idx++}`;
+      whereClause += ` AND warehouse_id = $${idx++}`;
       values.push(Number(warehouse_id));
     }
 
-    values.push(Math.min(100, Math.max(1, Number(limit))));
-    values.push(Math.max(0, Number(offset)));
+    const limitVal = Math.min(100, Math.max(1, Number(limit)));
+    const offsetVal = Math.max(0, Number(offset));
+    values.push(limitVal);
+    values.push(offsetVal);
 
     const query = `
       SELECT 
@@ -8807,13 +8809,16 @@ app.get("/stock/adjustments/history", authMiddleware, async (req, res) => {
         COALESCE(u.name, u.username, 'مدير النظام') as user_name,
         sm.note,
         sm.created_at
-      FROM stock_movements sm
+      FROM (
+        SELECT * FROM stock_movements
+        ${whereClause}
+        ORDER BY id DESC
+        LIMIT $${idx++} OFFSET $${idx++}
+      ) sm
       JOIN products p ON p.id = sm.product_id
       LEFT JOIN warehouses w ON w.id = sm.warehouse_id
-      LEFT JOIN users u ON u.id = sm.reference_id
-      ${whereClause}
+      LEFT JOIN users u ON CAST(u.id AS TEXT) = CAST(sm.reference_id AS TEXT)
       ORDER BY sm.id DESC
-      LIMIT $${idx++} OFFSET $${idx++}
     `;
 
     const result = await pool.query(query, values);
