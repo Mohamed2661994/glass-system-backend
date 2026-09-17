@@ -8614,6 +8614,292 @@ app.post("/stock/replace", async (req, res) => {
   }
 });
 
+// =========================================================================
+// 🎯 تسوية جرد المخزون اليدوية (Manual Stock Adjustment) - المعرض والمخازن
+// =========================================================================
+
+// 1️⃣ تنفيذ تسوية جرد لصنف
+app.post("/stock/adjust", authMiddleware, async (req, res) => {
+  const { warehouse_id, product_id, new_quantity, reason, notes } = req.body;
+
+  // التحقق من المدخلات الأساسية
+  const whId = Number(warehouse_id);
+  const prodId = Number(product_id);
+  const newQty = Number(new_quantity);
+
+  if (!whId || (whId !== 1 && whId !== 2)) {
+    return res.status(400).json({ error: "يجب تحديد المخزن بشكل صحيح (1 للمعرض أو 2 للمخزن الرئيسي)" });
+  }
+
+  if (!prodId || isNaN(prodId)) {
+    return res.status(400).json({ error: "كود الصنف غير صحيح" });
+  }
+
+  if (isNaN(newQty) || newQty < 0) {
+    return res.status(400).json({ error: "الرصيد الفعلي يجب أن يكون رقماً صحيحاً أو عشرياً موجباً (أكبر من أو يساوي صفر)" });
+  }
+
+  const cleanReason = String(reason || "").trim();
+  if (!cleanReason) {
+    return res.status(400).json({ error: "يجب اختيار أو كتابة سبب التسوية" });
+  }
+
+  // الضوابط الأمنية (RBAC): التحقق من الصلاحيات
+  const user = req.user || {};
+  const isAdmin = user.role === "admin" || user.is_admin === true;
+  const userBranchId = Number(user.branch_id || 0);
+
+  // إذا لم يكن أدمن عام، يُسمح له فقط بتسوية مخزن فرعه
+  if (!isAdmin && userBranchId !== whId) {
+    return res.status(403).json({ 
+      error: "غير مصرح لك بتسوية مخزون هذا الفرع. صلاحيتك تقتصر على فرعك الحالي فقط." 
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // قفل تشاؤمي صارم (Pessimistic Row Lock) لمنع التضارب أثناء قراءة وتحديث الرصيد
+    const prodRes = await client.query(
+      `SELECT 
+         p.id as product_id,
+         p.name as product_name,
+         p.barcode,
+         p.manufacturer,
+         p.wholesale_package,
+         p.retail_package,
+         COALESCE(s.quantity, 0) as current_quantity
+       FROM products p
+       LEFT JOIN stock s ON s.product_id = p.id AND s.warehouse_id = $1 AND COALESCE(s.variant_id, 0) = 0
+       WHERE p.id = $2
+       FOR UPDATE OF p`,
+      [whId, prodId]
+    );
+
+    if (prodRes.rows.length === 0) {
+      throw new Error("الصنف غير موجود في قاعدة البيانات");
+    }
+
+    const item = prodRes.rows[0];
+    const currentQty = Number(item.current_quantity || 0);
+    const diff = Math.round((newQty - currentQty) * 100) / 100;
+
+    const warehouseName = whId === 1 ? "مخزن المعرض (قطاعي)" : "المخزن الرئيسي (جملة)";
+    const unitName = whId === 1 ? (item.retail_package || "قطعة") : (item.wholesale_package || "كرتونة");
+    const userName = user.name || user.username || `مستخدم #${user.id}`;
+
+    if (diff === 0) {
+      await client.query("ROLLBACK");
+      return res.json({
+        success: true,
+        message: `الرصيد الفعلي مطابق بالفعل لرصيد السيستم (${newQty} ${unitName}). لم يتم إجراء أي تغيير.`,
+        data: {
+          product_id: prodId,
+          product_name: item.product_name,
+          warehouse_id: whId,
+          warehouse_name: warehouseName,
+          current_quantity: currentQty,
+          new_quantity: newQty,
+          diff: 0,
+        },
+      });
+    }
+
+    // 1️⃣ تحديث جدول الرصيد ذرياً (Atomic Upsert)
+    await client.query(
+      `INSERT INTO stock (warehouse_id, product_id, variant_id, quantity, updated_at)
+       VALUES ($1, $2, 0, $3, NOW())
+       ON CONFLICT (warehouse_id, product_id, variant_id)
+       DO UPDATE SET quantity = $3, updated_at = NOW()`,
+      [whId, prodId, newQty]
+    );
+
+    // 2️⃣ تسجيل حركة في دفتر الأستاذ stock_movements لحفظ المسار التاريخي الكامل (Immutable Audit Trail)
+    const movementType = diff > 0 ? "adjustment_in" : "adjustment_out";
+    const diffTypeArabic = diff > 0 ? "زيادة جردية" : "عجز جردي";
+    const noteContent = `تسوية جردية [${diffTypeArabic}: ${diff > 0 ? '+' : ''}${diff} ${unitName}] - الرصيد السابق: ${currentQty} -> الجديد: ${newQty} | المسؤول: ${userName} | السبب: ${cleanReason}${notes ? ' (' + String(notes).trim() + ')' : ''}`;
+
+    const movementRes = await client.query(
+      `INSERT INTO stock_movements 
+       (warehouse_id, product_id, variant_id, quantity, movement_type, reference_type, reference_id, note, created_at, updated_at)
+       VALUES ($1, $2, 0, $3, $4, 'manual_stock_adjustment', $5, $6, NOW(), NOW())
+       RETURNING id, created_at`,
+      [whId, prodId, Math.abs(diff), movementType, user.id || null, noteContent]
+    );
+
+    await client.query("COMMIT");
+
+    // 3️⃣ إرسال إشعار لحظي عبر Socket.io لتحديث شاشات الكاشير والمخازن فورياً
+    const io = req.app.get("io");
+    if (io) {
+      io.emit("data_changed", { type: "data:stock" });
+      io.to(`branch_${whId}`).emit("stock:adjusted", {
+        warehouse_id: whId,
+        product_id: prodId,
+        new_quantity: newQty,
+        diff,
+        product_name: item.product_name,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `تمت تسوية مخزون [${item.product_name}] بنجاح في ${warehouseName}: الرصيد أصبح (${newQty} ${unitName}) بفارق (${diff > 0 ? '+' : ''}${diff}).`,
+      data: {
+        movement_id: movementRes.rows[0]?.id,
+        product_id: prodId,
+        product_name: item.product_name,
+        barcode: item.barcode,
+        warehouse_id: whId,
+        warehouse_name: warehouseName,
+        old_quantity: currentQty,
+        new_quantity: newQty,
+        diff,
+        diff_type: diff > 0 ? "surplus" : "deficit",
+        unit: unitName,
+        adjusted_by: userName,
+        reason: cleanReason,
+        created_at: movementRes.rows[0]?.created_at,
+      },
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ Stock Adjustment Error:", err);
+    res.status(500).json({ error: err.message || "حدث خطأ أثناء تنفيذ تسوية المخزون" });
+  } finally {
+    client.release();
+  }
+});
+
+// 2️⃣ جلب سجل وتاريخ التسويات السابقة
+app.get("/stock/adjustments/history", authMiddleware, async (req, res) => {
+  try {
+    const { warehouse_id, limit = 50, offset = 0 } = req.query;
+    const values = [];
+    let idx = 1;
+    let whereClause = `WHERE (sm.reference_type = 'manual_stock_adjustment' OR sm.movement_type IN ('adjustment', 'adjustment_in', 'adjustment_out'))`;
+
+    if (warehouse_id && (Number(warehouse_id) === 1 || Number(warehouse_id) === 2)) {
+      whereClause += ` AND sm.warehouse_id = $${idx++}`;
+      values.push(Number(warehouse_id));
+    }
+
+    values.push(Math.min(100, Math.max(1, Number(limit))));
+    values.push(Math.max(0, Number(offset)));
+
+    const query = `
+      SELECT 
+        sm.id,
+        sm.warehouse_id,
+        w.name as warehouse_name,
+        sm.product_id,
+        p.name as product_name,
+        p.barcode,
+        p.manufacturer,
+        p.wholesale_package,
+        p.retail_package,
+        sm.quantity,
+        sm.movement_type,
+        sm.reference_type,
+        sm.reference_id as user_id,
+        COALESCE(u.name, u.username, 'مدير النظام') as user_name,
+        sm.note,
+        sm.created_at
+      FROM stock_movements sm
+      JOIN products p ON p.id = sm.product_id
+      LEFT JOIN warehouses w ON w.id = sm.warehouse_id
+      LEFT JOIN users u ON u.id = sm.reference_id
+      ${whereClause}
+      ORDER BY sm.id DESC
+      LIMIT $${idx++} OFFSET $${idx++}
+    `;
+
+    const result = await pool.query(query, values);
+    res.json({
+      success: true,
+      data: result.rows,
+      count: result.rows.length,
+    });
+  } catch (err) {
+    console.error("❌ Stock Adjustment History Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3️⃣ البحث السريع عن الأصناف لغرض التسوية مع جلب رصيد المعرض والمخزن معاً
+app.get("/stock/search-for-adjustment", authMiddleware, async (req, res) => {
+  try {
+    const { q = "", limit = 20 } = req.query;
+    const searchTerm = String(q).trim();
+
+    let query;
+    let values;
+
+    if (!searchTerm) {
+      query = `
+        SELECT 
+          p.id,
+          p.name,
+          p.barcode,
+          p.manufacturer,
+          p.wholesale_package,
+          p.retail_package,
+          p.retail_price,
+          p.wholesale_price,
+          COALESCE(s1.quantity, 0) as stock_retail,
+          COALESCE(s2.quantity, 0) as stock_wholesale
+        FROM products p
+        LEFT JOIN stock s1 ON s1.product_id = p.id AND s1.warehouse_id = 1 AND COALESCE(s1.variant_id, 0) = 0
+        LEFT JOIN stock s2 ON s2.product_id = p.id AND s2.warehouse_id = 2 AND COALESCE(s2.variant_id, 0) = 0
+        WHERE p.is_active = true
+        ORDER BY p.id DESC
+        LIMIT $1
+      `;
+      values = [Math.min(50, Math.max(1, Number(limit)))];
+    } else {
+      query = `
+        SELECT 
+          p.id,
+          p.name,
+          p.barcode,
+          p.manufacturer,
+          p.wholesale_package,
+          p.retail_package,
+          p.retail_price,
+          p.wholesale_price,
+          COALESCE(s1.quantity, 0) as stock_retail,
+          COALESCE(s2.quantity, 0) as stock_wholesale
+        FROM products p
+        LEFT JOIN stock s1 ON s1.product_id = p.id AND s1.warehouse_id = 1 AND COALESCE(s1.variant_id, 0) = 0
+        LEFT JOIN stock s2 ON s2.product_id = p.id AND s2.warehouse_id = 2 AND COALESCE(s2.variant_id, 0) = 0
+        WHERE p.is_active = true
+          AND (
+            p.name ILIKE $1 
+            OR p.barcode ILIKE $1 
+            OR p.manufacturer ILIKE $1
+            OR CAST(p.id AS TEXT) = $2
+          )
+        ORDER BY 
+          CASE WHEN p.barcode = $2 THEN 1 WHEN p.name ILIKE $1 THEN 2 ELSE 3 END,
+          p.name ASC
+        LIMIT $3
+      `;
+      values = [`%${searchTerm}%`, searchTerm, Math.min(50, Math.max(1, Number(limit)))];
+    }
+
+    const result = await pool.query(query, values);
+    res.json({
+      success: true,
+      data: result.rows,
+    });
+  } catch (err) {
+    console.error("❌ Search for Adjustment Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const ACCESS_PERMISSION_KEYS = [
   "cash_in_edit",
   "cash_in_delete",
