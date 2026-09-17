@@ -9443,6 +9443,11 @@ app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
         `UPDATE payroll_advances SET status = 'pending', payroll_record_id = NULL WHERE payroll_record_id = ANY($1)`,
         [payrollRecordIds],
       );
+      // Revert any applied adjustments back to 'pending'
+      await client.query(
+        `UPDATE payroll_adjustments SET status = 'pending', payroll_record_id = NULL, updated_at = NOW() WHERE payroll_record_id = ANY($1)`,
+        [payrollRecordIds],
+      );
       // Delete the payroll_records entries
       await client.query(
         `DELETE FROM payroll_records WHERE id = ANY($1)`,

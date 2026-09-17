@@ -31,4 +31,9 @@ router.post("/payout", requireAdmin, controller.confirmPayrollPayout);
 router.get("/history", requireAdmin, controller.getPayrollHistory);
 router.delete("/history/:id", requireAdmin, controller.revertPayrollRecord);
 
+// 5. Adjustments Routes (الحوافز والمكافآت والخصومات والإضافي)
+router.get("/adjustments", controller.getAdjustments);
+router.post("/adjustments", controller.createAdjustment);
+router.delete("/adjustments/:id", requireAdmin, controller.deleteAdjustment);
+
 module.exports = router;

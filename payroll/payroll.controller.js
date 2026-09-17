@@ -374,6 +374,192 @@ async function deleteAdvance(req, res) {
 }
 
 /* ==========================================================================
+   2.b PAYROLL ADJUSTMENTS (الحوافز، المكافآت، الخصومات، وساعات الإضافي)
+   ========================================================================== */
+
+/**
+ * GET /payroll/adjustments?branch_id=1&employee_id=...&status=pending
+ */
+async function getAdjustments(req, res) {
+  try {
+    const branchId = Number(req.query.branch_id || req.user?.branch_id || 1);
+    const employeeId = req.query.employee_id ? Number(req.query.employee_id) : null;
+    const status = req.query.status || "pending";
+    const periodStart = req.query.period_start;
+    const periodEnd = req.query.period_end;
+
+    let query = `
+      SELECT 
+        pa.id, pa.branch_id, pa.employee_id, pa.type, pa.amount, pa.adjustment_date,
+        pa.reason, pa.status, pa.payroll_record_id, pa.created_by, pa.created_by_name, pa.created_at,
+        pe.name as employee_name, pe.job_title, pe.salary_type
+      FROM payroll_adjustments pa
+      JOIN payroll_employees pe ON pa.employee_id = pe.id
+      WHERE pa.branch_id = $1
+    `;
+    const params = [branchId];
+
+    if (employeeId) {
+      params.push(employeeId);
+      query += ` AND pa.employee_id = $${params.length}`;
+    }
+
+    if (status !== "all") {
+      params.push(status);
+      query += ` AND pa.status = $${params.length}`;
+    }
+
+    if (periodStart && periodEnd) {
+      params.push(periodStart, periodEnd);
+      query += ` AND pa.adjustment_date >= $${params.length - 1} AND pa.adjustment_date <= $${params.length}`;
+    }
+
+    query += ` ORDER BY pa.adjustment_date DESC, pa.id DESC`;
+
+    const result = await pool.query(query, params);
+    res.json({ success: true, adjustments: result.rows });
+  } catch (err) {
+    console.error("getAdjustments error:", err);
+    res.status(500).json({ error: "فشل في جلب سجل التسويات والحوافز", details: err.message });
+  }
+}
+
+/**
+ * POST /payroll/adjustments
+ */
+async function createAdjustment(req, res) {
+  try {
+    const {
+      branch_id,
+      employee_id,
+      type, // 'bonus' | 'deduction' | 'overtime'
+      amount,
+      adjustment_date,
+      reason,
+    } = req.body;
+
+    const safeBranchId = Number(branch_id || req.user?.branch_id || 1);
+    const empId = Number(employee_id);
+    const numAmount = Number(amount);
+    const safeDate = adjustment_date ? String(adjustment_date).slice(0, 10) : new Date().toISOString().slice(0, 10);
+    const cleanReason = reason ? String(reason).trim() : null;
+
+    if (!empId || isNaN(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ error: "يرجى تحديد العامل والمبلغ بشكل صحيح (أكبر من صفر)" });
+    }
+
+    if (!["bonus", "deduction", "overtime"].includes(type)) {
+      return res.status(400).json({ error: "نوع الحركة غير صالح (يجب أن يكون حافز أو خصم أو إضافي)" });
+    }
+
+    // Branch authorization check
+    const currentUser = req.user;
+    if (currentUser && currentUser.role !== "admin" && Number(currentUser.id) !== 7) {
+      if (Number(currentUser.branch_id) !== safeBranchId) {
+        return res.status(403).json({ error: "غير مصرح لك بتسجيل حركة لفرع آخر" });
+      }
+    }
+
+    // Verify employee exists and is active
+    const empCheck = await pool.query(
+      "SELECT id, name, branch_id FROM payroll_employees WHERE id = $1 AND branch_id = $2",
+      [empId, safeBranchId],
+    );
+    if (empCheck.rows.length === 0) {
+      return res.status(404).json({ error: "العامل غير موجود في هذا الفرع" });
+    }
+
+    // Check if employee has an already paid record covering this date
+    const paidCheck = await pool.query(
+      `
+      SELECT pr.id, pr.period_start, pr.period_end
+      FROM payroll_records pr
+      LEFT JOIN cash_out co ON pr.cash_out_id = co.id
+      WHERE pr.branch_id = $1 AND pr.employee_id = $2 AND pr.payment_status = 'paid'
+        AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
+        AND pr.period_start <= $3 AND pr.period_end >= $3
+      LIMIT 1
+      `,
+      [safeBranchId, empId, safeDate],
+    );
+    if (paidCheck.rows.length > 0) {
+      return res.status(400).json({
+        error: `تم صرف مسير راتب هذا العامل بالفعل للفترة التي تشمل تاريخ ${safeDate}. لحفظ حركات جديدة، يجب إلغاء إذن الصرف من الخزينة أولاً.`,
+      });
+    }
+
+    const createdBy = currentUser?.id || null;
+    const createdByName = currentUser?.name || currentUser?.full_name || currentUser?.username || "الإدارة";
+
+    const insertRes = await pool.query(
+      `
+      INSERT INTO payroll_adjustments 
+        (branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by, created_by_name)
+      VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
+      RETURNING *
+      `,
+      [safeBranchId, empId, type, numAmount, safeDate, cleanReason, createdBy, createdByName],
+    );
+
+    const adjustment = insertRes.rows[0];
+
+    const broadcast = req.app?.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("data:payroll", { action: "adjustment_created", branch_id: safeBranchId, ts: Date.now() });
+    }
+
+    res.json({
+      success: true,
+      message: "تم تسجيل الحركة بنجاح",
+      adjustment,
+    });
+  } catch (err) {
+    console.error("createAdjustment error:", err);
+    res.status(500).json({ error: "فشل في تسجيل الحركة", details: err.message });
+  }
+}
+
+/**
+ * DELETE /payroll/adjustments/:id
+ */
+async function deleteAdjustment(req, res) {
+  try {
+    const adjId = Number(req.params.id);
+    const currentUser = req.user;
+
+    const findRes = await pool.query("SELECT * FROM payroll_adjustments WHERE id = $1", [adjId]);
+    if (findRes.rows.length === 0) {
+      return res.status(404).json({ error: "الحركة غير موجودة" });
+    }
+
+    const adj = findRes.rows[0];
+
+    if (adj.status !== "pending") {
+      return res.status(400).json({ error: "لا يمكن حذف حركة تم اعتمادها وصرفها بالمسير" });
+    }
+
+    // Branch authorization check
+    if (currentUser && currentUser.role !== "admin" && Number(currentUser.id) !== 7) {
+      if (Number(currentUser.branch_id) !== adj.branch_id) {
+        return res.status(403).json({ error: "غير مصرح لك بحذف حركة في فرع آخر" });
+      }
+    }
+
+    await pool.query("DELETE FROM payroll_adjustments WHERE id = $1", [adjId]);
+
+    const broadcast = req.app?.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("data:payroll", { action: "adjustment_deleted", branch_id: adj.branch_id, ts: Date.now() });
+    }
+
+    res.json({ success: true, message: "تم حذف الحركة بنجاح" });
+  } catch (err) {
+    console.error("deleteAdjustment error:", err);
+    res.status(500).json({ error: "فشل في حذف الحركة", details: err.message });
+  }
+}
+
+/* ==========================================================================
    3. PAYROLL SHEET CALCULATION & PAYOUT (مسير الرواتب وصرف الأسبوعيات والشهريات)
    ========================================================================== */
 
@@ -441,6 +627,23 @@ async function getPayrollSheet(req, res) {
       advancesByEmp[adv.employee_id].push(adv);
     }
 
+    // 2.b Fetch pending adjustments (bonuses, overtime, deductions) up to periodEnd
+    const adjRes = await pool.query(
+      `
+      SELECT id, branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by_name, created_at
+      FROM payroll_adjustments
+      WHERE branch_id = $1 AND employee_id = ANY($2) AND status = 'pending' AND adjustment_date <= $3
+      ORDER BY adjustment_date ASC, id ASC
+      `,
+      [branchId, empIds, periodEnd],
+    );
+
+    const adjustmentsByEmp = {};
+    for (const adj of adjRes.rows) {
+      if (!adjustmentsByEmp[adj.employee_id]) adjustmentsByEmp[adj.employee_id] = [];
+      adjustmentsByEmp[adj.employee_id].push(adj);
+    }
+
     // 3. Fetch paid records for these employees in this period window
     // (Only records whose linked cash_out still exists in the treasury, or cash_out_id is NULL)
     const paidRes = await pool.query(
@@ -472,6 +675,25 @@ async function getPayrollSheet(req, res) {
       }
     }
 
+    // Fetch applied adjustments for paid records if any
+    const paidRecordIds = paidRes.rows.map((r) => r.id);
+    const appliedAdjustmentsByEmp = {};
+    if (paidRecordIds.length > 0) {
+      const appliedAdjRes = await pool.query(
+        `
+        SELECT id, branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by_name, created_at
+        FROM payroll_adjustments
+        WHERE branch_id = $1 AND payroll_record_id = ANY($2)
+        ORDER BY adjustment_date ASC, id ASC
+        `,
+        [branchId, paidRecordIds],
+      );
+      for (const adj of appliedAdjRes.rows) {
+        if (!appliedAdjustmentsByEmp[adj.employee_id]) appliedAdjustmentsByEmp[adj.employee_id] = [];
+        appliedAdjustmentsByEmp[adj.employee_id].push(adj);
+      }
+    }
+
     // 4. Build sheet rows
     const sheetRows = employees.map((emp) => {
       const empAdvances = advancesByEmp[emp.id] || [];
@@ -480,7 +702,30 @@ async function getPayrollSheet(req, res) {
 
       const paidRecord = paidByEmp[emp.id];
       const isPaid = Boolean(paidRecord);
-      const paidNetAmount = isPaid ? Number(paidRecord.net_amount || 0) : Math.max(0, baseSalary - totalAdvances);
+
+      // Adjustments list & calculated sums
+      const empPendingAdjustments = adjustmentsByEmp[emp.id] || [];
+      const empAppliedAdjustments = appliedAdjustmentsByEmp[emp.id] || [];
+      const empAdjustmentsList = isPaid ? empAppliedAdjustments : empPendingAdjustments;
+
+      const sumBonus = empAdjustmentsList
+        .filter((a) => a.type === "bonus")
+        .reduce((s, a) => s + Number(a.amount || 0), 0);
+      const sumOvertime = empAdjustmentsList
+        .filter((a) => a.type === "overtime")
+        .reduce((s, a) => s + Number(a.amount || 0), 0);
+      const sumDeductions = empAdjustmentsList
+        .filter((a) => a.type === "deduction")
+        .reduce((s, a) => s + Number(a.amount || 0), 0);
+
+      const overtimeAmount = isPaid ? Number(paidRecord.overtime_amount || 0) : sumOvertime;
+      const bonusAmount = isPaid ? Number(paidRecord.bonus_amount || 0) : sumBonus;
+      const deductionsAmount = isPaid ? Number(paidRecord.deductions_amount || 0) : sumDeductions;
+      const pendingAdvances = isPaid ? Number(paidRecord.advances_deducted || 0) : totalAdvances;
+
+      const paidNetAmount = isPaid
+        ? Number(paidRecord.net_amount || 0)
+        : Math.max(0, baseSalary + overtimeAmount + bonusAmount - deductionsAmount - pendingAdvances);
 
       return {
         employee_id: emp.id,
@@ -489,11 +734,12 @@ async function getPayrollSheet(req, res) {
         salary_type: emp.salary_type,
         base_salary: isPaid ? Number(paidRecord.base_amount || baseSalary) : baseSalary,
         days_worked: isPaid ? Number(paidRecord.days_worked || (emp.salary_type === "daily" ? 6 : 0)) : (emp.salary_type === "daily" ? 6 : 0),
-        overtime_amount: isPaid ? Number(paidRecord.overtime_amount || 0) : 0,
-        bonus_amount: isPaid ? Number(paidRecord.bonus_amount || 0) : 0,
-        deductions_amount: isPaid ? Number(paidRecord.deductions_amount || 0) : 0,
-        pending_advances: isPaid ? Number(paidRecord.advances_deducted || 0) : totalAdvances,
+        overtime_amount: overtimeAmount,
+        bonus_amount: bonusAmount,
+        deductions_amount: deductionsAmount,
+        pending_advances: pendingAdvances,
         advances_list: isPaid ? [] : empAdvances,
+        adjustments_list: empAdjustmentsList,
         net_amount: paidNetAmount,
         notes: isPaid ? (paidRecord.notes || "") : "",
         is_paid: isPaid,
@@ -510,10 +756,10 @@ async function getPayrollSheet(req, res) {
               period_end: paidRecord.period_end,
               base_amount: Number(paidRecord.base_amount || baseSalary),
               days_worked: Number(paidRecord.days_worked || 0),
-              overtime_amount: Number(paidRecord.overtime_amount || 0),
-              bonus_amount: Number(paidRecord.bonus_amount || 0),
-              deductions_amount: Number(paidRecord.deductions_amount || 0),
-              advances_deducted: Number(paidRecord.advances_deducted || 0),
+              overtime_amount: overtimeAmount,
+              bonus_amount: bonusAmount,
+              deductions_amount: deductionsAmount,
+              advances_deducted: pendingAdvances,
               notes: paidRecord.notes || "",
             }
           : null,
@@ -674,6 +920,37 @@ async function confirmPayrollPayout(req, res) {
           `,
           [payrollRecord.id, advanceIds, safeBranchId],
         );
+      } else {
+        await client.query(
+          `
+          UPDATE payroll_advances 
+          SET status = 'deducted', payroll_record_id = $1 
+          WHERE employee_id = $2 AND branch_id = $3 AND status = 'pending' AND advance_date <= $4
+          `,
+          [payrollRecord.id, empId, safeBranchId, safeEnd],
+        );
+      }
+
+      // 4. Mark linked adjustments as applied
+      const adjustmentIds = Array.isArray(item.adjustment_ids) ? item.adjustment_ids.map(Number).filter(Boolean) : [];
+      if (adjustmentIds.length > 0) {
+        await client.query(
+          `
+          UPDATE payroll_adjustments 
+          SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
+          WHERE id = ANY($2) AND branch_id = $3
+          `,
+          [payrollRecord.id, adjustmentIds, safeBranchId],
+        );
+      } else {
+        await client.query(
+          `
+          UPDATE payroll_adjustments 
+          SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
+          WHERE employee_id = $2 AND branch_id = $3 AND status = 'pending' AND adjustment_date <= $4
+          `,
+          [payrollRecord.id, empId, safeBranchId, safeEnd],
+        );
       }
     }
 
@@ -767,6 +1044,12 @@ async function revertPayrollRecord(req, res) {
       [recordId],
     );
 
+    // 1.b Revert adjustments back to 'pending'
+    await client.query(
+      "UPDATE payroll_adjustments SET status = 'pending', payroll_record_id = NULL, updated_at = NOW() WHERE payroll_record_id = $1",
+      [recordId],
+    );
+
     // 2. Delete linked cash_out row if exists
     if (record.cash_out_id) {
       await client.query("DELETE FROM cash_out WHERE id = $1", [record.cash_out_id]);
@@ -802,6 +1085,9 @@ module.exports = {
   getAdvances,
   createAdvance,
   deleteAdvance,
+  getAdjustments,
+  createAdjustment,
+  deleteAdjustment,
   getPayrollSheet,
   confirmPayrollPayout,
   getPayrollHistory,
