@@ -723,9 +723,17 @@ async function getPayrollSheet(req, res) {
       const deductionsAmount = isPaid ? Number(paidRecord.deductions_amount || 0) : sumDeductions;
       const pendingAdvances = isPaid ? Number(paidRecord.advances_deducted || 0) : totalAdvances;
 
+      const grossEarnings = Math.max(
+        0,
+        Math.round((baseSalary + overtimeAmount + bonusAmount - deductionsAmount) * 100) / 100,
+      );
+      const excessAdvances = isPaid
+        ? 0
+        : Math.max(0, Math.round((pendingAdvances - grossEarnings) * 100) / 100);
+
       const paidNetAmount = isPaid
         ? Number(paidRecord.net_amount || 0)
-        : Math.max(0, baseSalary + overtimeAmount + bonusAmount - deductionsAmount - pendingAdvances);
+        : Math.max(0, Math.round((grossEarnings - pendingAdvances) * 100) / 100);
 
       return {
         employee_id: emp.id,
@@ -738,6 +746,7 @@ async function getPayrollSheet(req, res) {
         bonus_amount: bonusAmount,
         deductions_amount: deductionsAmount,
         pending_advances: pendingAdvances,
+        excess_advances: excessAdvances,
         advances_list: isPaid ? [] : empAdvances,
         adjustments_list: empAdjustmentsList,
         net_amount: paidNetAmount,
@@ -822,12 +831,27 @@ async function confirmPayrollPayout(req, res) {
       const bonusAmount = Number(item.bonus_amount || 0);
       const deductionsAmount = Number(item.deductions_amount || 0);
       const advancesDeducted = Number(item.advances_deducted || 0);
-      const netAmount = Math.max(
+
+      const grossEarnings = Math.max(
         0,
-        Math.round(
-          (baseAmount + overtimeAmount + bonusAmount - deductionsAmount - advancesDeducted) * 100,
-        ) / 100,
+        Math.round((baseAmount + overtimeAmount + bonusAmount - deductionsAmount) * 100) / 100,
       );
+
+      let actualDeductedInRecord = advancesDeducted;
+      let carryOverExcess = 0;
+      let netAmount = 0;
+
+      if (advancesDeducted > grossEarnings) {
+        carryOverExcess = Math.round((advancesDeducted - grossEarnings) * 100) / 100;
+        actualDeductedInRecord = grossEarnings;
+        netAmount = 0;
+      } else {
+        actualDeductedInRecord = advancesDeducted;
+        netAmount = Math.max(
+          0,
+          Math.round((grossEarnings - advancesDeducted) * 100) / 100,
+        );
+      }
 
       const itemCycle = item.cycle_type || item.salary_type || cycle_type;
 
@@ -867,7 +891,7 @@ async function confirmPayrollPayout(req, res) {
             safeBranchId,
             `راتب: ${item.name || "عامل"}`,
             netAmount,
-            `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} : ${item.name || ""} - الفترة من ${safeStart} إلى ${safeEnd}${advancesDeducted > 0 ? ` (بعد خصم سلف ${advancesDeducted} ج)` : ""}`,
+            `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} : ${item.name || ""} - الفترة من ${safeStart} إلى ${safeEnd}${actualDeductedInRecord > 0 ? ` (بعد خصم سلف ${actualDeductedInRecord} ج)` : ""}`,
             safeEnd,
             permissionNumber,
           ],
@@ -876,7 +900,13 @@ async function confirmPayrollPayout(req, res) {
         totalCashPaidOut += netAmount;
       }
 
-      // 2. Insert into payroll_records
+      // 2. Prepare notes and insert into payroll_records
+      let recordNotes = item.notes ? String(item.notes).trim() : "";
+      if (carryOverExcess > 0) {
+        const carryMsg = `(تم استهلاك كامل الراتب مقابل السلف، وترحيل ${carryOverExcess} ج سلف متبقية للأسبوع القادم)`;
+        recordNotes = recordNotes ? `${recordNotes} - ${carryMsg}` : carryMsg;
+      }
+
       const recordRes = await client.query(
         `
         INSERT INTO payroll_records 
@@ -897,12 +927,12 @@ async function confirmPayrollPayout(req, res) {
           overtimeAmount,
           bonusAmount,
           deductionsAmount,
-          advancesDeducted,
+          actualDeductedInRecord,
           netAmount,
           cashOutId,
           user.id || null,
           paidByName,
-          item.notes || null,
+          recordNotes || null,
         ],
       );
 
@@ -928,6 +958,30 @@ async function confirmPayrollPayout(req, res) {
           WHERE employee_id = $2 AND branch_id = $3 AND status = 'pending' AND advance_date <= $4
           `,
           [payrollRecord.id, empId, safeBranchId, safeEnd],
+        );
+      }
+
+      // 3.b If there is excess advance beyond gross earnings, carry it over as a new pending advance
+      if (carryOverExcess > 0) {
+        const endDateObj = new Date(safeEnd + "T12:00:00");
+        endDateObj.setDate(endDateObj.getDate() + 1);
+        const nextDateStr = endDateObj.toISOString().slice(0, 10);
+
+        await client.query(
+          `
+          INSERT INTO payroll_advances 
+            (branch_id, employee_id, amount, advance_date, status, cash_out_id, notes, created_by, created_by_name)
+          VALUES ($1, $2, $3, $4, 'pending', NULL, $5, $6, $7)
+          `,
+          [
+            safeBranchId,
+            empId,
+            carryOverExcess,
+            nextDateStr,
+            `متبقي سلف مرحل من مسير الفترة (${safeStart} إلى ${safeEnd})`,
+            user.id || null,
+            paidByName,
+          ],
         );
       }
 
