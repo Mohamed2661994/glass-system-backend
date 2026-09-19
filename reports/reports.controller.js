@@ -365,20 +365,31 @@ exports.getLowStockReorderCount = async (req, res) => {
         JOIN warehouses w2 ON w2.id = s2.warehouse_id
         WHERE w2.name = 'المخزن الرئيسي'
         GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
+      ),
+      retail_family_stock AS (
+        SELECT 
+          COALESCE(p3.retail_master_product_id, p3.id) AS product_id,
+          SUM(s3.quantity) AS retail_qty
+        FROM stock s3
+        JOIN products p3 ON p3.id = s3.product_id
+        JOIN warehouses w3 ON w3.id = s3.warehouse_id
+        WHERE w3.name = 'مخزن المعرض'
+        GROUP BY COALESCE(p3.retail_master_product_id, p3.id)
       )
       SELECT
         COUNT(*) AS total_count,
-        COUNT(*) FILTER (WHERE s.quantity = 0) AS zero_count
+        COUNT(*) FILTER (WHERE COALESCE(rfs.retail_qty, s.quantity, 0) = 0) AS zero_count
       FROM stock s
       JOIN products p ON p.id = s.product_id
       JOIN warehouses w ON w.id = s.warehouse_id
       LEFT JOIN ws_stock ws ON ws.product_id = p.id
+      LEFT JOIN retail_family_stock rfs ON rfs.product_id = p.id
       WHERE w.name = 'مخزن المعرض'
-        AND s.quantity >= 0 AND s.quantity <= 5
+        AND COALESCE(rfs.retail_qty, s.quantity, 0) >= 0 AND COALESCE(rfs.retail_qty, s.quantity, 0) <= 5
         AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
         AND p.is_active = true
         AND p.retail_master_product_id IS NULL
-        AND (s.quantity > 0 OR COALESCE(ws.max_ws_qty, 0) > 0);
+        AND (COALESCE(rfs.retail_qty, s.quantity, 0) > 0 OR COALESCE(ws.max_ws_qty, 0) > 0);
     `);
 
     res.json({
@@ -407,13 +418,23 @@ exports.getLowStockReorderItems = async (req, res) => {
         JOIN warehouses w2 ON w2.id = s2.warehouse_id
         WHERE w2.name = 'المخزن الرئيسي'
         GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
+      ),
+      retail_family_stock AS (
+        SELECT 
+          COALESCE(p3.retail_master_product_id, p3.id) AS product_id,
+          SUM(s3.quantity) AS retail_qty
+        FROM stock s3
+        JOIN products p3 ON p3.id = s3.product_id
+        JOIN warehouses w3 ON w3.id = s3.warehouse_id
+        WHERE w3.name = 'مخزن المعرض'
+        GROUP BY COALESCE(p3.retail_master_product_id, p3.id)
       )
       SELECT
         p.id AS product_id,
         p.name AS product_name,
         p.manufacturer AS manufacturer_name,
         w.name AS warehouse_name,
-        s.quantity AS current_stock,
+        COALESCE(rfs.retail_qty, s.quantity, 0) AS current_stock,
         s.variant_id,
         p.wholesale_package,
         p.retail_package,
@@ -422,13 +443,14 @@ exports.getLowStockReorderItems = async (req, res) => {
       JOIN products p ON p.id = s.product_id
       JOIN warehouses w ON w.id = s.warehouse_id
       LEFT JOIN ws_stock ws ON ws.product_id = p.id
+      LEFT JOIN retail_family_stock rfs ON rfs.product_id = p.id
       WHERE w.name = 'مخزن المعرض'
-        AND s.quantity >= 0 AND s.quantity <= 5
+        AND COALESCE(rfs.retail_qty, s.quantity, 0) >= 0 AND COALESCE(rfs.retail_qty, s.quantity, 0) <= 5
         AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
         AND p.is_active = true
         AND p.retail_master_product_id IS NULL
-        AND (s.quantity > 0 OR COALESCE(ws.ws_qty, 0) > 0)
-      ORDER BY CASE WHEN s.quantity <= 0 THEN 1 ELSE 0 END, s.quantity ASC;
+        AND (COALESCE(rfs.retail_qty, s.quantity, 0) > 0 OR COALESCE(ws.ws_qty, 0) > 0)
+      ORDER BY CASE WHEN COALESCE(rfs.retail_qty, s.quantity, 0) <= 0 THEN 1 ELSE 0 END, COALESCE(rfs.retail_qty, s.quantity, 0) ASC;
     `);
 
     // Get all variants to map variant_id → package names

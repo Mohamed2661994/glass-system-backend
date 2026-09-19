@@ -237,7 +237,11 @@ async function runBackupSync() {
       { name: 'public_webhook_change_log', checkUpdated: false },
       { name: 'user_activity', checkUpdated: false },
       { name: 'notifications', checkUpdated: false },
-      { name: 'messages', checkUpdated: false }
+      { name: 'messages', checkUpdated: false },
+      { name: 'payroll_employees', checkUpdated: true },
+      { name: 'payroll_records', checkUpdated: false },
+      { name: 'payroll_advances', checkUpdated: false },
+      { name: 'payroll_adjustments', checkUpdated: true }
     ];
 
     let totalSynced = 0;
