@@ -8586,9 +8586,10 @@ app.get("/products/for-replace", async (req, res) => {
         p.manufacturer,
         p.purchase_price,
         p.wholesale_price,
-        'purchase' AS discount_base,
+        COALESCE(m.discount_base, 'purchase') AS discount_base,
         COALESCE(s.qty, 0) AS available_quantity
       FROM products p
+      LEFT JOIN manufacturers m ON m.name = p.manufacturer
       LEFT JOIN (
         SELECT product_id, SUM(quantity) AS qty
         FROM stock
