@@ -221,7 +221,13 @@ async function dispatchInvoiceWhatsApp({
 
   const invoiceNumber = `INV-${id}`;
   const formattedAmount = formatAmount(targetAmount);
-  const displayName = (targetName && targetName.trim()) ? targetName.trim() : 'عميلنا العزيز';
+
+  let displayName = 'عميلنا العزيز';
+  if (targetName && targetName.trim()) {
+    const rawName = targetName.trim();
+    const cleanedName = rawName.replace(/^(أ\s*[\/\.]|أستاذ\s*[\/\.]?|الاستاذ\s*[\/\.]?|الأستاذ\s*[\/\.]?)\s*/i, '');
+    displayName = `أ / ${cleanedName}`;
+  }
 
   const customMessage = `(${QUAZLINK_CONFIG.storeName})
 
