@@ -8,9 +8,10 @@
  * First run: node scripts/gdrive-authorize.js  (one-time browser login)
  */
 
-const { google } = require("googleapis");
 const fs = require("fs");
 const path = require("path");
+const { google } = require("googleapis");
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const CREDENTIALS_PATH = path.join(
   __dirname,
@@ -24,29 +25,38 @@ const TOKEN_PATH = path.join(
   "credentials",
   "gdrive-token.json",
 );
-const FOLDER_ID = "1sOVQgZ2A_Vfr2KfZ5I1yjjwSIMH3R3Iw";
+const FOLDER_ID = process.env.GDRIVE_FOLDER_ID || "1sOVQgZ2A_Vfr2KfZ5I1yjjwSIMH3R3Iw";
 const MAX_FILES = 5;
 
 function getAuth() {
-  if (!fs.existsSync(TOKEN_PATH)) {
+  let clientId, clientSecret, refreshToken;
+
+  if (fs.existsSync(TOKEN_PATH) && fs.existsSync(CREDENTIALS_PATH)) {
+    try {
+      const content = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, "utf8"));
+      const { client_id, client_secret } = content.installed || content.web;
+      const tokens = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
+      clientId = client_id;
+      clientSecret = client_secret;
+      refreshToken = tokens.refresh_token;
+    } catch (e) {}
+  }
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    clientId = process.env.GDRIVE_CLIENT_ID;
+    clientSecret = process.env.GDRIVE_CLIENT_SECRET;
+    refreshToken = process.env.GDRIVE_REFRESH_TOKEN;
+  }
+
+  if (!clientId || !clientSecret || !refreshToken) {
     console.error(
-      "ERROR: No token found. Run 'node scripts/gdrive-authorize.js' first.",
+      "ERROR: No valid Google Drive credentials found in credentials/ or .env.",
     );
     process.exit(1);
   }
 
-  const content = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, "utf8"));
-  const { client_id, client_secret } = content.installed || content.web;
-  const tokens = JSON.parse(fs.readFileSync(TOKEN_PATH, "utf8"));
-
-  const oauth2Client = new google.auth.OAuth2(client_id, client_secret);
-  oauth2Client.setCredentials(tokens);
-
-  // Auto-save refreshed tokens
-  oauth2Client.on("tokens", (newTokens) => {
-    const merged = { ...tokens, ...newTokens };
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(merged, null, 2));
-  });
+  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret);
+  oauth2Client.setCredentials({ refresh_token: refreshToken });
 
   return oauth2Client;
 }
