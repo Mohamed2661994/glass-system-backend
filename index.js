@@ -2776,7 +2776,17 @@ app.get("/products", async (req, res) => {
       p.wholesale_price,
       p.retail_price,
       p.discount_amount,
-      COALESCE(SUM(s.quantity), 0) AS available_quantity,
+      CASE
+        WHEN $1 = 'retail' THEN
+          COALESCE((
+            SELECT SUM(s_fam.quantity)
+            FROM stock s_fam
+            WHERE s_fam.warehouse_id = $2
+              AND (s_fam.product_id = p.id OR s_fam.product_id IN (SELECT id FROM products WHERE retail_master_product_id = p.id))
+          ), 0)
+        ELSE
+          COALESCE(SUM(s.quantity), 0)
+      END AS available_quantity,
       (
         SELECT json_agg(json_build_object(
           'variant_id', vs.variant_id,
@@ -2819,7 +2829,17 @@ app.get("/products", async (req, res) => {
         ELSE p.retail_purchase_price
       END AS price,
       p.discount_amount,
-     COALESCE(SUM(s.quantity), 0) AS available_quantity,
+      CASE
+        WHEN $1 = 'retail' THEN
+          COALESCE((
+            SELECT SUM(s_fam.quantity)
+            FROM stock s_fam
+            WHERE s_fam.warehouse_id = $2
+              AND (s_fam.product_id = p.id OR s_fam.product_id IN (SELECT id FROM products WHERE retail_master_product_id = p.id))
+          ), 0)
+        ELSE
+          COALESCE(SUM(s.quantity), 0)
+      END AS available_quantity,
       (
         SELECT json_agg(json_build_object(
           'variant_id', vs.variant_id,

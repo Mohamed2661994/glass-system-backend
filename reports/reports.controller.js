@@ -203,7 +203,12 @@ exports.getProductCurrentStock = async (req, res) => {
       return res.status(400).json({ error: "product_id مطلوب" });
     }
 
-    let where = "WHERE s.product_id = $1";
+    let where = `WHERE s.product_id IN (
+      SELECT id FROM products 
+      WHERE id = $1 
+         OR retail_master_product_id = $1 
+         OR id = (SELECT retail_master_product_id FROM products WHERE id = $1 AND retail_master_product_id IS NOT NULL)
+    )`;
     const values = [product_id];
 
     if (warehouse_id) {
@@ -240,17 +245,17 @@ exports.getProductCurrentStock = async (req, res) => {
 
     const rows = result.rows.map((row) => {
       const vid = Number(row.variant_id) || 0;
+      const isRetailWarehouse = Number(row.warehouse_id) === 1;
       let pkgLabel;
       if (vid === 0) {
-        pkgLabel =
-          [row.wholesale_package, row.retail_package]
-            .filter(Boolean)
-            .join(" / ") || "-";
+        pkgLabel = isRetailWarehouse
+          ? (row.retail_package || "قطاعي")
+          : (row.wholesale_package || "جملة");
       } else {
         const v = variantsById[vid];
-        pkgLabel = v
-          ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ")
-          : "-";
+        pkgLabel = isRetailWarehouse
+          ? (v?.retail_package || row.retail_package || "قطاعي")
+          : (v?.wholesale_package || row.wholesale_package || "جملة");
       }
 
       return {
