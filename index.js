@@ -62,7 +62,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.19";
+const SYSTEM_VERSION = "v.26.9.20";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -1183,6 +1183,7 @@ app.use((req, res, next) => {
           }
           // Also broadcast specific cross-client invalidation if stock or product changed
           if (channel === "data:stock" || channel === "data:products" || channel === "data:invoices" || channel === "data:inter-branch") {
+            invalidateProductsCache();
             broadcast("product_updated", { invalidateProducts: true, path: p, ts: Date.now() });
           }
         } else if (io) {
@@ -2767,6 +2768,181 @@ function assertInvoiceRevisionMatches(currentRevision, incomingRevision) {
   return actualRevision;
 }
 
+/* =========================================================
+   ⚡ Ultra-Fast In-Memory Cache for /products
+   ========================================================= */
+const productsMemoryCache = new Map();
+const PRODUCTS_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL
+
+function getProductsCacheKey(warehouseId, invoiceType, movementType) {
+  return `${warehouseId || "null"}:${invoiceType || ""}:${movementType || ""}`;
+}
+
+function invalidateProductsCache() {
+  if (productsMemoryCache.size > 0) {
+    productsMemoryCache.clear();
+    console.log("⚡ Products in-memory cache invalidated.");
+  }
+}
+
+async function fetchProductsFromDb(invoiceType, warehouseId, movementType) {
+  if (movementType === "sale") {
+    const res = await pool.query(
+      `
+      WITH product_stock AS (
+        SELECT product_id, SUM(quantity) AS qty
+        FROM stock
+        WHERE warehouse_id = $2
+        GROUP BY product_id
+      ),
+      family_stock AS (
+        SELECT
+          CASE WHEN $1 = 'retail' THEN COALESCE(p.retail_master_product_id, p.id) ELSE p.id END AS master_id,
+          SUM(ps.qty) AS total_qty
+        FROM product_stock ps
+        JOIN products p ON p.id = ps.product_id
+        GROUP BY 1
+      ),
+      secondary_bcs AS (
+        SELECT retail_master_product_id AS master_id, json_agg(barcode) AS secondary_barcodes
+        FROM products
+        WHERE retail_master_product_id IS NOT NULL AND barcode IS NOT NULL AND barcode <> ''
+        GROUP BY retail_master_product_id
+      ),
+      var_stock AS (
+        SELECT
+          vs.product_id,
+          json_agg(json_build_object(
+            'variant_id', vs.variant_id,
+            'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
+            'quantity', vs.quantity,
+            'price', CASE WHEN $1 = 'wholesale' THEN pv.wholesale_price ELSE pv.retail_price END
+          ) ORDER BY vs.variant_id) AS variant_stock
+        FROM stock vs
+        JOIN products p ON p.id = vs.product_id
+        LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = vs.product_id
+        WHERE vs.warehouse_id = $2 AND vs.variant_id IS NOT NULL
+        GROUP BY vs.product_id
+      )
+      SELECT
+        p.id,
+        p.name,
+        p.barcode,
+        p.wholesale_package,
+        p.retail_package,
+        p.manufacturer,
+        p.description,
+        p.has_wholesale,
+        p.retail_master_product_id,
+        sb.secondary_barcodes,
+        CASE
+          WHEN $1 = 'wholesale' THEN p.wholesale_price
+          ELSE p.retail_price
+        END AS price,
+        p.wholesale_price,
+        p.retail_price,
+        p.discount_amount,
+        COALESCE(fs.total_qty, 0) AS available_quantity,
+        vs.variant_stock
+      FROM products p
+      LEFT JOIN family_stock fs ON fs.master_id = p.id
+      LEFT JOIN secondary_bcs sb ON sb.master_id = p.id
+      LEFT JOIN var_stock vs ON vs.product_id = p.id
+      WHERE p.is_active = true
+        AND ($1 = 'wholesale' OR p.retail_master_product_id IS NULL)
+      ORDER BY p.name;
+      `,
+      [invoiceType, warehouseId]
+    );
+    return res.rows;
+  } else {
+    // 🔹 شراء
+    const res = await pool.query(
+      `
+      WITH product_stock AS (
+        SELECT product_id, SUM(quantity) AS qty
+        FROM stock
+        WHERE warehouse_id = $2
+        GROUP BY product_id
+      ),
+      family_stock AS (
+        SELECT
+          CASE WHEN $1 = 'retail' THEN COALESCE(p.retail_master_product_id, p.id) ELSE p.id END AS master_id,
+          SUM(ps.qty) AS total_qty
+        FROM product_stock ps
+        JOIN products p ON p.id = ps.product_id
+        GROUP BY 1
+      ),
+      secondary_bcs AS (
+        SELECT retail_master_product_id AS master_id, json_agg(barcode) AS secondary_barcodes
+        FROM products
+        WHERE retail_master_product_id IS NOT NULL AND barcode IS NOT NULL AND barcode <> ''
+        GROUP BY retail_master_product_id
+      ),
+      var_stock AS (
+        SELECT
+          vs.product_id,
+          json_agg(json_build_object(
+            'variant_id', vs.variant_id,
+            'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
+            'quantity', vs.quantity,
+            'price', CASE WHEN $1 = 'wholesale' THEN pv.purchase_price ELSE pv.retail_purchase_price END
+          ) ORDER BY vs.variant_id) AS variant_stock
+        FROM stock vs
+        JOIN products p ON p.id = vs.product_id
+        LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = vs.product_id
+        WHERE vs.warehouse_id = $2 AND vs.variant_id IS NOT NULL
+        GROUP BY vs.product_id
+      )
+      SELECT
+        p.id,
+        p.name,
+        p.barcode,
+        p.wholesale_package,
+        p.retail_package,
+        p.manufacturer,
+        p.description,
+        p.has_wholesale,
+        p.retail_master_product_id,
+        sb.secondary_barcodes,
+        CASE
+          WHEN $1 = 'wholesale' THEN p.purchase_price
+          ELSE p.retail_purchase_price
+        END AS price,
+        p.discount_amount,
+        COALESCE(fs.total_qty, 0) AS available_quantity,
+        vs.variant_stock
+      FROM products p
+      LEFT JOIN family_stock fs ON fs.master_id = p.id
+      LEFT JOIN secondary_bcs sb ON sb.master_id = p.id
+      LEFT JOIN var_stock vs ON vs.product_id = p.id
+      WHERE p.is_active = true
+        AND ($1 = 'wholesale' OR p.retail_master_product_id IS NULL)
+      ORDER BY p.name;
+      `,
+      [invoiceType, warehouseId]
+    );
+    return res.rows;
+  }
+}
+
+function prewarmProductsCache() {
+  setTimeout(async () => {
+    try {
+      console.log("🔥 Pre-warming products in-memory cache...");
+      const rows = await fetchProductsFromDb("retail", 1, "sale");
+      productsMemoryCache.set(getProductsCacheKey(1, "retail", "sale"), {
+        data: rows,
+        timestamp: Date.now(),
+        isFetching: false,
+      });
+      console.log(`🔥 Products cache pre-warmed (${rows.length} retail products loaded into RAM)!`);
+    } catch (err) {
+      console.error("Products cache pre-warm error:", err.message);
+    }
+  }, 2500);
+}
+
 app.get("/products", async (req, res) => {
   try {
     const { branch_id, invoice_type, movement_type } = req.query;
@@ -2777,128 +2953,47 @@ app.get("/products", async (req, res) => {
       });
     }
 
-    // نجيب المخزن بتاع الفرع
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
+    const cacheKey = getProductsCacheKey(warehouseId, invoice_type, movement_type);
+    const cached = productsMemoryCache.get(cacheKey);
+    const now = Date.now();
 
-    // نجيب الأصناف + الرصيد + السعر حسب نوع الفاتورة
-    let productsResult;
-
-    if (movement_type === "sale") {
-      // 🔹 بيع → كل الأصناف (اللي رصيدها 0 هتكون disabled في الفرونت)
-      productsResult = await pool.query(
-        `
-     SELECT
-      p.id,
-      p.name,
-      p.barcode,
-      p.wholesale_package,
-      p.retail_package,
-      p.manufacturer,
-      p.description,
-      p.has_wholesale,
-      p.retail_master_product_id,
-      (
-        SELECT json_agg(sp.barcode)
-        FROM products sp
-        WHERE sp.retail_master_product_id = p.id AND sp.barcode IS NOT NULL AND sp.barcode <> ''
-      ) AS secondary_barcodes,
-      CASE
-        WHEN $1 = 'wholesale' THEN p.wholesale_price
-        ELSE p.retail_price
-      END AS price,
-      p.wholesale_price,
-      p.retail_price,
-      p.discount_amount,
-      CASE
-        WHEN $1 = 'retail' THEN
-          COALESCE((
-            SELECT SUM(s_fam.quantity)
-            FROM stock s_fam
-            WHERE s_fam.warehouse_id = $2
-              AND (s_fam.product_id = p.id OR s_fam.product_id IN (SELECT id FROM products WHERE retail_master_product_id = p.id))
-          ), 0)
-        ELSE
-          COALESCE(SUM(s.quantity), 0)
-      END AS available_quantity,
-      (
-        SELECT json_agg(json_build_object(
-          'variant_id', vs.variant_id,
-          'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
-          'quantity', vs.quantity,
-          'price', CASE WHEN $1 = 'wholesale' THEN pv.wholesale_price ELSE pv.retail_price END
-        ) ORDER BY vs.variant_id)
-        FROM stock vs
-        LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = p.id
-        WHERE vs.product_id = p.id AND vs.warehouse_id = $2
-      ) AS variant_stock
-    FROM products p
-    LEFT JOIN stock s
-      ON s.product_id = p.id
-      AND s.warehouse_id = $2
-    WHERE p.is_active = true
-      AND ($1 = 'wholesale' OR p.retail_master_product_id IS NULL)
-    GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.description, p.has_wholesale, p.wholesale_price, p.retail_price, p.discount_amount, p.retail_master_product_id
-    ORDER BY p.name
-    `,
-        [invoice_type, warehouseId],
-      );
-    } else {
-      // 🔹 شراء → كل الأصناف حتى لو الرصيد صفر (نجمع كل الـ variants في سطر واحد)
-      productsResult = await pool.query(
-        `
-   SELECT
-      p.id,
-      p.name,
-      p.barcode,
-      p.wholesale_package,
-      p.retail_package,
-      p.manufacturer,
-      p.description,
-      p.has_wholesale,
-      p.retail_master_product_id,
-      CASE
-        WHEN $1 = 'wholesale' THEN p.purchase_price
-        ELSE p.retail_purchase_price
-      END AS price,
-      p.discount_amount,
-      CASE
-        WHEN $1 = 'retail' THEN
-          COALESCE((
-            SELECT SUM(s_fam.quantity)
-            FROM stock s_fam
-            WHERE s_fam.warehouse_id = $2
-              AND (s_fam.product_id = p.id OR s_fam.product_id IN (SELECT id FROM products WHERE retail_master_product_id = p.id))
-          ), 0)
-        ELSE
-          COALESCE(SUM(s.quantity), 0)
-      END AS available_quantity,
-      (
-        SELECT json_agg(json_build_object(
-          'variant_id', vs.variant_id,
-          'package_name', COALESCE(pv.wholesale_package, p.wholesale_package),
-          'quantity', vs.quantity,
-          'price', CASE WHEN $1 = 'wholesale' THEN pv.purchase_price ELSE pv.retail_purchase_price END
-        ) ORDER BY vs.variant_id)
-        FROM stock vs
-        LEFT JOIN product_variants pv ON pv.id = vs.variant_id AND pv.product_id = p.id
-        WHERE vs.product_id = p.id AND vs.warehouse_id = $2
-      ) AS variant_stock
-    FROM products p
-    LEFT JOIN stock s
-      ON s.product_id = p.id
-      AND s.warehouse_id = $2
-    WHERE p.is_active = true
-      AND ($1 = 'wholesale' OR p.retail_master_product_id IS NULL)
-    GROUP BY p.id, p.name, p.barcode, p.wholesale_package, p.retail_package,
-             p.manufacturer, p.description, p.has_wholesale, p.purchase_price, p.retail_purchase_price, p.discount_amount, p.retail_master_product_id
-    ORDER BY p.name
-    `,
-        [invoice_type, warehouseId],
-      );
+    // 1. Instant Cache Hit (< 1ms response)
+    if (cached && (now - cached.timestamp < PRODUCTS_CACHE_TTL_MS)) {
+      res.setHeader("X-Cache", "HIT");
+      return res.json(cached.data);
     }
 
-    res.json(productsResult.rows);
+    // 2. Stale-While-Revalidate: serve stale immediately and revalidate in background
+    if (cached && cached.data) {
+      if (!cached.isFetching) {
+        cached.isFetching = true;
+        fetchProductsFromDb(invoice_type, warehouseId, movement_type)
+          .then((fresh) => {
+            productsMemoryCache.set(cacheKey, {
+              data: fresh,
+              timestamp: Date.now(),
+              isFetching: false,
+            });
+          })
+          .catch((e) => {
+            console.error("Background products cache refresh error:", e.message);
+            cached.isFetching = false;
+          });
+      }
+      res.setHeader("X-Cache", "STALE");
+      return res.json(cached.data);
+    }
+
+    // 3. Cold Fetch
+    const rows = await fetchProductsFromDb(invoice_type, warehouseId, movement_type);
+    productsMemoryCache.set(cacheKey, {
+      data: rows,
+      timestamp: Date.now(),
+      isFetching: false,
+    });
+    res.setHeader("X-Cache", "MISS");
+    res.json(rows);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Server error" });
@@ -12925,6 +13020,15 @@ async function initClusterRealtimeSync() {
           if (sender && sender === currentWorker) {
             return;
           }
+          if (
+            event === "product_updated" ||
+            event === "data:stock" ||
+            event === "data:invoices" ||
+            event === "data:products" ||
+            event === "data:inter-branch"
+          ) {
+            invalidateProductsCache();
+          }
           if (room) {
             io.to(room).emit(event, payload);
           } else {
@@ -13321,6 +13425,7 @@ runStartupMigrations().finally(() => {
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server + Socket running on port ${PORT}`);
     initClusterRealtimeSync();
+    prewarmProductsCache();
     stockWatchdogService.initStartupAudit(io);
     if (typeof pool.startContinuousStandbyBackup === "function") {
       pool.startContinuousStandbyBackup();
