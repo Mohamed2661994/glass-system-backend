@@ -6736,6 +6736,59 @@ app.post("/stock/reconcile", authMiddleware, async (req, res) => {
     client.release();
   }
 });
+// ========== Dashboard Aggregate ==========
+app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
+  try {
+    const { branch_id, invoice_type, date } = req.query;
+    if (!branch_id || !invoice_type || !date) {
+      return res.status(400).json({ error: "Missing parameters" });
+    }
+    
+    const currentPort = process.env.PORT || 3001;
+    const baseUrl = `http://127.0.0.1:${currentPort}`;
+    const headers = { 
+       "Authorization": req.headers.authorization,
+       "Content-Type": "application/json"
+    };
+    
+    const requests = [
+      fetch(`${baseUrl}/invoices?invoice_type=${invoice_type}&date_from=${date}&date_to=${date}&_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => ({ data: [] })),
+      fetch(`${baseUrl}/dashboard/stats?invoice_type=${invoice_type}&_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => null),
+      fetch(`${baseUrl}/reports/low-stock-reorder-count?_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => null),
+      fetch(`${baseUrl}/stock-transfers/by-date?date=${date}&_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => ({ items: [] })),
+      fetch(`${baseUrl}/cash-in?branch_id=${branch_id}&from_date=${date}&to_date=${date}`, { headers }).then(r => r.json()).catch(() => []),
+      fetch(`${baseUrl}/cash/out?branch_id=${branch_id}&from_date=${date}&to_date=${date}`, { headers }).then(r => r.json()).catch(() => []),
+      fetch(`${baseUrl}/notifications/unread?limit=5`, { headers }).then(r => r.json()).catch(() => []),
+      String(branch_id) === "1" ? fetch(`${baseUrl}/invoices/wholesale/pending`, { headers }).then(r => r.json()).catch(() => []) : Promise.resolve([])
+    ];
+
+    const [
+      invoicesData,
+      statsData,
+      lowStockData,
+      transfersData,
+      cashInData,
+      cashOutData,
+      notificationsData,
+      pendingWholesaleData
+    ] = await Promise.all(requests);
+
+    res.json({
+      invoices: invoicesData,
+      stats: statsData,
+      lowStock: lowStockData,
+      transfers: transfersData,
+      cashIn: cashInData,
+      cashOut: cashOutData,
+      notifications: notificationsData,
+      pendingWholesale: pendingWholesaleData
+    });
+
+  } catch (err) {
+    console.error("Dashboard Aggregate Error:", err);
+    res.status(500).json({ error: "Failed to aggregate dashboard data" });
+  }
+});
 
 // ========== Dashboard Stats ==========
 app.get("/dashboard/stats", async (req, res) => {
