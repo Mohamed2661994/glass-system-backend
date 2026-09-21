@@ -62,7 +62,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.21";
+const SYSTEM_VERSION = "v.26.9.22";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -9201,6 +9201,27 @@ app.get("/stock/search-for-adjustment", authMiddleware, async (req, res) => {
       `;
       values = [Math.min(50, Math.max(1, Number(limit)))];
     } else {
+      const words = searchTerm.split(/\s+/).filter(Boolean);
+      const conditions = [];
+      values = [];
+      let idx = 1;
+
+      words.forEach((word) => {
+        conditions.push(`(
+          p.name ILIKE $${idx}
+          OR p.barcode ILIKE $${idx}
+          OR p.manufacturer ILIKE $${idx}
+          OR p.description ILIKE $${idx}
+          OR CAST(p.id AS TEXT) = $${idx + 1}
+        )`);
+        values.push(`%${word}%`, word);
+        idx += 2;
+      });
+
+      const limitVal = Math.min(50, Math.max(1, Number(limit)));
+      values.push(limitVal);
+      const limitIdx = idx;
+
       query = `
         SELECT 
           p.id,
@@ -9217,18 +9238,16 @@ app.get("/stock/search-for-adjustment", authMiddleware, async (req, res) => {
         LEFT JOIN stock s1 ON s1.product_id = p.id AND s1.warehouse_id = 1 AND COALESCE(s1.variant_id, 0) = 0
         LEFT JOIN stock s2 ON s2.product_id = p.id AND s2.warehouse_id = 2 AND COALESCE(s2.variant_id, 0) = 0
         WHERE p.is_active = true
-          AND (
-            p.name ILIKE $1 
-            OR p.barcode ILIKE $1 
-            OR p.manufacturer ILIKE $1
-            OR CAST(p.id AS TEXT) = $2
-          )
+          AND ${conditions.join(" AND ")}
         ORDER BY 
-          CASE WHEN p.barcode = $2 THEN 1 WHEN p.name ILIKE $1 THEN 2 ELSE 3 END,
+          CASE 
+            WHEN p.barcode = $2 THEN 1 
+            WHEN p.name ILIKE $1 THEN 2 
+            ELSE 3 
+          END,
           p.name ASC
-        LIMIT $3
+        LIMIT $${limitIdx}
       `;
-      values = [`%${searchTerm}%`, searchTerm, Math.min(50, Math.max(1, Number(limit)))];
     }
 
     const result = await pool.query(query, values);
