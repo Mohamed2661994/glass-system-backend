@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 process.on("unhandledRejection", (reason, promise) => {
   console.error("⚠️ Unhandled Rejection (handled):", reason);
