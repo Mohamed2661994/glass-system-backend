@@ -971,6 +971,29 @@ async function autoBackupToDrive() {
     console.log(
       `✅ Auto-backup complete: ${lastAutoBackup.file} (${sizeMB} MB)`,
     );
+
+    // 🧹 Auto-prune local backups: keep only the latest 2 files to protect disk space
+    try {
+      const files = fs
+        .readdirSync(BACKUP_DIR)
+        .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
+        .map((f) => ({
+          name: f,
+          path: path.join(BACKUP_DIR, f),
+          time: fs.statSync(path.join(BACKUP_DIR, f)).mtime.getTime(),
+        }))
+        .sort((a, b) => b.time - a.time);
+
+      if (files.length > 2) {
+        files.slice(2).forEach((f) => {
+          try {
+            fs.unlinkSync(f.path);
+          } catch (e) {}
+        });
+      }
+    } catch (cleanErr) {
+      console.warn("⚠️ Local backup prune warning:", cleanErr.message);
+    }
   } catch (err) {
     console.error("❌ Auto-backup failed:", err.message);
   }
@@ -5078,7 +5101,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
         ii.is_return,
         p.manufacturer
       FROM invoice_items ii
-      JOIN products p ON p.id = ii.product_id
+      LEFT JOIN products p ON p.id = ii.product_id
       WHERE ii.invoice_id = $1
       ORDER BY ii.id
       `,
@@ -5196,7 +5219,7 @@ app.get("/invoices/:id", async (req, res) => {
     COALESCE(ii.variant_id, 0) AS variant_id,
     p.manufacturer
   FROM invoice_items ii
-  JOIN products p ON p.id = ii.product_id
+  LEFT JOIN products p ON p.id = ii.product_id
   WHERE ii.invoice_id = $1
   `,
       [id],
