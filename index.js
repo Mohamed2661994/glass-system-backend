@@ -62,7 +62,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.20";
+const SYSTEM_VERSION = "v.26.9.21";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -12345,39 +12345,44 @@ app.get(
       const userId = req.user.id;
       const convId = Number(req.params.id);
 
-      // Verify user is a participant
-      const participant = await pool.query(
-        "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
-        [convId, userId],
-      );
-      if (!participant.rows.length) {
-        return res.status(403).json({ error: "غير مصرح" });
-      }
-
-      // Mark messages as read
-      await pool.query(
-        "UPDATE messages SET is_read = true WHERE conversation_id = $1 AND sender_id != $2 AND is_read = false",
-        [convId, userId],
-      );
-
       const result = await pool.query(
         `
-      SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
-             m.type, m.file_url, m.reply_to_id,
-             u.username, u.full_name,
-             rm.content AS reply_content,
-             rm.sender_id AS reply_sender_id,
-             ru.full_name AS reply_sender_name,
-             rm.type AS reply_type
-      FROM messages m
-      JOIN users u ON u.id = m.sender_id
-      LEFT JOIN messages rm ON rm.id = m.reply_to_id
-      LEFT JOIN users ru ON ru.id = rm.sender_id
-      WHERE m.conversation_id = $1
-      ORDER BY m.created_at ASC
-    `,
-        [convId],
+        WITH auth AS (
+          SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2
+        ),
+        marked AS (
+          UPDATE messages
+          SET is_read = true
+          WHERE conversation_id = $1 AND sender_id != $2 AND is_read = false AND EXISTS (SELECT 1 FROM auth)
+          RETURNING id
+        )
+        SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
+               m.type, m.file_url, m.reply_to_id,
+               u.username, u.full_name,
+               rm.content AS reply_content,
+               rm.sender_id AS reply_sender_id,
+               ru.full_name AS reply_sender_name,
+               rm.type AS reply_type
+        FROM messages m
+        JOIN users u ON u.id = m.sender_id
+        LEFT JOIN messages rm ON rm.id = m.reply_to_id
+        LEFT JOIN users ru ON ru.id = rm.sender_id
+        WHERE m.conversation_id = $1 AND EXISTS (SELECT 1 FROM auth)
+        ORDER BY m.created_at ASC
+        `,
+        [convId, userId],
       );
+
+      // If no messages returned, check if user is unauthorized or if conversation is just empty
+      if (!result.rows.length) {
+        const participant = await pool.query(
+          "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+          [convId, userId],
+        );
+        if (!participant.rows.length) {
+          return res.status(403).json({ error: "غير مصرح" });
+        }
+      }
 
       res.json({ success: true, data: result.rows });
     } catch (err) {
@@ -12569,68 +12574,88 @@ app.post(
         return res.status(400).json({ error: "الرسالة فاضية" });
       }
 
-      // Verify user is a participant
-      const participant = await pool.query(
-        "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
-        [convId, userId],
+      const cleanContent = content.trim();
+      const validReplyId = Number(reply_to_id) || null;
+
+      // Single-roundtrip CTE for participant verification, insertion, timestamp update, and sender/recipient resolution
+      const result = await pool.query(
+        `
+        WITH auth AS (
+          SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2
+        ),
+        ins AS (
+          INSERT INTO messages (conversation_id, sender_id, content, reply_to_id)
+          SELECT $1, $2, $3, $4
+          WHERE EXISTS (SELECT 1 FROM auth)
+          RETURNING *
+        ),
+        upd_conv AS (
+          UPDATE conversations SET updated_at = NOW() WHERE id = $1 AND EXISTS (SELECT 1 FROM ins)
+        ),
+        other_usr AS (
+          SELECT user_id AS other_user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2 LIMIT 1
+        )
+        SELECT 
+          ins.id, ins.conversation_id, ins.sender_id, ins.content, ins.is_read, ins.created_at, ins.type, ins.file_url, ins.reply_to_id,
+          u.username, u.full_name,
+          (SELECT other_user_id FROM other_usr) AS other_user_id,
+          rm.content AS reply_content,
+          rm.sender_id AS reply_sender_id,
+          ru.full_name AS reply_sender_name,
+          rm.type AS reply_type
+        FROM ins
+        JOIN users u ON u.id = ins.sender_id
+        LEFT JOIN messages rm ON rm.id = ins.reply_to_id
+        LEFT JOIN users ru ON ru.id = rm.sender_id
+        `,
+        [convId, userId, cleanContent, validReplyId],
       );
-      if (!participant.rows.length) {
-        return res.status(403).json({ error: "غير مصرح" });
+
+      if (!result.rows.length) {
+        // Not authorized or invalid conversation
+        const participant = await pool.query(
+          "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+          [convId, userId],
+        );
+        if (!participant.rows.length) {
+          return res.status(403).json({ error: "غير مصرح" });
+        }
+        return res.status(500).json({ error: "فشل إرسال الرسالة" });
       }
 
-      // Insert message
-      const msgResult = await pool.query(
-        "INSERT INTO messages (conversation_id, sender_id, content, reply_to_id) VALUES ($1, $2, $3, $4) RETURNING *",
-        [convId, userId, content.trim(), reply_to_id || null],
-      );
-
-      // Update conversation timestamp
-      await pool.query(
-        "UPDATE conversations SET updated_at = NOW() WHERE id = $1",
-        [convId],
-      );
-
-      // Get sender info
-      const senderResult = await pool.query(
-        "SELECT username, full_name FROM users WHERE id = $1",
-        [userId],
-      );
+      const row = result.rows[0];
+      const otherUserId = row.other_user_id;
 
       const message = {
-        ...msgResult.rows[0],
-        username: senderResult.rows[0].username,
-        full_name: senderResult.rows[0].full_name,
+        id: row.id,
+        conversation_id: row.conversation_id,
+        sender_id: row.sender_id,
+        content: row.content,
+        is_read: row.is_read,
+        created_at: row.created_at,
+        type: row.type || "text",
+        file_url: row.file_url,
+        reply_to_id: row.reply_to_id,
+        username: row.username,
+        full_name: row.full_name,
+        reply_content: row.reply_content,
+        reply_sender_id: row.reply_sender_id,
+        reply_sender_name: row.reply_sender_name,
+        reply_type: row.reply_type,
       };
 
-      // If replying, attach reply info
-      if (reply_to_id) {
-        const replyResult = await pool.query(
-          "SELECT m.content, m.sender_id, m.type, u.full_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.id = $1",
-          [reply_to_id],
-        );
-        if (replyResult.rows.length) {
-          message.reply_content = replyResult.rows[0].content;
-          message.reply_sender_id = replyResult.rows[0].sender_id;
-          message.reply_sender_name = replyResult.rows[0].full_name;
-          message.reply_type = replyResult.rows[0].type;
-        }
-      }
-
-      // Get other participant to send real-time notification
-      const otherUser = await pool.query(
-        "SELECT user_id FROM conversation_participants WHERE conversation_id = $1 AND user_id != $2",
-        [convId, userId],
-      );
-
       // Emit to the other user via socket (Cluster-safe)
-      const broadcast = req.app.get("broadcastRealtime");
-      if (otherUser.rows.length) {
-        const otherUserId = otherUser.rows[0].user_id;
+      if (otherUserId) {
+        const broadcast = req.app.get("broadcastRealtime");
         if (typeof broadcast === "function") {
-          broadcast("new_message", {
-            conversation_id: convId,
-            message,
-          }, `user_${otherUserId}`);
+          broadcast(
+            "new_message",
+            {
+              conversation_id: convId,
+              message,
+            },
+            `user_${otherUserId}`,
+          );
         } else {
           const io = req.app.get("io");
           if (io) {
@@ -12640,20 +12665,18 @@ app.post(
             });
           }
         }
-      }
 
-      // Send push notification to other user
-      if (otherUser.rows.length) {
+        // Send push notification asynchronously (unawaited)
         const preview =
-          content.trim().length > 80
-            ? content.trim().substring(0, 80) + "..."
-            : content.trim();
+          cleanContent.length > 80
+            ? cleanContent.substring(0, 80) + "..."
+            : cleanContent;
         sendPushToUser(
-          otherUser.rows[0].user_id,
-          senderResult.rows[0].full_name,
+          otherUserId,
+          message.full_name || message.username,
           preview,
           convId,
-        );
+        ).catch(() => {});
       }
 
       res.json({ success: true, data: message });
