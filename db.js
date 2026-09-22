@@ -3086,7 +3086,25 @@ function startPeriodicSync() {
   // Bi-directional sync disabled: unified on Data Studio HA Cluster
 }
 
+/* ── Automatic Idle Transaction Reaper (Prevents connection exhaustion) ── */
+function startIdleTransactionReaper() {
+  setInterval(async () => {
+    try {
+      await primaryPool.query(`
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE usename = current_user
+          AND state = 'idle in transaction'
+          AND state_change < NOW() - INTERVAL '3 minutes'
+      `);
+    } catch (err) {
+      // ignore transient db errors
+    }
+  }, 60000);
+}
+
 // Start background services
+startIdleTransactionReaper();
 startPublicWebhookDelivery();
 if (process.env.STANDBY_BACKUP_ENABLED === "true" && process.env.IS_STANDBY_WORKER === "true") {
   startContinuousStandbyBackup();

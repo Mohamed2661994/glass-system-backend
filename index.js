@@ -9844,6 +9844,91 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
 });
 
 /* ===============================
+   ⚡ CASH SUMMARY - الرصيد الافتتاحي السريع (Opening Balance)
+================================ */
+app.get("/cash/opening-balance", authMiddleware, async (req, res) => {
+  try {
+    const rawBranch = req.query.branch_id;
+    const branch_id =
+      req.user.role === "admin" && rawBranch
+        ? Number(rawBranch)
+        : Number(req.user.branch_id);
+
+    const rawBeforeDate =
+      req.query.before_date ||
+      req.query.from_date ||
+      new Date().toISOString().split("T")[0];
+
+    // Strict format validation (YYYY-MM-DD)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(rawBeforeDate))) {
+      return res.status(400).json({ error: "صيغة التاريخ غير صحيحة (YYYY-MM-DD)" });
+    }
+
+    const hideMarketCustomers =
+      req.query.hide_market_customers === "1" ||
+      req.query.hide_market_customers === "true";
+
+    const query = `
+      SELECT
+        COALESCE(
+          (SELECT SUM(
+             CASE 
+               WHEN ci.source_type = 'invoice' THEN COALESCE(ci.paid_amount, 0)
+               ELSE COALESCE(ci.amount, 0)
+             END
+           )
+           FROM cash_in ci
+           WHERE ci.branch_id = $1 
+             AND ci.transaction_date < $2::date
+             AND (ci.notes IS NULL OR ci.notes NOT LIKE '%{{discount_diff}}%')
+             AND (
+               $3::boolean = false 
+               OR ci.customer_name IS NULL 
+               OR REPLACE(LOWER(TRIM(ci.customer_name)), ' ', '') NOT IN (
+                 SELECT REPLACE(LOWER(TRIM(name)), ' ', '') FROM customers WHERE is_market_customer = true
+               )
+             )
+          ), 0
+        ) AS prev_total_in,
+        COALESCE(
+          (SELECT SUM(co.amount)
+           FROM cash_out co
+           WHERE co.branch_id = $1 
+             AND co.transaction_date < $2::date
+          ), 0
+        ) AS prev_total_out,
+        (
+          SELECT to_char(MAX(d), 'YYYY-MM-DD') FROM (
+            SELECT MAX(transaction_date) as d FROM cash_in WHERE branch_id = $1 AND transaction_date < $2::date
+            UNION ALL
+            SELECT MAX(transaction_date) as d FROM cash_out WHERE branch_id = $1 AND transaction_date < $2::date
+          ) t
+        ) AS last_prev_date
+    `;
+
+    const result = await pool.query(query, [branch_id, rawBeforeDate, hideMarketCustomers]);
+    const row = result.rows[0] || {};
+    const prevTotalIn = Number(row.prev_total_in) || 0;
+    const prevTotalOut = Number(row.prev_total_out) || 0;
+
+    res.json({
+      success: true,
+      data: {
+        branch_id,
+        before_date: rawBeforeDate,
+        prev_total_in: prevTotalIn,
+        prev_total_out: prevTotalOut,
+        opening_balance: prevTotalIn - prevTotalOut,
+        last_prev_date: row.last_prev_date || null,
+      },
+    });
+  } catch (err) {
+    console.error("GET CASH OPENING BALANCE ERROR:", err);
+    res.status(500).json({ error: "خطأ في حساب الرصيد الافتتاحي" });
+  }
+});
+
+/* ===============================
    🔎 CASH OUT - جلب منصرف واحد
 ================================ */
 app.get("/cash/out/:id", authMiddleware, async (req, res) => {
