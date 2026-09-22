@@ -62,7 +62,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.22";
+const SYSTEM_VERSION = "v.26.9.23";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -1184,12 +1184,19 @@ app.use((req, res, next) => {
           // Also broadcast specific cross-client invalidation if stock or product changed
           if (channel === "data:stock" || channel === "data:products" || channel === "data:invoices" || channel === "data:inter-branch") {
             invalidateProductsCache();
+            invalidateDashboardStatsCache();
             broadcast("product_updated", { invalidateProducts: true, path: p, ts: Date.now() });
+          }
+          if (channel === "data:cash") {
+            invalidateDashboardStatsCache();
           }
         } else if (io) {
           io.emit(channel, payload);
           if (p.includes("/cash-in")) {
             io.emit("data:cash-in", payload);
+          }
+          if (channel === "data:invoices" || channel === "data:cash" || channel === "data:stock") {
+            invalidateDashboardStatsCache();
           }
         }
 
@@ -6831,6 +6838,221 @@ app.post("/stock/reconcile", authMiddleware, async (req, res) => {
     client.release();
   }
 });
+// ========== Dashboard In-Memory Cache ==========
+const _dashboardCache = new Map();
+function getDashboardCache(key, ttlMs) {
+  const item = _dashboardCache.get(key);
+  if (item && Date.now() - item.ts < ttlMs) {
+    return item.data;
+  }
+  return null;
+}
+function setDashboardCache(key, data) {
+  _dashboardCache.set(key, { data, ts: Date.now() });
+}
+function invalidateDashboardStatsCache() {
+  _dashboardCache.delete("dashboard_stats_retail");
+  _dashboardCache.delete("dashboard_stats_wholesale");
+  _dashboardCache.delete("low_stock_reorder_count");
+}
+
+async function fetchDashboardStats(invoice_type) {
+  const cacheKey = `dashboard_stats_${invoice_type}`;
+  const cached = getDashboardCache(cacheKey, 30000);
+  if (cached) return cached;
+
+  const warehouseId = invoice_type === "retail" ? 1 : 2;
+
+  const [
+    salesToday,
+    cashToday,
+    lowStockCount,
+    negativeStockCount,
+    todayProfitSummary,
+    interBranchProfitSummary,
+  ] = await Promise.all([
+    // Today's sales total
+    pool.query(
+      `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
+       FROM invoices
+       WHERE invoice_type = $1
+         AND movement_type = 'sale'
+         AND is_return = false
+         AND created_at >= CURRENT_DATE
+         AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
+      [invoice_type],
+    ),
+    // Today's cash collected
+    pool.query(
+      `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
+       FROM invoices
+       WHERE invoice_type = $1
+         AND created_at >= CURRENT_DATE
+         AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
+      [invoice_type],
+    ),
+    // Low stock count (quantity <= 5)
+    pool.query(
+      `SELECT COUNT(DISTINCT product_id) AS count
+       FROM stock
+       WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
+      [warehouseId],
+    ),
+    // Negative stock count — optimized directly on stock table
+    pool.query(
+      `SELECT COUNT(*) AS count
+       FROM stock s
+       JOIN products p ON p.id = s.product_id
+       WHERE s.warehouse_id = $1 AND s.quantity < 0 AND p.is_active = true`,
+      [warehouseId],
+    ),
+    // Today's profit percentage (Proportional Distribution)
+    pool.query(
+      `WITH invoice_scope AS (
+         SELECT 
+           i.id AS invoice_id, 
+           i.branch_id, 
+           i.invoice_type, 
+           COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date, 
+           COALESCE(i.total, 0) AS invoice_total,
+           COALESCE(i.apply_items_discount, true) AS apply_items_discount
+         FROM invoices i
+         WHERE i.invoice_type = $1
+           AND i.movement_type = 'sale'
+           AND i.is_void IS NOT TRUE
+           AND COALESCE(i.invoice_date::date, i.created_at::date) = CURRENT_DATE
+       ),
+       invoice_items_scoped AS (
+         SELECT
+           ii.invoice_id,
+           ii.quantity, ii.price, ii.discount, ii.total, ii.is_return, ii.cost_price,
+           inv.branch_id, inv.invoice_type, inv.invoice_date, inv.invoice_total, inv.apply_items_discount,
+           p.purchase_price, p.retail_purchase_price,
+           CASE
+             WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+               CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+               ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+             ELSE
+               CASE WHEN COALESCE(ii.is_return, false)
+                 THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+               ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+           END AS signed_item_total,
+           SUM(
+             CASE
+               WHEN COALESCE(inv.apply_items_discount, true) = false THEN
+                 CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
+                 ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
+               ELSE
+                 CASE WHEN COALESCE(ii.is_return, false)
+                   THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
+                 ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
+             END
+           ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
+         FROM invoice_scope inv
+         JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
+         JOIN products p ON p.id = ii.product_id
+       )
+       SELECT
+         COALESCE(SUM(
+           CASE
+             WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
+             ELSE iis.signed_item_total - ((iis.invoice_items_total - iis.invoice_total) * (iis.signed_item_total / iis.invoice_items_total))
+           END
+         ), 0) AS sales_total,
+         COALESCE(SUM(
+           CASE WHEN COALESCE(iis.is_return, false) THEN 0
+           ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
+         ), 0) AS total_cost
+       FROM invoice_items_scoped iis`,
+      [invoice_type],
+    ),
+    // Today's inter-branch outbound profit
+    pool.query(
+      `SELECT COALESCE(SUM(total_value), 0) AS total_sales,
+              COALESCE(SUM(total_cost), 0) AS total_cost
+       FROM inter_branch_transfers
+       WHERE direction = 'outbound'
+         AND status IN ('in_transit', 'received')
+         AND created_at >= CURRENT_DATE
+         AND created_at < CURRENT_DATE + INTERVAL '1 day'`
+    ).catch(() => ({ rows: [{ total_sales: 0, total_cost: 0 }] })),
+  ]);
+
+  const todaySalesTotal = Number(todayProfitSummary.rows[0]?.sales_total || 0) + Number(interBranchProfitSummary.rows[0]?.total_sales || 0);
+  const todayTotalCost = Number(todayProfitSummary.rows[0]?.total_cost || 0) + Number(interBranchProfitSummary.rows[0]?.total_cost || 0);
+  const todayNetProfit = todaySalesTotal - todayTotalCost;
+  const todayProfitPercentage =
+    todaySalesTotal > 0 ? (todayNetProfit / todaySalesTotal) * 100 : 0;
+
+  const statsResult = {
+    today_sales: Number(salesToday.rows[0]?.total_sales || 0),
+    today_invoices_count: Number(salesToday.rows[0]?.count || 0),
+    today_cash: Number(cashToday.rows[0]?.total_cash || 0),
+    low_stock_count: Number(lowStockCount.rows[0]?.count || 0),
+    negative_stock_count: Number(negativeStockCount.rows[0]?.count || 0),
+    today_profit_percentage: todayProfitPercentage,
+  };
+
+  setDashboardCache(cacheKey, statsResult);
+  return statsResult;
+}
+
+async function fetchLowStockReorderCount() {
+  const cacheKey = "low_stock_reorder_count";
+  const cached = getDashboardCache(cacheKey, 60000);
+  if (cached) return cached;
+
+  try {
+    const res = await pool.query(`
+      WITH ws_stock AS (
+        SELECT 
+          COALESCE(p2.retail_master_product_id, p2.id) AS product_id,
+          SUM(s2.quantity) AS max_ws_qty
+        FROM stock s2
+        JOIN products p2 ON p2.id = s2.product_id
+        JOIN warehouses w2 ON w2.id = s2.warehouse_id
+        WHERE w2.name = 'المخزن الرئيسي'
+        GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
+      ),
+      retail_family_stock AS (
+        SELECT 
+          COALESCE(p3.retail_master_product_id, p3.id) AS product_id,
+          SUM(s3.quantity) AS retail_qty
+        FROM stock s3
+        JOIN products p3 ON p3.id = s3.product_id
+        JOIN warehouses w3 ON w3.id = s3.warehouse_id
+        WHERE w3.name = 'مخزن المعرض'
+        GROUP BY COALESCE(p3.retail_master_product_id, p3.id)
+      )
+      SELECT
+        COUNT(*) AS total_count,
+        COUNT(*) FILTER (WHERE COALESCE(rfs.retail_qty, s.quantity, 0) = 0) AS zero_count
+      FROM stock s
+      JOIN products p ON p.id = s.product_id
+      JOIN warehouses w ON w.id = s.warehouse_id
+      LEFT JOIN ws_stock ws ON ws.product_id = p.id
+      LEFT JOIN retail_family_stock rfs ON rfs.product_id = p.id
+      WHERE w.name = 'مخزن المعرض'
+        AND COALESCE(rfs.retail_qty, s.quantity, 0) >= 0 AND COALESCE(rfs.retail_qty, s.quantity, 0) <= 5
+        AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
+        AND p.is_active = true
+        AND p.retail_master_product_id IS NULL
+        AND (COALESCE(rfs.retail_qty, s.quantity, 0) > 0 OR COALESCE(ws.max_ws_qty, 0) > 0);
+    `);
+
+    const result = {
+      success: true,
+      totalCount: Number(res.rows[0]?.total_count || 0),
+      zeroCount: Number(res.rows[0]?.zero_count || 0),
+    };
+    setDashboardCache(cacheKey, result);
+    return result;
+  } catch (err) {
+    console.error("Error fetching low stock reorder count:", err);
+    return { success: true, totalCount: 0, zeroCount: 0 };
+  }
+}
+
 // ========== Dashboard Aggregate ==========
 app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
   try {
@@ -6838,47 +7060,173 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
     if (!branch_id || !invoice_type || !date) {
       return res.status(400).json({ error: "Missing parameters" });
     }
-    
-    const currentPort = process.env.PORT || 3001;
-    const baseUrl = `http://127.0.0.1:${currentPort}`;
-    const headers = { 
-       "Authorization": req.headers.authorization,
-       "Content-Type": "application/json"
-    };
-    
-    const requests = [
-      fetch(`${baseUrl}/invoices?invoice_type=${invoice_type}&date_from=${date}&date_to=${date}&_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => ({ data: [] })),
-      fetch(`${baseUrl}/dashboard/stats?invoice_type=${invoice_type}&_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => null),
-      fetch(`${baseUrl}/reports/low-stock-reorder-count?_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => null),
-      fetch(`${baseUrl}/stock-transfers/by-date?date=${date}&_t=${Date.now()}`, { headers }).then(r => r.json()).catch(() => ({ items: [] })),
-      fetch(`${baseUrl}/cash-in?branch_id=${branch_id}&from_date=${date}&to_date=${date}`, { headers }).then(r => r.json()).catch(() => []),
-      fetch(`${baseUrl}/cash/out?branch_id=${branch_id}&from_date=${date}&to_date=${date}`, { headers }).then(r => r.json()).catch(() => []),
-      fetch(`${baseUrl}/notifications/unread?limit=5`, { headers }).then(r => r.json()).catch(() => []),
-      String(branch_id) === "1" ? fetch(`${baseUrl}/invoices/wholesale/pending`, { headers }).then(r => r.json()).catch(() => []) : Promise.resolve([])
-    ];
+
+    const isAdmin = req.user?.username === "admin" || req.user?.role === "admin";
+    const effectiveBranchId = isAdmin
+      ? Number(branch_id || req.user?.branch_id || 1)
+      : Number(req.user?.branch_id || 1);
 
     const [
-      invoicesData,
+      invoicesRes,
       statsData,
       lowStockData,
-      transfersData,
-      cashInData,
-      cashOutData,
-      notificationsData,
-      pendingWholesaleData
-    ] = await Promise.all(requests);
+      transfersRes,
+      cashInRes,
+      cashOutRes,
+      notificationsRes,
+      pendingWholesaleRes,
+    ] = await Promise.all([
+      // 1. Invoices for date
+      pool.query(
+        `SELECT
+           id, invoice_type, movement_type, is_return, customer_name, customer_phone,
+           supplier_name, supplier_phone, subtotal, discount_total, total,
+           previous_balance, additional_amount, paid_amount, remaining_amount,
+           payment_status, invoice_date, created_at, created_by, created_by_name,
+           updated_by, updated_by_name, hidden_from_list, invoice_source,
+           external_order_id, whatsapp_status, notes
+         FROM invoices
+         WHERE invoice_type = $1
+           AND (COALESCE(hidden_from_list, false) = false)
+           AND COALESCE(invoice_date, created_at) >= $2::date
+           AND COALESCE(invoice_date, created_at) < ($2::date + INTERVAL '1 day')
+         ORDER BY id DESC
+         LIMIT 100`,
+        [invoice_type, date],
+      ).catch((err) => {
+        console.error("Dashboard Aggregate Invoices Error:", err);
+        return { rows: [] };
+      }),
+
+      // 2. Stats (with memory caching)
+      fetchDashboardStats(invoice_type).catch((err) => {
+        console.error("Dashboard Aggregate Stats Error:", err);
+        return null;
+      }),
+
+      // 3. Low stock count (with memory caching)
+      fetchLowStockReorderCount(),
+
+      // 4. Stock transfers for date
+      pool.query(
+        `SELECT
+           sti.id, sti.transfer_id, sti.product_id,
+           p.name AS product_name, p.manufacturer AS manufacturer,
+           p.wholesale_package AS wholesale_package,
+           sti.from_quantity, sti.to_quantity, sti.total_price,
+           fw.name AS from_warehouse, tw.name AS to_warehouse,
+           CASE WHEN st.status = 'cancelled' THEN 'cancelled' ELSE sti.status END AS status,
+           st.status AS transfer_status, st.created_at,
+           COALESCE(sti.received, false) AS received
+         FROM stock_transfer_items sti
+         JOIN stock_transfers st ON st.id = sti.transfer_id
+         JOIN products p ON p.id = sti.product_id
+         JOIN warehouses fw ON fw.id = sti.from_warehouse_id
+         JOIN warehouses tw ON tw.id = sti.to_warehouse_id
+         WHERE (st.created_at AT TIME ZONE 'Africa/Cairo')::date = $1::date
+         ORDER BY st.created_at ASC, sti.id ASC`,
+        [date],
+      ).catch((err) => {
+        console.error("Dashboard Aggregate Transfers Error:", err);
+        return { rows: [] };
+      }),
+
+      // 5. Cash In for date & branch
+      pool.query(
+        `SELECT
+           ci.id, ci.branch_id, ci.customer_name, ci.amount, ci.paid_amount,
+           ci.remaining_amount, COALESCE(ci.notes, ci.description) AS notes,
+           to_char(ci.transaction_date, 'YYYY-MM-DD') AS transaction_date,
+           ci.source_type, ci.invoice_id, ci.created_at,
+           inv.invoice_source, inv.external_order_id
+         FROM cash_in ci
+         LEFT JOIN invoices inv ON inv.id = ci.invoice_id
+         WHERE ci.branch_id = $1
+           AND ci.transaction_date = $2::date
+         ORDER BY ci.transaction_date DESC, ci.id DESC`,
+        [effectiveBranchId, date],
+      ).catch((err) => {
+        console.error("Dashboard Aggregate CashIn Error:", err);
+        return { rows: [] };
+      }),
+
+      // 6. Cash Out for date & branch
+      pool.query(
+        `SELECT
+           co.id, co.permission_number, co.name, co.amount, co.notes,
+           to_char(co.transaction_date, 'YYYY-MM-DD') AS transaction_date,
+           co.created_at, co.entry_type, co.supplier_id, s.name AS supplier_name
+         FROM cash_out co
+         LEFT JOIN suppliers s ON s.id = co.supplier_id
+         WHERE co.branch_id = $1
+           AND co.transaction_date = $2::date
+         ORDER BY co.transaction_date DESC, co.created_at DESC, co.id DESC
+         LIMIT 100`,
+        [effectiveBranchId, date],
+      ).catch((err) => {
+        console.error("Dashboard Aggregate CashOut Error:", err);
+        return { rows: [] };
+      }),
+
+      // 7. Notifications for branch
+      pool.query(
+        `SELECT n.id, n.title, n.message, n.type, n.reference_id, n.is_read, n.created_at
+         FROM notifications n
+         LEFT JOIN users u ON u.id = n.from_user_id
+         WHERE n.to_branch_id = $1
+           AND (u.branch_id != $1 OR u.branch_id IS NULL)
+         ORDER BY n.created_at DESC
+         LIMIT 10`,
+        [effectiveBranchId],
+      ).catch((err) => {
+        console.error("Dashboard Aggregate Notifications Error:", err);
+        return { rows: [] };
+      }),
+
+      // 8. Pending Wholesale (Branch 1 only)
+      effectiveBranchId === 1
+        ? pool.query(
+            `SELECT
+               id, invoice_type, movement_type, is_return, customer_name, customer_phone,
+               supplier_name, supplier_phone, subtotal, discount_total, total,
+               previous_balance, additional_amount, paid_amount, remaining_amount,
+               payment_status, invoice_date, created_at, created_by, created_by_name,
+               updated_by, updated_by_name, hidden_from_list, invoice_source,
+               external_order_id, notes
+             FROM invoices
+             WHERE invoice_type = 'wholesale'
+               AND payment_status != 'paid'
+               AND is_void IS NOT TRUE
+               AND (COALESCE(hidden_from_list, false) = false)
+             ORDER BY id DESC
+             LIMIT 50`,
+          ).catch((err) => {
+            console.error("Dashboard Aggregate Pending Wholesale Error:", err);
+            return { rows: [] };
+          })
+        : Promise.resolve({ rows: [] }),
+    ]);
 
     res.json({
-      invoices: invoicesData,
+      invoices: invoicesRes.rows || [],
       stats: statsData,
       lowStock: lowStockData,
-      transfers: transfersData,
-      cashIn: cashInData,
-      cashOut: cashOutData,
-      notifications: notificationsData,
-      pendingWholesale: pendingWholesaleData
+      transfers: {
+        date,
+        items_count: transfersRes.rows ? transfersRes.rows.length : 0,
+        items: transfersRes.rows || [],
+      },
+      cashIn: {
+        success: true,
+        data: cashInRes.rows || [],
+      },
+      cashOut: {
+        success: true,
+        data: cashOutRes.rows || [],
+      },
+      notifications: notificationsRes.rows || [],
+      pendingWholesale: pendingWholesaleRes.rows || [],
     });
-
   } catch (err) {
     console.error("Dashboard Aggregate Error:", err);
     res.status(500).json({ error: "Failed to aggregate dashboard data" });
@@ -6892,150 +7240,10 @@ app.get("/dashboard/stats", async (req, res) => {
     if (!invoice_type)
       return res.status(400).json({ error: "invoice_type مطلوب" });
 
-    const cacheKey = `dashboard_stats_${invoice_type}`;
-    const cached = _cache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < 30000) return res.json(cached.data);
-
-    const warehouseId = invoice_type === "retail" ? 1 : 2;
-
-    // Run queries in parallel
-    const [
-      salesToday,
-      cashToday,
-      lowStockCount,
-      negativeStockCount,
-      todayProfitSummary,
-      interBranchProfitSummary,
-    ] = await Promise.all([
-      // Today's sales total
-      pool.query(
-        `SELECT COALESCE(SUM(total), 0) AS total_sales, COUNT(*) AS count
-         FROM invoices
-         WHERE invoice_type = $1
-           AND movement_type = 'sale'
-           AND is_return = false
-           AND created_at >= CURRENT_DATE
-           AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-        [invoice_type],
-      ),
-      // Today's cash collected
-      pool.query(
-        `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
-         FROM invoices
-         WHERE invoice_type = $1
-           AND created_at >= CURRENT_DATE
-           AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
-        [invoice_type],
-      ),
-      // Low stock count (quantity <= 5)
-      pool.query(
-        `SELECT COUNT(DISTINCT product_id) AS count
-         FROM stock
-         WHERE warehouse_id = $1 AND quantity <= 5 AND quantity > 0`,
-        [warehouseId],
-      ),
-      // Negative stock count — calculated from stock_movements
-      pool.query(
-        `SELECT COUNT(*) AS count FROM (
-            SELECT sm.product_id
-            FROM stock_movements sm
-            JOIN products p ON p.id = sm.product_id
-            WHERE sm.warehouse_id = $1 AND p.is_active = true
-            GROUP BY sm.product_id, sm.variant_id
-            HAVING SUM(sm.quantity) < 0
-          ) neg`,
-        [warehouseId],
-      ),
-      // Today's profit percentage using the same logic as the invoice profit report (Proportional Distribution)
-      pool.query(
-        `WITH invoice_scope AS (
-           SELECT 
-             i.id AS invoice_id, 
-             i.branch_id, 
-             i.invoice_type, 
-             COALESCE(i.invoice_date::date, i.created_at::date) AS invoice_date, 
-             COALESCE(i.total, 0) AS invoice_total,
-             COALESCE(i.apply_items_discount, true) AS apply_items_discount
-           FROM invoices i
-           WHERE i.invoice_type = $1
-             AND i.movement_type = 'sale'
-             AND i.is_void IS NOT TRUE
-             AND COALESCE(i.invoice_date::date, i.created_at::date) = CURRENT_DATE
-         ),
-         invoice_items_scoped AS (
-           SELECT
-             ii.invoice_id,
-             ii.quantity, ii.price, ii.discount, ii.total, ii.is_return, ii.cost_price,
-             inv.branch_id, inv.invoice_type, inv.invoice_date, inv.invoice_total, inv.apply_items_discount,
-             p.purchase_price, p.retail_purchase_price,
-             CASE
-               WHEN COALESCE(inv.apply_items_discount, true) = false THEN
-                 CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
-                 ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
-               ELSE
-                 CASE WHEN COALESCE(ii.is_return, false)
-                   THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
-                 ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
-             END AS signed_item_total,
-             SUM(
-               CASE
-                 WHEN COALESCE(inv.apply_items_discount, true) = false THEN
-                   CASE WHEN COALESCE(ii.is_return, false) THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0))
-                   ELSE (COALESCE(ii.quantity, 0) * COALESCE(ii.price, 0)) END
-                 ELSE
-                   CASE WHEN COALESCE(ii.is_return, false)
-                     THEN -COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0)))
-                   ELSE COALESCE(ii.total, COALESCE(ii.quantity, 0) * (COALESCE(ii.price, 0) - COALESCE(ii.discount, 0))) END
-               END
-             ) OVER (PARTITION BY ii.invoice_id) AS invoice_items_total
-           FROM invoice_scope inv
-           JOIN invoice_items ii ON ii.invoice_id = inv.invoice_id
-           JOIN products p ON p.id = ii.product_id
-         )
-         SELECT
-           COALESCE(SUM(
-             CASE
-               WHEN iis.invoice_items_total = 0 THEN iis.signed_item_total
-               ELSE iis.signed_item_total - ((iis.invoice_items_total - iis.invoice_total) * (iis.signed_item_total / iis.invoice_items_total))
-             END
-           ), 0) AS sales_total,
-           COALESCE(SUM(
-             CASE WHEN COALESCE(iis.is_return, false) THEN 0
-             ELSE COALESCE(iis.quantity, 0) * COALESCE(iis.cost_price, CASE WHEN iis.invoice_type = 'retail' THEN COALESCE(iis.retail_purchase_price, iis.purchase_price, 0) ELSE COALESCE(iis.purchase_price, 0) END) END
-           ), 0) AS total_cost
-         FROM invoice_items_scoped iis`,
-        [invoice_type],
-      ),
-      // Today's inter-branch outbound profit
-      pool.query(
-        `SELECT COALESCE(SUM(total_value), 0) AS total_sales,
-                COALESCE(SUM(total_cost), 0) AS total_cost
-         FROM inter_branch_transfers
-         WHERE direction = 'outbound'
-           AND status IN ('in_transit', 'received')
-           AND created_at >= CURRENT_DATE
-           AND created_at < CURRENT_DATE + INTERVAL '1 day'`
-      ).catch(() => ({ rows: [{ total_sales: 0, total_cost: 0 }] })),
-    ]);
-
-    const todaySalesTotal = Number(todayProfitSummary.rows[0].sales_total || 0) + Number(interBranchProfitSummary.rows[0].total_sales || 0);
-    const todayTotalCost = Number(todayProfitSummary.rows[0].total_cost || 0) + Number(interBranchProfitSummary.rows[0].total_cost || 0);
-    const todayNetProfit = todaySalesTotal - todayTotalCost;
-    const todayProfitPercentage =
-      todaySalesTotal > 0 ? (todayNetProfit / todaySalesTotal) * 100 : 0;
-
-    const statsResult = {
-      today_sales: Number(salesToday.rows[0].total_sales),
-      today_invoices_count: Number(salesToday.rows[0].count),
-      today_cash: Number(cashToday.rows[0].total_cash),
-      low_stock_count: Number(lowStockCount.rows[0].count),
-      negative_stock_count: Number(negativeStockCount.rows[0].count),
-      today_profit_percentage: todayProfitPercentage,
-    };
-    _cache.set(cacheKey, { data: statsResult, ts: Date.now() });
-    res.json(statsResult);
+    const stats = await fetchDashboardStats(invoice_type);
+    res.json(stats);
   } catch (err) {
-    console.error(err);
+    console.error("GET /dashboard/stats ERROR:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
