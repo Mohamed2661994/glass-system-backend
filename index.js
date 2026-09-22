@@ -760,6 +760,8 @@ app.post("/admin/backup", (req, res) => {
       }
     } catch (e) {
       send(0, e.message, false, true);
+    } finally {
+      pruneLocalBackups(2);
     }
   });
 });
@@ -932,8 +934,37 @@ async function syncInvoiceCashEntry(
 /* ── Automatic Hourly Backup to Google Drive ── */
 let lastAutoBackup = null;
 
+function pruneLocalBackups(maxFiles = 2) {
+  try {
+    if (!fs.existsSync(BACKUP_DIR)) return;
+    const files = fs
+      .readdirSync(BACKUP_DIR)
+      .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
+      .map((f) => ({
+        name: f,
+        path: path.join(BACKUP_DIR, f),
+        time: fs.statSync(path.join(BACKUP_DIR, f)).mtime.getTime(),
+      }))
+      .sort((a, b) => b.time - a.time);
+
+    if (files.length > maxFiles) {
+      files.slice(maxFiles).forEach((f) => {
+        try {
+          fs.unlinkSync(f.path);
+          console.log(`🧹 Auto-prune: removed old local backup ${f.name}`);
+        } catch (e) {
+          console.warn(`Failed to unlink ${f.name}:`, e.message);
+        }
+      });
+    }
+  } catch (cleanErr) {
+    console.warn("⚠️ Local backup prune warning:", cleanErr.message);
+  }
+}
+
 async function autoBackupToDrive() {
   console.log("⏰ Auto-backup: starting hourly backup...");
+  let backupFile = null;
   try {
     if (!fs.existsSync(BACKUP_DIR)) {
       fs.mkdirSync(BACKUP_DIR, { recursive: true });
@@ -943,7 +974,7 @@ async function autoBackupToDrive() {
       const d = new Date();
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}_${String(d.getHours()).padStart(2, "0")}-00`;
     })();
-    const backupFile = path.join(BACKUP_DIR, `glass_system_${ts}.sql`);
+    backupFile = path.join(BACKUP_DIR, `glass_system_${ts}.sql`);
 
     const dbEnv = getDbEnv();
     const cmd = buildPgCmd(
@@ -963,49 +994,33 @@ async function autoBackupToDrive() {
     const sizeMB = (size / 1024 / 1024).toFixed(2);
     console.log(`⏰ Auto-backup: exported ${sizeMB} MB, uploading to Drive...`);
 
-    await uploadToDrive(backupFile);
-
-    lastAutoBackup = {
-      file: path.basename(backupFile),
-      sizeMB: parseFloat(sizeMB),
-      time: new Date().toISOString(),
-    };
-    cachedDriveBackup = {
-      file: path.basename(backupFile),
-      sizeMB: parseFloat(sizeMB),
-      time: new Date().toISOString(),
-      count: (cachedDriveBackup?.count || 0) + 1,
-      source: "google_drive",
-    };
-    lastDriveBackupFetchTime = Date.now();
-    console.log(
-      `✅ Auto-backup complete: ${lastAutoBackup.file} (${sizeMB} MB)`,
-    );
-
-    // 🧹 Auto-prune local backups: keep only the latest 2 files to protect disk space
     try {
-      const files = fs
-        .readdirSync(BACKUP_DIR)
-        .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
-        .map((f) => ({
-          name: f,
-          path: path.join(BACKUP_DIR, f),
-          time: fs.statSync(path.join(BACKUP_DIR, f)).mtime.getTime(),
-        }))
-        .sort((a, b) => b.time - a.time);
+      await uploadToDrive(backupFile);
 
-      if (files.length > 2) {
-        files.slice(2).forEach((f) => {
-          try {
-            fs.unlinkSync(f.path);
-          } catch (e) {}
-        });
-      }
-    } catch (cleanErr) {
-      console.warn("⚠️ Local backup prune warning:", cleanErr.message);
+      lastAutoBackup = {
+        file: path.basename(backupFile),
+        sizeMB: parseFloat(sizeMB),
+        time: new Date().toISOString(),
+      };
+      cachedDriveBackup = {
+        file: path.basename(backupFile),
+        sizeMB: parseFloat(sizeMB),
+        time: new Date().toISOString(),
+        count: (cachedDriveBackup?.count || 0) + 1,
+        source: "google_drive",
+      };
+      lastDriveBackupFetchTime = Date.now();
+      console.log(
+        `✅ Auto-backup complete: ${lastAutoBackup.file} (${sizeMB} MB)`,
+      );
+    } catch (uploadErr) {
+      console.error("❌ Auto-backup Drive upload failed:", uploadErr.message);
     }
   } catch (err) {
     console.error("❌ Auto-backup failed:", err.message);
+  } finally {
+    // 🧹 ALWAYS prune local backups to protect disk space regardless of upload status
+    pruneLocalBackups(2);
   }
 }
 
