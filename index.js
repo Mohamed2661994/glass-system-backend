@@ -12656,47 +12656,131 @@ app.get(
     try {
       const userId = req.user.id;
       const convId = Number(req.params.id);
+      const beforeId = req.query.before_id ? Number(req.query.before_id) : null;
+      const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 100);
 
-      const result = await pool.query(
-        `
-        WITH auth AS (
-          SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2
-        ),
-        marked AS (
-          UPDATE messages
-          SET is_read = true
-          WHERE conversation_id = $1 AND sender_id != $2 AND is_read = false AND EXISTS (SELECT 1 FROM auth)
-          RETURNING id
-        )
-        SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
-               m.type, m.file_url, m.reply_to_id,
-               u.username, u.full_name,
-               rm.content AS reply_content,
-               rm.sender_id AS reply_sender_id,
-               ru.full_name AS reply_sender_name,
-               rm.type AS reply_type
-        FROM messages m
-        JOIN users u ON u.id = m.sender_id
-        LEFT JOIN messages rm ON rm.id = m.reply_to_id
-        LEFT JOIN users ru ON ru.id = rm.sender_id
-        WHERE m.conversation_id = $1 AND EXISTS (SELECT 1 FROM auth)
-        ORDER BY m.created_at ASC
-        `,
-        [convId, userId],
-      );
+      let rows = [];
+      let hasMore = false;
 
-      // If no messages returned, check if user is unauthorized or if conversation is just empty
-      if (!result.rows.length) {
-        const participant = await pool.query(
-          "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+      if (beforeId) {
+        // Fetch older messages before a specific message ID (scroll-up / pagination)
+        const result = await pool.query(
+          `
+          WITH auth AS (
+            SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2
+          )
+          SELECT * FROM (
+            SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
+                   m.type, m.file_url, m.reply_to_id,
+                   u.username, u.full_name,
+                   rm.content AS reply_content,
+                   rm.sender_id AS reply_sender_id,
+                   ru.full_name AS reply_sender_name,
+                   rm.type AS reply_type
+            FROM messages m
+            JOIN users u ON u.id = m.sender_id
+            LEFT JOIN messages rm ON rm.id = m.reply_to_id
+            LEFT JOIN users ru ON ru.id = rm.sender_id
+            WHERE m.conversation_id = $1
+              AND m.id < $3
+              AND EXISTS (SELECT 1 FROM auth)
+            ORDER BY m.id DESC
+            LIMIT $4
+          ) sub
+          ORDER BY sub.id ASC
+          `,
+          [convId, userId, beforeId, limit],
+        );
+        rows = result.rows;
+
+        if (rows.length > 0) {
+          const oldestId = rows[0].id;
+          const moreCheck = await pool.query(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1 AND id < $2) AS has_more",
+            [convId, oldestId],
+          );
+          hasMore = Boolean(moreCheck.rows[0]?.has_more);
+        }
+      } else {
+        // Initial load: Smart 24h window + safety floor (latest 25 if inactive)
+        const result = await pool.query(
+          `
+          WITH auth AS (
+            SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2
+          ),
+          marked AS (
+            UPDATE messages
+            SET is_read = true
+            WHERE conversation_id = $1 AND sender_id != $2 AND is_read = false AND EXISTS (SELECT 1 FROM auth)
+            RETURNING id
+          ),
+          recent_24h AS (
+            SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
+                   m.type, m.file_url, m.reply_to_id,
+                   u.username, u.full_name,
+                   rm.content AS reply_content,
+                   rm.sender_id AS reply_sender_id,
+                   ru.full_name AS reply_sender_name,
+                   rm.type AS reply_type
+            FROM messages m
+            JOIN users u ON u.id = m.sender_id
+            LEFT JOIN messages rm ON rm.id = m.reply_to_id
+            LEFT JOIN users ru ON ru.id = rm.sender_id
+            WHERE m.conversation_id = $1
+              AND m.created_at >= NOW() - INTERVAL '24 HOURS'
+              AND EXISTS (SELECT 1 FROM auth)
+            ORDER BY m.created_at DESC
+            LIMIT 100
+          ),
+          fallback_latest AS (
+            SELECT m.id, m.content, m.sender_id, m.is_read, m.created_at,
+                   m.type, m.file_url, m.reply_to_id,
+                   u.username, u.full_name,
+                   rm.content AS reply_content,
+                   rm.sender_id AS reply_sender_id,
+                   ru.full_name AS reply_sender_name,
+                   rm.type AS reply_type
+            FROM messages m
+            JOIN users u ON u.id = m.sender_id
+            LEFT JOIN messages rm ON rm.id = m.reply_to_id
+            LEFT JOIN users ru ON ru.id = rm.sender_id
+            WHERE m.conversation_id = $1
+              AND EXISTS (SELECT 1 FROM auth)
+              AND NOT EXISTS (SELECT 1 FROM recent_24h)
+            ORDER BY m.created_at DESC
+            LIMIT 25
+          )
+          SELECT * FROM (
+            SELECT * FROM recent_24h
+            UNION ALL
+            SELECT * FROM fallback_latest
+          ) combined
+          ORDER BY id ASC
+          `,
           [convId, userId],
         );
-        if (!participant.rows.length) {
-          return res.status(403).json({ error: "غير مصرح" });
+        rows = result.rows;
+
+        // If no messages returned, check if user is unauthorized or if conversation is just empty
+        if (!rows.length) {
+          const participant = await pool.query(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2",
+            [convId, userId],
+          );
+          if (!participant.rows.length) {
+            return res.status(403).json({ error: "غير مصرح" });
+          }
+        } else {
+          const oldestId = rows[0].id;
+          const moreCheck = await pool.query(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1 AND id < $2) AS has_more",
+            [convId, oldestId],
+          );
+          hasMore = Boolean(moreCheck.rows[0]?.has_more);
         }
       }
 
-      res.json({ success: true, data: result.rows });
+      res.json({ success: true, data: rows, has_more: hasMore });
     } catch (err) {
       console.error("GET MESSAGES ERROR:", err);
       res.status(500).json({ error: "فشل تحميل الرسايل" });
