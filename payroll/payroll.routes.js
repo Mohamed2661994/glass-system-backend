@@ -36,4 +36,11 @@ router.get("/adjustments", controller.getAdjustments);
 router.post("/adjustments", controller.createAdjustment);
 router.delete("/adjustments/:id", requireAdmin, controller.deleteAdjustment);
 
+// 6. Attendance Routes (نظام الغياب والتحضير الأسبوعي)
+router.post("/attendance/toggle", requireAdmin, controller.toggleAttendance);
+
+// 7. Employee Audit Log & Ledger (كشف حساب وسجل حركات العامل الشامل)
+router.get("/employees/:id/ledger", controller.getEmployeeLedger);
+
 module.exports = router;
+

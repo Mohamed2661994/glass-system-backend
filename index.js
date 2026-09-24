@@ -13885,6 +13885,49 @@ async function runStartupMigrations() {
         CREATE INDEX IF NOT EXISTS idx_payroll_rec_branch ON payroll_records(branch_id, period_start);
       `,
     },
+    {
+      name: "payroll.attendance.and.indexes",
+      sql: `
+        CREATE TABLE IF NOT EXISTS payroll_adjustments (
+          id SERIAL PRIMARY KEY,
+          branch_id INTEGER NOT NULL REFERENCES branches(id),
+          employee_id INTEGER NOT NULL REFERENCES payroll_employees(id) ON DELETE CASCADE,
+          type VARCHAR(50) NOT NULL,
+          amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          adjustment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          reason TEXT,
+          status VARCHAR(20) NOT NULL DEFAULT 'pending',
+          payroll_record_id INTEGER,
+          created_by INTEGER,
+          created_by_name VARCHAR(100),
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_payroll_adj_branch ON payroll_adjustments(branch_id, status);
+        CREATE INDEX IF NOT EXISTS idx_payroll_adj_emp ON payroll_adjustments(employee_id, status);
+
+        CREATE TABLE IF NOT EXISTS payroll_attendance (
+          id SERIAL PRIMARY KEY,
+          branch_id INTEGER NOT NULL REFERENCES branches(id),
+          employee_id INTEGER NOT NULL REFERENCES payroll_employees(id) ON DELETE CASCADE,
+          attendance_date DATE NOT NULL,
+          status VARCHAR(20) NOT NULL DEFAULT 'absent',
+          day_rate NUMERIC(12, 2) NOT NULL DEFAULT 0,
+          adjustment_id INTEGER REFERENCES payroll_adjustments(id) ON DELETE SET NULL,
+          payroll_record_id INTEGER REFERENCES payroll_records(id) ON DELETE SET NULL,
+          notes TEXT,
+          created_by INTEGER,
+          created_by_name VARCHAR(100),
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          UNIQUE(employee_id, attendance_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_payroll_att_emp_date ON payroll_attendance(employee_id, attendance_date);
+        CREATE INDEX IF NOT EXISTS idx_payroll_att_branch_date ON payroll_attendance(branch_id, attendance_date);
+        CREATE INDEX IF NOT EXISTS idx_payroll_rec_emp ON payroll_records(employee_id, payment_status);
+        CREATE INDEX IF NOT EXISTS idx_payroll_adv_emp ON payroll_advances(employee_id, status);
+      `,
+    },
   ];
 
   for (const migration of migrations) {

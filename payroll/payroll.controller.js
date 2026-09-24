@@ -694,6 +694,36 @@ async function getPayrollSheet(req, res) {
       }
     }
 
+    // 3.b Fetch attendance records for these employees within the period window
+    const attendanceByEmp = {};
+    try {
+      const attRes = await pool.query(
+        `
+        SELECT id, branch_id, employee_id, attendance_date, status, day_rate, adjustment_id, notes
+        FROM payroll_attendance
+        WHERE branch_id = $1 AND employee_id = ANY($2) AND attendance_date >= $3 AND attendance_date <= $4
+        ORDER BY attendance_date ASC
+        `,
+        [branchId, empIds, periodStart, periodEnd],
+      );
+      for (const att of attRes.rows) {
+        if (!attendanceByEmp[att.employee_id]) attendanceByEmp[att.employee_id] = [];
+        const dateStr = att.attendance_date instanceof Date
+          ? att.attendance_date.toISOString().slice(0, 10)
+          : String(att.attendance_date).slice(0, 10);
+        attendanceByEmp[att.employee_id].push({
+          id: att.id,
+          date: dateStr,
+          status: att.status,
+          day_rate: Number(att.day_rate || 0),
+          adjustment_id: att.adjustment_id,
+          notes: att.notes,
+        });
+      }
+    } catch (attErr) {
+      console.warn("payroll_attendance query note:", attErr.message);
+    }
+
     // 4. Build sheet rows
     const sheetRows = employees.map((emp) => {
       const empAdvances = advancesByEmp[emp.id] || [];
@@ -702,6 +732,16 @@ async function getPayrollSheet(req, res) {
 
       const paidRecord = paidByEmp[emp.id];
       const isPaid = Boolean(paidRecord);
+
+      // Attendance data for this employee
+      const empAttendance = attendanceByEmp[emp.id] || [];
+      const absentDaysCount = empAttendance.filter((a) => a.status === "absent").length;
+      const dailyRate = emp.salary_type === "weekly"
+        ? Math.round((baseSalary / 6.0) * 100) / 100
+        : (emp.salary_type === "monthly" ? Math.round((baseSalary / 30.0) * 100) / 100 : baseSalary);
+      const calculatedDaysWorked = emp.salary_type === "weekly" || emp.salary_type === "daily"
+        ? Math.max(0, 6 - absentDaysCount)
+        : (emp.salary_type === "monthly" ? Math.max(0, 30 - absentDaysCount) : 0);
 
       // Adjustments list & calculated sums
       const empPendingAdjustments = adjustmentsByEmp[emp.id] || [];
@@ -741,7 +781,10 @@ async function getPayrollSheet(req, res) {
         job_title: emp.job_title,
         salary_type: emp.salary_type,
         base_salary: isPaid ? Number(paidRecord.base_amount || baseSalary) : baseSalary,
-        days_worked: isPaid ? Number(paidRecord.days_worked || (emp.salary_type === "daily" ? 6 : 0)) : (emp.salary_type === "daily" ? 6 : 0),
+        daily_rate: dailyRate,
+        days_worked: isPaid ? Number(paidRecord.days_worked || calculatedDaysWorked) : calculatedDaysWorked,
+        absent_days_count: absentDaysCount,
+        attendance_list: empAttendance,
         overtime_amount: overtimeAmount,
         bonus_amount: bonusAmount,
         deductions_amount: deductionsAmount,
@@ -1006,6 +1049,20 @@ async function confirmPayrollPayout(req, res) {
           [payrollRecord.id, empId, safeBranchId, safeEnd],
         );
       }
+
+      // 5. Link attendance records for this period to this payroll record
+      try {
+        await client.query(
+          `
+          UPDATE payroll_attendance 
+          SET payroll_record_id = $1, updated_at = NOW() 
+          WHERE employee_id = $2 AND branch_id = $3 AND attendance_date >= $4 AND attendance_date <= $5
+          `,
+          [payrollRecord.id, empId, safeBranchId, safeStart, safeEnd],
+        );
+      } catch (attErr) {
+        console.warn("payroll_attendance payout link note:", attErr.message);
+      }
     }
 
     await client.query("COMMIT");
@@ -1104,6 +1161,16 @@ async function revertPayrollRecord(req, res) {
       [recordId],
     );
 
+    // 1.c Revert linked attendance back
+    try {
+      await client.query(
+        "UPDATE payroll_attendance SET payroll_record_id = NULL, updated_at = NOW() WHERE payroll_record_id = $1",
+        [recordId],
+      );
+    } catch (attErr) {
+      console.warn("payroll_attendance revert note:", attErr.message);
+    }
+
     // 2. Delete linked cash_out row if exists
     if (record.cash_out_id) {
       await client.query("DELETE FROM cash_out WHERE id = $1", [record.cash_out_id]);
@@ -1132,6 +1199,453 @@ async function revertPayrollRecord(req, res) {
   }
 }
 
+/**
+ * POST /payroll/attendance/toggle
+ * Toggles employee attendance for a specific date (absent vs present)
+ * Body: { branch_id, employee_id, attendance_date, status: "absent" | "present", notes }
+ */
+async function toggleAttendance(req, res) {
+  const client = await pool.connect();
+  try {
+    const { branch_id, employee_id, attendance_date, status = "absent", notes = "" } = req.body;
+    const safeBranchId = Number(branch_id);
+    const empId = Number(employee_id);
+    const dateStr = String(attendance_date || "").slice(0, 10);
+    const targetStatus = status === "absent" ? "absent" : "present";
+
+    if (!safeBranchId || !empId || !dateStr) {
+      return res.status(400).json({ error: "بيانات تسجيل الحضور والغياب غير مكتملة" });
+    }
+
+    // 1. Fetch employee
+    const empRes = await client.query(
+      "SELECT id, name, salary_type, base_salary, status, branch_id FROM payroll_employees WHERE id = $1",
+      [empId],
+    );
+    if (empRes.rows.length === 0) {
+      return res.status(404).json({ error: "العامل غير موجود" });
+    }
+    const emp = empRes.rows[0];
+
+    // 2. Check if period covering this date is already paid
+    const paidCheck = await client.query(
+      `
+      SELECT pr.id, pr.period_start, pr.period_end, pr.paid_at
+      FROM payroll_records pr
+      LEFT JOIN cash_out co ON pr.cash_out_id = co.id
+      WHERE pr.branch_id = $1 AND pr.employee_id = $2 AND pr.payment_status = 'paid'
+        AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
+        AND pr.period_start <= $3 AND pr.period_end >= $3
+      LIMIT 1
+      `,
+      [safeBranchId, empId, dateStr],
+    );
+    if (paidCheck.rows.length > 0) {
+      return res.status(400).json({
+        error: `تم اعتماد وصرف مسير راتب هذا العامل بالفعل للفترة التي تشمل تاريخ ${dateStr}. لا يمكن تعديل الغياب بأثر رجعي.`,
+      });
+    }
+
+    // 3. Calculate daily rate on server (Base / 6 for weekly)
+    const baseSalary = Number(emp.base_salary || 0);
+    let dayRate = 0;
+    if (emp.salary_type === "weekly") {
+      dayRate = Math.round((baseSalary / 6.0) * 100) / 100;
+    } else if (emp.salary_type === "monthly") {
+      dayRate = Math.round((baseSalary / 30.0) * 100) / 100;
+    } else {
+      // daily
+      dayRate = baseSalary;
+    }
+
+    // Arabic day name helper
+    const daysArabic = ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
+    const dObj = new Date(dateStr + "T12:00:00");
+    const dayName = isNaN(dObj.getTime()) ? "" : daysArabic[dObj.getDay()];
+
+    // Friday Protection: Friday is the official paid weekly holiday; deductions are forbidden
+    if (dObj.getDay() === 5 && emp.salary_type === "weekly" && targetStatus === "absent") {
+      return res.status(400).json({
+        error: "يوم الجمعة إجازة أسبوعية رسمية مدفوعة ولا يجوز تسجيل غياب أو تطبيق خصم فيه.",
+      });
+    }
+
+    const user = req.user || {};
+    const createdBy = user.id || null;
+    const createdByName = user.full_name || user.username || "الإدارة";
+
+    await client.query("BEGIN");
+
+    // Check existing attendance record
+    const existRes = await client.query(
+      "SELECT id, status, adjustment_id FROM payroll_attendance WHERE employee_id = $1 AND attendance_date = $2",
+      [empId, dateStr],
+    );
+    const existing = existRes.rows[0];
+
+    if (targetStatus === "absent") {
+      // If already absent, return early
+      if (existing && existing.status === "absent") {
+        await client.query("COMMIT");
+        return res.json({ success: true, message: "العامل مسجل غياب بالفعل لهذا اليوم", status: "absent", day_rate: dayRate });
+      }
+
+      // Create linked adjustment deduction
+      const reasonText = `خصم غياب يوم ${dayName ? dayName + " " : ""}(${dateStr}) - أسبوعية`;
+      const adjRes = await client.query(
+        `
+        INSERT INTO payroll_adjustments 
+          (branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by, created_by_name)
+        VALUES ($1, $2, 'deduction', $3, $4, $5, 'pending', $6, $7)
+        RETURNING id
+        `,
+        [safeBranchId, empId, dayRate, dateStr, reasonText, createdBy, createdByName],
+      );
+      const adjustmentId = adjRes.rows[0].id;
+
+      // Upsert into payroll_attendance
+      await client.query(
+        `
+        INSERT INTO payroll_attendance
+          (branch_id, employee_id, attendance_date, status, day_rate, adjustment_id, notes, created_by, created_by_name)
+        VALUES ($1, $2, $3, 'absent', $4, $5, $6, $7, $8)
+        ON CONFLICT (employee_id, attendance_date)
+        DO UPDATE SET 
+          status = 'absent', 
+          day_rate = EXCLUDED.day_rate, 
+          adjustment_id = EXCLUDED.adjustment_id, 
+          notes = EXCLUDED.notes,
+          updated_at = NOW()
+        `,
+        [safeBranchId, empId, dateStr, dayRate, adjustmentId, notes || reasonText, createdBy, createdByName],
+      );
+    } else {
+      // Revert to "present"
+      if (existing && existing.adjustment_id) {
+        // Delete pending linked adjustment
+        await client.query(
+          "DELETE FROM payroll_adjustments WHERE id = $1 AND status = 'pending'",
+          [existing.adjustment_id],
+        );
+      }
+      // Delete attendance row
+      await client.query(
+        "DELETE FROM payroll_attendance WHERE employee_id = $1 AND attendance_date = $2",
+        [empId, dateStr],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    const broadcast = req.app?.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("data:payroll", {
+        action: "attendance_updated",
+        branch_id: safeBranchId,
+        employee_id: empId,
+        date: dateStr,
+        status: targetStatus,
+        ts: Date.now(),
+      });
+    }
+
+    res.json({
+      success: true,
+      status: targetStatus,
+      day_rate: dayRate,
+      message: targetStatus === "absent" ? `تم تسجيل غياب العامل وخصم ${dayRate} ج` : "تم إلغاء الغياب واسترجاع اليومية",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("toggleAttendance error:", err);
+    res.status(500).json({ error: "فشل في تحديث حالة الحضور والغياب", details: err.message });
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * GET /payroll/employees/:id/ledger?branch_id=1&from=YYYY-MM-DD&to=YYYY-MM-DD
+ * Comprehensive audit trail, ledger, and transaction history for an individual employee
+ */
+async function getEmployeeLedger(req, res) {
+  try {
+    const empId = Number(req.params.id);
+    const branchId = Number(req.query.branch_id) || null;
+    const fromDate = req.query.from || null;
+    const toDate = req.query.to || null;
+
+    if (!empId) {
+      return res.status(400).json({ error: "معرف العامل غير صحيح" });
+    }
+
+    // 1. Fetch employee profile
+    const empRes = await pool.query(
+      `
+      SELECT e.*, b.name as branch_name
+      FROM payroll_employees e
+      LEFT JOIN branches b ON e.branch_id = b.id
+      WHERE e.id = $1
+      `,
+      [empId],
+    );
+    if (empRes.rows.length === 0) {
+      return res.status(404).json({ error: "العامل غير موجود" });
+    }
+    const employee = empRes.rows[0];
+
+    // 2. Aggregated Summary Statistics
+    const [payoutsStats, advancesStats, absenceStats, adjStats] = await Promise.all([
+      // Total net payouts
+      pool.query(
+        `
+        SELECT 
+          COALESCE(SUM(pr.net_amount), 0) as total_net_paid,
+          COALESCE(SUM(pr.base_amount), 0) as total_base_paid,
+          COALESCE(SUM(pr.overtime_amount), 0) as total_overtime_paid,
+          COALESCE(SUM(pr.bonus_amount), 0) as total_bonus_paid,
+          COALESCE(SUM(pr.deductions_amount), 0) as total_deductions_paid,
+          COALESCE(SUM(pr.advances_deducted), 0) as total_advances_settled,
+          COUNT(pr.id) as count_payouts
+        FROM payroll_records pr
+        LEFT JOIN cash_out co ON pr.cash_out_id = co.id
+        WHERE pr.employee_id = $1 AND pr.payment_status = 'paid'
+          AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
+        `,
+        [empId],
+      ),
+      // Advances stats
+      pool.query(
+        `
+        SELECT 
+          COALESCE(SUM(amount), 0) as total_advances_taken,
+          COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END), 0) as pending_advances,
+          COALESCE(SUM(CASE WHEN status = 'deducted' THEN amount ELSE 0 END), 0) as deducted_advances,
+          COUNT(id) as count_advances
+        FROM payroll_advances
+        WHERE employee_id = $1
+        `,
+        [empId],
+      ),
+      // Absences stats
+      pool.query(
+        `
+        SELECT 
+          COUNT(id) as count_absences,
+          COALESCE(SUM(day_rate), 0) as total_absence_amount
+        FROM payroll_attendance
+        WHERE employee_id = $1 AND status = 'absent'
+        `,
+        [empId],
+      ),
+      // Active pending adjustments stats
+      pool.query(
+        `
+        SELECT 
+          COALESCE(SUM(CASE WHEN type IN ('bonus', 'overtime') THEN amount ELSE 0 END), 0) as pending_bonuses,
+          COALESCE(SUM(CASE WHEN type = 'deduction' THEN amount ELSE 0 END), 0) as pending_deductions
+        FROM payroll_adjustments
+        WHERE employee_id = $1 AND status = 'pending'
+        `,
+        [empId],
+      ),
+    ]);
+
+    const summary = {
+      total_net_paid: Number(payoutsStats.rows[0]?.total_net_paid || 0),
+      total_base_paid: Number(payoutsStats.rows[0]?.total_base_paid || 0),
+      total_overtime_paid: Number(payoutsStats.rows[0]?.total_overtime_paid || 0),
+      total_bonus_paid: Number(payoutsStats.rows[0]?.total_bonus_paid || 0),
+      total_deductions_paid: Number(payoutsStats.rows[0]?.total_deductions_paid || 0),
+      total_advances_settled: Number(payoutsStats.rows[0]?.total_advances_settled || 0),
+      count_payouts: Number(payoutsStats.rows[0]?.count_payouts || 0),
+
+      total_advances_taken: Number(advancesStats.rows[0]?.total_advances_taken || 0),
+      pending_advances: Number(advancesStats.rows[0]?.pending_advances || 0),
+      count_advances: Number(advancesStats.rows[0]?.count_advances || 0),
+
+      count_absences: Number(absenceStats.rows[0]?.count_absences || 0),
+      total_absence_amount: Number(absenceStats.rows[0]?.total_absence_amount || 0),
+
+      pending_bonuses: Number(adjStats.rows[0]?.pending_bonuses || 0),
+      pending_deductions: Number(adjStats.rows[0]?.pending_deductions || 0),
+    };
+
+    // 3. Transactions / Audit Trail
+    const [payoutsRes, advsRes, attsRes, adjsRes] = await Promise.all([
+      pool.query(
+        `
+        SELECT 
+          pr.id, 'payout' as tx_type, pr.net_amount as amount, pr.paid_at as tx_date,
+          CONCAT('صرف مسير راتب (', pr.cycle_type, ') عن الفترة ', pr.period_start, ' إلى ', pr.period_end) as description,
+          co.permission_number, pr.paid_by_name as actor_name, pr.payment_status as status,
+          pr.notes,
+          pr.base_amount, pr.days_worked, pr.overtime_amount, pr.bonus_amount, pr.deductions_amount, pr.advances_deducted
+        FROM payroll_records pr
+        LEFT JOIN cash_out co ON pr.cash_out_id = co.id
+        WHERE pr.employee_id = $1 AND pr.payment_status = 'paid'
+          AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
+        ORDER BY pr.paid_at DESC
+        `,
+        [empId],
+      ),
+      pool.query(
+        `
+        SELECT 
+          pa.id, 'advance' as tx_type, pa.amount, pa.advance_date as tx_date,
+          COALESCE(pa.notes, 'سلفة نقدية للعامل') as description,
+          co.permission_number, pa.created_by_name as actor_name, pa.status,
+          pa.notes
+        FROM payroll_advances pa
+        LEFT JOIN cash_out co ON pa.cash_out_id = co.id
+        WHERE pa.employee_id = $1
+        ORDER BY pa.advance_date DESC, pa.id DESC
+        `,
+        [empId],
+      ),
+      pool.query(
+        `
+        SELECT 
+          att.id, 'absence' as tx_type, att.day_rate as amount, att.attendance_date as tx_date,
+          COALESCE(att.notes, CONCAT('تسجيل غياب يوم ', att.attendance_date)) as description,
+          NULL as permission_number, att.created_by_name as actor_name, att.status,
+          att.notes
+        FROM payroll_attendance att
+        WHERE att.employee_id = $1 AND att.status = 'absent'
+        ORDER BY att.attendance_date DESC, att.id DESC
+        `,
+        [empId],
+      ),
+      pool.query(
+        `
+        SELECT 
+          padj.id, padj.type as tx_type, padj.amount, padj.adjustment_date as tx_date,
+          COALESCE(padj.reason, padj.type) as description,
+          NULL as permission_number, padj.created_by_name as actor_name, padj.status,
+          padj.reason as notes
+        FROM payroll_adjustments padj
+        WHERE padj.employee_id = $1
+          AND (padj.reason NOT LIKE 'خصم غياب%' OR padj.reason IS NULL)
+        ORDER BY padj.adjustment_date DESC, padj.id DESC
+        `,
+        [empId],
+      ),
+    ]);
+
+    const transactions = [];
+
+    // Map payouts
+    for (const r of payoutsRes.rows) {
+      transactions.push({
+        id: `payout-${r.id}`,
+        record_id: r.id,
+        tx_type: "payout",
+        category: "راتب",
+        amount: Number(r.amount || 0),
+        tx_date: r.tx_date instanceof Date ? r.tx_date.toISOString().slice(0, 10) : String(r.tx_date).slice(0, 10),
+        raw_timestamp: r.tx_date,
+        description: r.description,
+        permission_number: r.permission_number || null,
+        actor_name: r.actor_name || "الإدارة",
+        status: r.status,
+        notes: r.notes || "",
+        breakdown: {
+          base: Number(r.base_amount || 0),
+          days_worked: Number(r.days_worked || 0),
+          overtime: Number(r.overtime_amount || 0),
+          bonus: Number(r.bonus_amount || 0),
+          deductions: Number(r.deductions_amount || 0),
+          advances_deducted: Number(r.advances_deducted || 0),
+        },
+      });
+    }
+
+    // Map advances
+    for (const r of advsRes.rows) {
+      transactions.push({
+        id: `adv-${r.id}`,
+        record_id: r.id,
+        tx_type: "advance",
+        category: "سلفة",
+        amount: Number(r.amount || 0),
+        tx_date: r.tx_date instanceof Date ? r.tx_date.toISOString().slice(0, 10) : String(r.tx_date).slice(0, 10),
+        raw_timestamp: r.tx_date,
+        description: r.description,
+        permission_number: r.permission_number || null,
+        actor_name: r.actor_name || "الإدارة",
+        status: r.status,
+        notes: r.notes || "",
+      });
+    }
+
+    // Map absences
+    for (const r of attsRes.rows) {
+      transactions.push({
+        id: `att-${r.id}`,
+        record_id: r.id,
+        tx_type: "absence",
+        category: "غياب",
+        amount: Number(r.amount || 0),
+        tx_date: r.tx_date instanceof Date ? r.tx_date.toISOString().slice(0, 10) : String(r.tx_date).slice(0, 10),
+        raw_timestamp: r.tx_date,
+        description: r.description,
+        permission_number: null,
+        actor_name: r.actor_name || "الإدارة",
+        status: r.status,
+        notes: r.notes || "",
+      });
+    }
+
+    // Map other adjustments (bonus, overtime, deduction)
+    for (const r of adjsRes.rows) {
+      transactions.push({
+        id: `adj-${r.id}`,
+        record_id: r.id,
+        tx_type: r.tx_type,
+        category: r.tx_type === "bonus" ? "مكافأة" : r.tx_type === "overtime" ? "إضافي" : "خصم",
+        amount: Number(r.amount || 0),
+        tx_date: r.tx_date instanceof Date ? r.tx_date.toISOString().slice(0, 10) : String(r.tx_date).slice(0, 10),
+        raw_timestamp: r.tx_date,
+        description: r.description,
+        permission_number: null,
+        actor_name: r.actor_name || "الإدارة",
+        status: r.status,
+        notes: r.notes || "",
+      });
+    }
+
+    // Sort all transactions chronologically descending
+    transactions.sort((a, b) => {
+      const dateA = new Date(a.raw_timestamp || a.tx_date).getTime();
+      const dateB = new Date(b.raw_timestamp || b.tx_date).getTime();
+      return dateB - dateA;
+    });
+
+    res.json({
+      success: true,
+      employee: {
+        id: employee.id,
+        name: employee.name,
+        phone: employee.phone,
+        national_id: employee.national_id,
+        job_title: employee.job_title,
+        salary_type: employee.salary_type,
+        base_salary: Number(employee.base_salary || 0),
+        status: employee.status,
+        hire_date: employee.hire_date,
+        branch_id: employee.branch_id,
+        branch_name: employee.branch_name,
+        notes: employee.notes,
+      },
+      summary,
+      transactions,
+    });
+  } catch (err) {
+    console.error("getEmployeeLedger error:", err);
+    res.status(500).json({ error: "فشل في جلب كشف حساب العامل", details: err.message });
+  }
+}
+
 module.exports = {
   getEmployees,
   createEmployee,
@@ -1146,4 +1660,6 @@ module.exports = {
   confirmPayrollPayout,
   getPayrollHistory,
   revertPayrollRecord,
+  toggleAttendance,
+  getEmployeeLedger,
 };

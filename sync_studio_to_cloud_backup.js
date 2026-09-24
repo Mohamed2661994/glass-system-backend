@@ -299,7 +299,8 @@ async function runBackupSync(options = {}) {
         'invoices', 'invoice_items', 'cash_in', 'cash_out',
         'customers', 'customer_phones', 'stock_movements',
         'stock_transfers', 'stock_transfer_items', 'messages',
-        'notifications', 'user_activity', 'payroll_advances'
+        'notifications', 'user_activity', 'payroll_advances',
+        'payroll_records', 'payroll_adjustments', 'payroll_attendance'
       ];
 
       for (const t of activeTables) {
