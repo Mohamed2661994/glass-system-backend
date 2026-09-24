@@ -103,6 +103,10 @@ function getCairoDate() {
 }
 
 const app = express();
+
+// 🛡️ Pre-Flight: Enable trust proxy for Nginx reverse proxy so req.ip and rate limiting work accurately
+app.set("trust proxy", 1);
+
 app.use(
   cors({
     origin: [
@@ -124,12 +128,32 @@ app.use(
 app.use(express.json({ limit: "50mb" }));
 app.use("/assets", express.static(path.join(__dirname, "assets")));
 
+// 🛡️ Rate Limiter for Login Endpoint (express-rate-limit with trust-proxy & built-in IPv6 normalization)
+const { rateLimit } = require("express-rate-limit");
+const loginLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,             // 10 attempts per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: "تم تجاوز الحد المسموح من محاولات الدخول، يرجى الانتظار لمدة دقيقة والمحاولة مجدداً.",
+  },
+});
+
+// 🛡️ Admin Role Authorization Middleware
+function requireAdminRole(req, res, next) {
+  if (!req.user || req.user.role !== "admin") {
+    return res.status(403).json({ error: "غير مصرح - يتطلب صلاحيات المدير العام (Admin only)" });
+  }
+  next();
+}
+
 // Global auth middleware — protects ALL routes except public ones
 const PUBLIC_PATHS = [
   "/login",
   "/health",
   "/public",
-  "/admin",
   "/integrations",
   "/chat/media",
   "/api/inter-branch/webhook",
@@ -350,7 +374,7 @@ app.get("/health", async (req, res) => {
 });
 
 /* ── Admin: Switch Active DB ── */
-app.post("/admin/switch-db", async (req, res) => {
+app.post("/admin/switch-db", requireAdminRole, async (req, res) => {
   try {
     const target = req.body.target; // "local" | "cloud"
     if (!target || !["local", "cloud"].includes(target)) {
@@ -383,7 +407,7 @@ app.post("/admin/switch-db", async (req, res) => {
 });
 
 /* ── Admin: Trigger Sync ── */
-app.post("/admin/sync", async (req, res) => {
+app.post("/admin/sync", requireAdminRole, async (req, res) => {
   try {
     const result = await syncBetweenPools({ trigger: "manual" });
     res.json(result);
@@ -393,7 +417,7 @@ app.post("/admin/sync", async (req, res) => {
 });
 
 /* ── Admin: Read recent sync logs ── */
-app.get("/admin/sync-logs", (req, res) => {
+app.get("/admin/sync-logs", requireAdminRole, (req, res) => {
   try {
     const limit = Number(req.query.limit) || 100;
     const logs = getSyncLogs(limit);
@@ -705,7 +729,7 @@ async function uploadToDrive(filePath) {
 }
 
 /* ── Admin: Manual Backup (SSE progress) ── */
-app.post("/admin/backup", (req, res) => {
+app.post("/admin/backup", requireAdminRole, (req, res) => {
   const send = setupSSE(res);
   send(5, "جاري تجهيز الباك أب...");
 
@@ -1029,7 +1053,7 @@ setTimeout(() => autoBackupToDrive(), 2 * 60 * 1000);
 setInterval(() => autoBackupToDrive(), 60 * 60 * 1000);
 
 /* ── Admin: Restore from Google Drive → local DB (SSE progress) ── */
-app.post("/admin/restore", async (req, res) => {
+app.post("/admin/restore", requireAdminRole, async (req, res) => {
   const send = setupSSE(res);
 
   try {
@@ -7666,7 +7690,7 @@ app.post("/admin/opening-stock", async (req, res) => {
 });
 
 // مسح جميع الأصناف
-app.delete("/admin/products/all", async (req, res) => {
+app.delete("/admin/products/all", requireAdminRole, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -12185,7 +12209,7 @@ app.get("/system/backup/download/:file", authMiddleware, (req, res) => {
 
 const jwt = require("jsonwebtoken");
 
-app.post("/login", async (req, res) => {
+app.post("/login", loginLimiter, async (req, res) => {
   try {
     
 
