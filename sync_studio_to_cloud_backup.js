@@ -18,6 +18,7 @@ const cloudBackupPool = new Pool({
   user: process.env.BACKUP_DB_USER || 'glass_admin',
   password: process.env.BACKUP_DB_PASSWORD || '@Hadysalah1',
   database: process.env.BACKUP_DB_NAME || 'glass_system',
+  ssl: process.env.BACKUP_DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
   max: 3,
   connectionTimeoutMillis: 15000
 });

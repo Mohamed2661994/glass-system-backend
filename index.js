@@ -159,6 +159,28 @@ const PUBLIC_PATHS = [
   "/api/inter-branch/webhook",
 ];
 const jwt_auth = require("jsonwebtoken");
+const JWT_SECRET = process.env.JWT_SECRET || "glass_system_super_secret_2026";
+const JWT_FALLBACK_SECRET = process.env.JWT_FALLBACK_SECRET || "glass_system_super_secret_2026";
+
+/**
+ * 🛡️ Dual-Secret JWT Verification with Grace-Period Fallback
+ * Verifies with primary active JWT_SECRET; if signature fails, falls back to JWT_FALLBACK_SECRET.
+ */
+function verifyJwtToken(token) {
+  try {
+    return jwt_auth.verify(token, JWT_SECRET);
+  } catch (primaryErr) {
+    if (JWT_FALLBACK_SECRET && JWT_FALLBACK_SECRET !== JWT_SECRET) {
+      try {
+        return jwt_auth.verify(token, JWT_FALLBACK_SECRET);
+      } catch (fallbackErr) {
+        throw primaryErr;
+      }
+    }
+    throw primaryErr;
+  }
+}
+
 app.use((req, res, next) => {
   // Allow public paths
   if (PUBLIC_PATHS.some((p) => req.path === p || req.path.startsWith(p + "/")))
@@ -173,7 +195,7 @@ app.use((req, res, next) => {
   if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
   const token = authHeader.split(" ")[1];
   try {
-    const decoded = jwt_auth.verify(token, process.env.JWT_SECRET);
+    const decoded = verifyJwtToken(token);
     req.user = decoded;
     next();
   } catch (err) {
@@ -12241,8 +12263,8 @@ app.post("/login", loginLimiter, async (req, res) => {
         role,
         permissions,
       },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" },
+      JWT_SECRET,
+      { expiresIn: "24h" },
     );
 
     res.json({
@@ -12314,6 +12336,7 @@ app.get("/user-activity", authMiddleware, async (req, res) => {
 });
 
 function authMiddleware(req, res, next) {
+  if (req.user) return next();
   const authHeader = req.headers.authorization;
 
   if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
@@ -12321,7 +12344,7 @@ function authMiddleware(req, res, next) {
   const token = authHeader.split(" ")[1];
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = verifyJwtToken(token);
     req.user = decoded;
     next();
   } catch (err) {
@@ -13592,10 +13615,7 @@ io.use((socket, next) => {
   // 2. User JWT token authentication
   if (token) {
     try {
-      const decoded = jwt_auth.verify(
-        token,
-        process.env.JWT_SECRET || "glass_system_super_secret_2026",
-      );
+      const decoded = verifyJwtToken(token);
       socket.user = decoded;
       socket.userId = decoded.id;
       socket.branchId = decoded.branch_id;

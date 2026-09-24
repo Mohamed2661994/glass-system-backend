@@ -50,8 +50,8 @@ conn.on('ready', () => {
     });
   });
 }).connect({
-  host: '34.45.246.123',
-  port: 22,
-  username: 'root',
-  password: '@Hadysalah1'
+  host: process.env.VPS_SSH_HOST || '34.45.246.123',
+  port: Number(process.env.VPS_SSH_PORT || 22),
+  username: process.env.VPS_SSH_USER || 'root',
+  password: process.env.VPS_SSH_PASSWORD,
 });
