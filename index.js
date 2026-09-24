@@ -9884,9 +9884,15 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
         co.created_at,
         co.entry_type,
         co.supplier_id,
-        s.name AS supplier_name
+        s.name AS supplier_name,
+        COALESCE(pe_rec.job_title, pe_adv.job_title) AS employee_job_title,
+        COALESCE(pe_rec.name, pe_adv.name) AS employee_name
       FROM cash_out co
       LEFT JOIN suppliers s ON s.id = co.supplier_id
+      LEFT JOIN payroll_records pr ON pr.cash_out_id = co.id
+      LEFT JOIN payroll_employees pe_rec ON pe_rec.id = pr.employee_id
+      LEFT JOIN payroll_advances pa ON pa.cash_out_id = co.id
+      LEFT JOIN payroll_employees pe_adv ON pe_adv.id = pa.employee_id
       WHERE ${conditions.join(" AND ")}
       ORDER BY co.transaction_date DESC, co.created_at DESC, co.id DESC
       LIMIT $${idx++} OFFSET $${idx++}
