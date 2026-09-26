@@ -22,7 +22,8 @@ const QUAZLINK_CONFIG = {
   apiKey: process.env.QUAZLINK_API_KEY || 'ql_live_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI4MzJiOWQxMS04MmI3LTQzN2EtOGY3ZC0zYjljNjUyNDE0NDEiLCJ0eXBlIjoiYXBpX2tleSIsImlhdCI6MTc4OTY0OTEzMSwiZXhwIjoyMTA1MDA5MTMxfQ.D_EJgbJQvaAtUeQA-isNo0h6ec4jITzCZvM_9DlVi5U',
   enabled: process.env.QUAZLINK_ENABLED !== 'false',
   timeoutMs: Number(process.env.QUAZLINK_TIMEOUT_MS) || 4500,
-  storeName: process.env.QUAZLINK_STORE_NAME || 'معرض ال عاشور عدس - House of Glass',
+  storeName: process.env.QUAZLINK_STORE_NAME || 'معرض آل عاشور عدس - House of Glass',
+  websiteUrl: process.env.QUAZLINK_WEBSITE_URL || 'https://www.hg-alshour.online',
 };
 
 // Memory cache for debounce/anti-spam (stores invoiceId -> lastSentTimestamp)
@@ -142,6 +143,142 @@ function postToQuazLink(payload) {
 }
 
 /**
+ * ═══════════════════════════════════════════════════════════════════
+ * Dynamic WhatsApp Message Templates
+ * ───────────────────────────────────────────────────────────────────
+ * Randomized rotation avoids repetitive bot patterns, keeps customer
+ * engagement high, and protects WhatsApp accounts against spam flags.
+ * ═══════════════════════════════════════════════════════════════════
+ */
+
+// 🛒 Retail Templates (4 variations)
+const RETAIL_TEMPLATES = [
+  // 1: الاستكشاف والكولكشن الجديد
+  (name, invNum, finance, website, store) => `(${store})
+
+أهلاً بك يا ${name}، شرفتنا ونورتنا اليوم! ❤️
+📄 *رقم الفاتورة:* #${invNum}
+${finance}
+
+✨ تشكيلتنا لسه فيها كتير!
+تقدر تكتشف أحدث منتجاتنا وباقي الكولكشن بسهولة من خلال الرابط:
+👉 ${website}
+
+شكراً لاختيارك لنا وسعداء دائماً بخدمتك! 🌟`,
+
+  // 2: شياكة البيت والديكور الفاخر
+  (name, invNum, finance, website, store) => `(${store})
+
+أهلاً بك يا ${name}، نورتنا ويسعدنا دائماً اختيارك لذوقنا! ❤️
+📄 *رقم الفاتورة:* #${invNum}
+${finance}
+
+🏠 عشان تكمل شياكة بيتك..
+جمعنالك تشكيلة واسعة من أرقى أدوات الزجاج والديكور على موقعنا، تقدر تشوفها من هنا:
+👉 ${website}
+
+يومك جميل ونتمنى نشوفك تاني قريب! ✨`,
+
+  // 3: العميل المميز والعروض الحصرية
+  (name, invNum, finance, website, store) => `(${store})
+
+أهلاً بك يا ${name}، شرفتنا ونورتنا اليوم! ❤️
+📄 *رقم الفاتورة:* #${invNum}
+${finance}
+
+🎁 لأنك عميل مميز، حابين تتابع أول بأول جديدنا وعروضنا الحصرية:
+تصفح باقي المنتجات واطلب مباشرة من موقعنا:
+👉 ${website}
+
+شكراً جزيلاً لك ونتمنى لك تجربة تسوق ممتعة دائماً! 🌟`,
+
+  // 4: الذوق والكتالوج الكامل
+  (name, invNum, finance, website, store) => `(${store})
+
+شكراً لزيارتك وثقتك بنا يا ${name} 💐
+📄 *الفاتورة:* #${invNum}
+${finance}
+
+🛒 كتالوج المنتجات الكامل متاح الآن أونلاين:
+👉 ${website}
+
+في خدمتك دائماً، ونتطلع لزيارتك القادمة! ✨`
+];
+
+// 🤝 Wholesale Templates (3 variations)
+const WHOLESALE_TEMPLATES = [
+  // 1: شراكة نجاح وتجارة رابحة
+  (name, invNum, finance, website) => `(معرض آل عاشور عدس - كبار العملاء والتوزيع) 🤝
+
+أهلاً بك يا ${name}، سعداء بشراكتنا المستمرة ونتمنى لك تجارة رابحة ورزقاً واسعاً! 🌟
+
+📄 *رقم فاتورة الجملة:* #${invNum}
+${finance}
+
+📦 لمعرفة أحدث الحاويات والأصناف والبضائع المتاحة للكميات:
+👉 ${website}
+
+بالبركة إن شاء الله، وفي خدمتك دائماً لأي طلبيات إضافية! 🚚`,
+
+  // 2: طلبيات المحلات وتوريد البضاعة
+  (name, invNum, finance, website) => `(معرض آل عاشور عدس - قسم الجملة) 💎
+
+تحياتنا لك يا ${name} ويسعدنا دائماً تلبية كافة احتياجات محلك ومعرضك! 🤝
+
+📄 *فاتورة توريد بضاعة:* #${invNum}
+${finance}
+
+🚛 تقدر تتابع وصول تشكيلات البضاعة الجديدة وطلبيات الكراتين أول بأول عبر موقعنا:
+👉 ${website}
+
+سعداء بالتعاون المستمر ونتمنى لك موسماً مباركاً ومبيعات موفقة! ✨`,
+
+  // 3: كشف حساب وفاتورة جملة مباشرة
+  (name, invNum, finance, website) => `(معرض آل عاشور عدس - House of Glass) 📋
+
+بيان فاتورة جملة للعميل: ${name} 💐
+───────────────────
+📄 *رقم الفاتورة:* #${invNum}
+${finance}
+───────────────────
+🛒 للاطلاع على كتالوج المنتجات والأسعار الخاصة بالكميات:
+👉 ${website}
+
+شاكرين لتعاملكم الراقي وثقتكم الدائمة في منتجاتنا! 🌟`
+];
+
+/**
+ * Build smart financial text block conditionally:
+ * - If remaining is 0 or paid >= total: Shows "خالصة بالكامل ✅"
+ * - If partial payment: Shows Total, Paid, and Remaining
+ * - If 0 paid (unpaid / credit): Shows "آجل ⏳"
+ */
+function buildFinancialBlock({ amount, paidAmount, remainingAmount, currency = 'ج.م' }) {
+  const formattedTotal = formatAmount(amount);
+  const numTotal = Number(amount || 0);
+  const numPaid = Number(paidAmount || 0);
+  const numRemaining = remainingAmount !== undefined && remainingAmount !== null
+    ? Number(remainingAmount)
+    : (numTotal - numPaid);
+
+  const formattedPaid = formatAmount(numPaid);
+  const formattedRemaining = formatAmount(Math.max(0, numRemaining));
+
+  // Case 1: Fully paid
+  if (numRemaining <= 0 || (numTotal > 0 && numPaid >= numTotal)) {
+    return `💰 *الإجمالي:* ${formattedTotal} ${currency} *(خالصة بالكامل ✅)*`;
+  }
+
+  // Case 2: Partial payment
+  if (numPaid > 0 && numRemaining > 0) {
+    return `💰 *الإجمالي:* ${formattedTotal} ${currency}\n💵 *المدفوع:* ${formattedPaid} ${currency}\n⏳ *المتبقي:* ${formattedRemaining} ${currency}`;
+  }
+
+  // Case 3: Fully credit / Unpaid
+  return `💰 *الإجمالي:* ${formattedTotal} ${currency} *(آجل ⏳)*`;
+}
+
+/**
  * Dispatches an automated WhatsApp invoice notification asynchronously.
  * Designed to be called non-blocking (e.g. via setImmediate).
  *
@@ -150,6 +287,9 @@ function postToQuazLink(payload) {
  * @param {string} [params.customerPhone]
  * @param {string} [params.customerName]
  * @param {number|string} [params.amount]
+ * @param {number|string} [params.paidAmount]
+ * @param {number|string} [params.remainingAmount]
+ * @param {string} [params.invoiceType] 'retail' or 'wholesale'
  * @param {string} [params.currency]
  * @param {boolean} [params.force] If true, bypasses anti-spam debounce
  */
@@ -158,6 +298,9 @@ async function dispatchInvoiceWhatsApp({
   customerPhone,
   customerName,
   amount,
+  paidAmount,
+  remainingAmount,
+  invoiceType,
   currency = 'ج.م',
   force = false,
 }) {
@@ -179,22 +322,37 @@ async function dispatchInvoiceWhatsApp({
     return { success: false, reason: 'debounced' };
   }
 
-  // If phone/name/amount are missing, fetch from database
+  // If details are missing, fetch from database
   let targetPhone = customerPhone;
   let targetName = customerName;
   let targetAmount = amount;
+  let targetPaid = paidAmount;
+  let targetRemaining = remainingAmount;
+  let targetInvoiceType = invoiceType;
 
-  if (!targetPhone || !targetAmount) {
+  if (
+    !targetPhone ||
+    targetAmount === undefined ||
+    targetPaid === undefined ||
+    targetRemaining === undefined ||
+    !targetInvoiceType
+  ) {
     try {
       const invRes = await pool.query(
-        'SELECT customer_phone, customer_name, total FROM invoices WHERE id = $1',
+        `SELECT customer_phone, customer_name, total, paid_amount, remaining_amount, invoice_type, branch_id 
+         FROM invoices WHERE id = $1`,
         [id]
       );
       if (invRes.rows.length > 0) {
         const row = invRes.rows[0];
         targetPhone = targetPhone || row.customer_phone;
         targetName = targetName || row.customer_name;
-        targetAmount = targetAmount || row.total;
+        if (targetAmount === undefined || targetAmount === null) targetAmount = row.total;
+        if (targetPaid === undefined || targetPaid === null) targetPaid = row.paid_amount;
+        if (targetRemaining === undefined || targetRemaining === null) targetRemaining = row.remaining_amount;
+        if (!targetInvoiceType) {
+          targetInvoiceType = row.invoice_type || (row.branch_id === 2 ? 'wholesale' : 'retail');
+        }
       }
     } catch (dbErr) {
       console.error(`[QuazLink] Error fetching invoice #${id} details for WhatsApp:`, dbErr.message);
@@ -229,15 +387,31 @@ async function dispatchInvoiceWhatsApp({
     displayName = `أ / ${cleanedName}`;
   }
 
-  const customMessage = `(${QUAZLINK_CONFIG.storeName})
+  // 🚀 Generate Smart Financial Block
+  const financialBlock = buildFinancialBlock({
+    amount: targetAmount,
+    paidAmount: targetPaid,
+    remainingAmount: targetRemaining,
+    currency,
+  });
 
-أهلاً بك يا ${displayName}، شرفتنا ونورتنا بشرائك من عندنا! ❤️
-📄 رقم الفاتورة: #${invoiceNumber}
-💰 الإجمالي: ${formattedAmount} ${currency}
+  // 🎲 Select Random Template based on Invoice Type (Wholesale vs Retail)
+  const isWholesale = targetInvoiceType === 'wholesale';
+  const poolTemplates = isWholesale ? WHOLESALE_TEMPLATES : RETAIL_TEMPLATES;
+  const randomIndex = Math.floor(Math.random() * poolTemplates.length);
+  const selectedTemplate = poolTemplates[randomIndex];
 
-شكراً جزيلاً لثقتك بنا ونراك قريباً إن شاء الله! ✨`;
+  const customMessage = selectedTemplate(
+    displayName,
+    invoiceNumber,
+    financialBlock,
+    QUAZLINK_CONFIG.websiteUrl,
+    QUAZLINK_CONFIG.storeName
+  );
 
-  console.log(`[QuazLink] 🚀 Dispatching WhatsApp invoice #${id} to ${maskPhone(cleanPhone)} (${displayName}, ${formattedAmount} ${currency})...`);
+  const senderStoreName = isWholesale ? 'معرض آل عاشور عدس - كبار العملاء والتوزيع' : QUAZLINK_CONFIG.storeName;
+
+  console.log(`[QuazLink] 🚀 Dispatching WhatsApp invoice #${id} (${targetInvoiceType || 'retail'}, template #${randomIndex + 1}) to ${maskPhone(cleanPhone)} (${displayName}, ${formattedAmount} ${currency})...`);
 
   try {
     const result = await postToQuazLink({
@@ -247,10 +421,10 @@ async function dispatchInvoiceWhatsApp({
       amount: formattedAmount,
       currency: currency,
       message: customMessage,
-      storeName: QUAZLINK_CONFIG.storeName,
-      companyName: QUAZLINK_CONFIG.storeName,
-      company: QUAZLINK_CONFIG.storeName,
-      store: QUAZLINK_CONFIG.storeName,
+      storeName: senderStoreName,
+      companyName: senderStoreName,
+      company: senderStoreName,
+      store: senderStoreName,
     });
 
     if (result.statusCode >= 200 && result.statusCode < 300 && result.data?.success) {
@@ -323,7 +497,8 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
   if (!id) throw new Error('معرف الفاتورة غير صالح');
 
   const invRes = await pool.query(
-    'SELECT id, customer_phone, customer_name, total FROM invoices WHERE id = $1',
+    `SELECT id, customer_phone, customer_name, total, paid_amount, remaining_amount, invoice_type, branch_id 
+     FROM invoices WHERE id = $1`,
     [id]
   );
   if (invRes.rows.length === 0) {
@@ -340,6 +515,9 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
     customerPhone: invoice.customer_phone,
     customerName: invoice.customer_name,
     amount: invoice.total,
+    paidAmount: invoice.paid_amount,
+    remainingAmount: invoice.remaining_amount,
+    invoiceType: invoice.invoice_type || (invoice.branch_id === 2 ? 'wholesale' : 'retail'),
     currency: 'ج.م',
     force: true, // Bypass debounce for manual user resend
   });

@@ -4481,22 +4481,38 @@ VALUES
       !is_return &&
       (customer_phone || req.body.customer_phone)
     ) {
-      setImmediate(() => {
-        quazlinkService
-          .dispatchInvoiceWhatsApp({
-            invoiceId,
-            customerPhone: customer_phone || req.body.customer_phone,
-            customerName: customer_name || req.body.customer_name,
-            amount: total,
-            currency: "ج.م",
-          })
-          .catch((err) =>
-            console.error(
-              "[QuazLink] Wholesale WhatsApp background error:",
-              err.message,
-            ),
-          );
-      });
+      // 🚀 Smart Delayed Dispatch check:
+      // If wholesale invoice is created from Retail Branch (branch_id == 1)
+      // and customer hasn't paid yet (unpaid / paid_amount <= 0),
+      // DELAY dispatch until customer arrives at Wholesale branch to pay and pick up goods.
+      const isCreatedFromRetail = Number(branch_id) === 1;
+      const isUnpaid = Number(paid_amount || 0) <= 0 || payment_status === "unpaid";
+
+      if (isCreatedFromRetail && isUnpaid) {
+        console.log(
+          `[QuazLink] ⏳ Wholesale invoice #${invoiceId} created from Retail branch (unpaid). Delaying WhatsApp dispatch until payment/pickup at Wholesale branch.`
+        );
+      } else {
+        setImmediate(() => {
+          quazlinkService
+            .dispatchInvoiceWhatsApp({
+              invoiceId,
+              customerPhone: customer_phone || req.body.customer_phone,
+              customerName: customer_name || req.body.customer_name,
+              amount: totalWithPrevious || total,
+              paidAmount: Number(paid_amount || 0),
+              remainingAmount: remaining_amount,
+              invoiceType: "wholesale",
+              currency: "ج.م",
+            })
+            .catch((err) =>
+              console.error(
+                "[QuazLink] Wholesale WhatsApp background error:",
+                err.message,
+              ),
+            );
+        });
+      }
     }
 
     res.json({
@@ -4843,6 +4859,9 @@ app.post("/invoices/retail", async (req, res) => {
             customerPhone: customer_phone || req.body.customer_phone,
             customerName: customer_name || req.body.customer_name,
             amount: final_total,
+            paidAmount: Number(paid_amount || 0),
+            remainingAmount: remaining_amount,
+            invoiceType: "retail",
             currency: "ج.م",
           })
           .catch((err) =>
@@ -5907,6 +5926,33 @@ SET
     await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
 
     await client.query("COMMIT");
+
+    if (
+      movement_type === "sale" &&
+      (customer_phone || req.body.customer_phone)
+    ) {
+      setImmediate(() => {
+        quazlinkService
+          .dispatchInvoiceWhatsApp({
+            invoiceId,
+            customerPhone: customer_phone || req.body.customer_phone,
+            customerName: customer_name || req.body.customer_name,
+            amount: totalWithPrevious || total,
+            paidAmount: Number(paid_amount || 0),
+            remainingAmount: remaining,
+            invoiceType: "wholesale",
+            currency: "ج.م",
+            force: true, // Force send updated status after edit/payment at wholesale
+          })
+          .catch((err) =>
+            console.error(
+              "[QuazLink] Wholesale Update WhatsApp background error:",
+              err.message,
+            ),
+          );
+      });
+    }
+
     res.json({
       success: true,
       invoice_id: invoiceId,
