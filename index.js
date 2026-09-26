@@ -109,16 +109,21 @@ app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: [
-      "https://homeglass-web.vercel.app",
-      "https://house-of-glass-phi.vercel.app",
-      "https://x.hg-alshour.online",
-      "http://localhost:3000", "http://localhost:3001", "http://localhost:3002",
-      "http://localhost:8000",
-      "http://192.168.1.63:3000",
-      "https://hg-alshour.online",
-      "https://www.hg-alshour.online",
-    ],
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      const isAllowed =
+        origin.endsWith(".hg-alshour.online") ||
+        origin === "https://hg-alshour.online" ||
+        origin.endsWith(".vercel.app") ||
+        origin.includes("localhost") ||
+        origin.includes("127.0.0.1") ||
+        origin.includes("192.168.");
+      if (isAllowed) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
     credentials: true,
