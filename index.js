@@ -4487,15 +4487,19 @@ VALUES
       (customer_phone || req.body.customer_phone)
     ) {
       // 🚀 Smart Delayed Dispatch check:
-      // If wholesale invoice is created from Retail Branch (branch_id == 1)
-      // and customer hasn't paid yet (unpaid / paid_amount <= 0),
+      // If wholesale invoice is created by a user from Retail Branch (userBranchId == 1)
+      // and customer hasn't fully settled yet (unpaid / partial),
       // DELAY dispatch until customer arrives at Wholesale branch to pay and pick up goods.
-      const isCreatedFromRetail = Number(branch_id) === 1;
-      const isUnpaid = Number(paid_amount || 0) <= 0 || payment_status === "unpaid";
+      const creatorBranchId = Number(userBranchId ?? req.user?.branch_id ?? 0);
+      const isCreatedFromRetail = creatorBranchId === 1;
+      const isUnpaid =
+        Number(paid_amount || 0) <= 0 ||
+        payment_status === "unpaid" ||
+        Number(remaining_amount || 0) > 0;
 
       if (isCreatedFromRetail && isUnpaid) {
         console.log(
-          `[QuazLink] ⏳ Wholesale invoice #${invoiceId} created from Retail branch (unpaid). Delaying WhatsApp dispatch until payment/pickup at Wholesale branch.`
+          `[QuazLink] ⏳ Wholesale invoice #${invoiceId} created by Retail user (user branch: ${creatorBranchId}, unpaid/partial). Delaying WhatsApp dispatch until payment/pickup at Wholesale branch.`
         );
       } else {
         setImmediate(() => {
