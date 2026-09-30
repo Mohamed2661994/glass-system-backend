@@ -9773,7 +9773,8 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
       entry_type === "purchase" ||
       entry_type === "expense" ||
       entry_type === "supplier_payment" ||
-      entry_type === "warehouse_settlement"
+      entry_type === "warehouse_settlement" ||
+      entry_type === "showroom_settlement"
         ? entry_type
         : "expense";
 
@@ -9844,7 +9845,8 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
       entry_type === "purchase" ||
       entry_type === "expense" ||
       entry_type === "supplier_payment" ||
-      entry_type === "warehouse_settlement"
+      entry_type === "warehouse_settlement" ||
+      entry_type === "showroom_settlement"
         ? entry_type
         : "expense";
 
