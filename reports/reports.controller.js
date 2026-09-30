@@ -575,38 +575,94 @@ exports.getNegativeStock = async (req, res) => {
 ================================ */
 exports.getInventoryValue = async (req, res) => {
   try {
-    const { warehouse_id } = req.query;
+    const { warehouse_id, as_of_date, date } = req.query;
+    const targetDate = (as_of_date || date || "").trim();
+    const isHistorical = /^\d{4}-\d{2}-\d{2}$/.test(targetDate);
 
-    let where = "";
-    let values = [];
+    let result;
+    if (isHistorical) {
+      let cteConditions = [
+        "(sm.created_at AT TIME ZONE 'Africa/Cairo')::date <= $1::date",
+      ];
+      let values = [targetDate];
+      let idx = 2;
 
-    if (warehouse_id) {
-      where = "WHERE w.id = $1";
-      values.push(warehouse_id);
+      if (warehouse_id) {
+        cteConditions.push(`sm.warehouse_id = $${idx++}`);
+        values.push(warehouse_id);
+      }
+
+      result = await pool.query(
+        `
+        WITH hist_stock AS (
+          SELECT
+            sm.warehouse_id,
+            sm.product_id,
+            SUM(
+              CASE 
+                WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in', 'adjustment_in') THEN sm.quantity
+                WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out', 'adjustment_out') THEN -sm.quantity
+                ELSE 0
+              END
+            ) AS quantity
+          FROM stock_movements sm
+          WHERE ${cteConditions.join(" AND ")}
+          GROUP BY sm.warehouse_id, sm.product_id
+          HAVING SUM(
+            CASE 
+              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in', 'adjustment_in') THEN sm.quantity
+              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out', 'adjustment_out') THEN -sm.quantity
+              ELSE 0
+            END
+          ) > 0
+        )
+        SELECT
+          w.id AS warehouse_id,
+          w.name AS warehouse_name,
+          COUNT(DISTINCT hs.product_id) AS total_products,
+          SUM(hs.quantity) AS total_quantity,
+          SUM(hs.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value
+        FROM hist_stock hs
+        JOIN products p ON p.id = hs.product_id
+        JOIN warehouses w ON w.id = hs.warehouse_id
+        WHERE p.is_active = true
+        GROUP BY w.id, w.name
+        ORDER BY total_value DESC
+        `,
+        values,
+      );
+    } else {
+      let where = "";
+      let values = [];
+
+      if (warehouse_id) {
+        where = "WHERE w.id = $1";
+        values.push(warehouse_id);
+      }
+
+      result = await pool.query(
+        `
+        SELECT
+          w.id AS warehouse_id,
+          w.name AS warehouse_name,
+
+          COUNT(DISTINCT s.product_id) AS total_products,   -- 🆕 عدد الأصناف
+          SUM(s.quantity) AS total_quantity,                -- 🆕 إجمالي الكمية
+
+          SUM(s.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value -- 💰 قيمة المخزون
+
+        FROM stock s
+        JOIN products p ON p.id = s.product_id
+        JOIN warehouses w ON w.id = s.warehouse_id
+
+        ${where}
+
+        GROUP BY w.id, w.name
+        ORDER BY total_value DESC
+        `,
+        values,
+      );
     }
-
-    const result = await pool.query(
-      `
-      SELECT
-        w.id AS warehouse_id,
-        w.name AS warehouse_name,
-
-        COUNT(DISTINCT s.product_id) AS total_products,   -- 🆕 عدد الأصناف
-        SUM(s.quantity) AS total_quantity,                -- 🆕 إجمالي الكمية
-
-        SUM(s.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value -- 💰 قيمة المخزون
-
-      FROM stock s
-      JOIN products p ON p.id = s.product_id
-      JOIN warehouses w ON w.id = s.warehouse_id
-
-      ${where}
-
-      GROUP BY w.id, w.name
-      ORDER BY total_value DESC
-      `,
-      values,
-    );
 
     res.json(result.rows);
   } catch (err) {
@@ -617,47 +673,116 @@ exports.getInventoryValue = async (req, res) => {
 
 exports.getInventoryDetails = async (req, res) => {
   try {
-    const { warehouse_id, manufacturer } = req.query;
+    const { warehouse_id, manufacturer, as_of_date, date } = req.query;
+    const targetDate = (as_of_date || date || "").trim();
+    const isHistorical = /^\d{4}-\d{2}-\d{2}$/.test(targetDate);
 
-    let conditions = ["s.quantity > 0"];
-    let values = [];
-    let idx = 1;
+    let result;
 
-    if (warehouse_id) {
-      conditions.push(`w.id = $${idx++}`);
-      values.push(warehouse_id);
+    if (isHistorical) {
+      let cteConditions = [
+        "(sm.created_at AT TIME ZONE 'Africa/Cairo')::date <= $1::date",
+      ];
+      let values = [targetDate];
+      let idx = 2;
+
+      if (warehouse_id) {
+        cteConditions.push(`sm.warehouse_id = $${idx++}`);
+        values.push(warehouse_id);
+      }
+
+      let outerConditions = ["p.is_active = true"];
+      if (manufacturer) {
+        outerConditions.push(`LOWER(TRIM(p.manufacturer)) = $${idx++}`);
+        values.push(manufacturer);
+      }
+
+      const histQuery = `
+        WITH hist_stock AS (
+          SELECT
+            sm.warehouse_id,
+            sm.product_id,
+            COALESCE(sm.variant_id, 0) AS variant_id,
+            SUM(
+              CASE 
+                WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in', 'adjustment_in') THEN sm.quantity
+                WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out', 'adjustment_out') THEN -sm.quantity
+                ELSE 0
+              END
+            ) AS quantity
+          FROM stock_movements sm
+          WHERE ${cteConditions.join(" AND ")}
+          GROUP BY sm.warehouse_id, sm.product_id, sm.variant_id
+          HAVING SUM(
+            CASE 
+              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'inter_branch_in', 'in', 'adjustment_in') THEN sm.quantity
+              WHEN sm.movement_type IN ('sale', 'transfer_out', 'replace_out', 'return_purchase', 'inter_branch_out', 'out', 'adjustment_out') THEN -sm.quantity
+              ELSE 0
+            END
+          ) > 0
+        )
+        SELECT
+          p.id AS product_id,
+          p.name AS product_name,
+          p.manufacturer,
+          hs.quantity,
+          hs.variant_id,
+          p.purchase_price,
+          p.retail_purchase_price,
+          p.wholesale_package,
+          p.retail_package,
+          (hs.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value,
+          w.id AS warehouse_id,
+          w.name AS warehouse_name
+        FROM hist_stock hs
+        JOIN products p ON p.id = hs.product_id
+        JOIN warehouses w ON w.id = hs.warehouse_id
+        WHERE ${outerConditions.join(" AND ")}
+        ORDER BY w.name, p.name
+      `;
+
+      result = await pool.query(histQuery, values);
+    } else {
+      let conditions = ["s.quantity > 0"];
+      let values = [];
+      let idx = 1;
+
+      if (warehouse_id) {
+        conditions.push(`w.id = $${idx++}`);
+        values.push(warehouse_id);
+      }
+
+      if (manufacturer) {
+        conditions.push(`LOWER(TRIM(p.manufacturer)) = $${idx++}`);
+        values.push(manufacturer);
+      }
+
+      const where = `WHERE ${conditions.join(" AND ")}`;
+
+      result = await pool.query(
+        `
+        SELECT
+          p.id AS product_id,
+          p.name AS product_name,
+          p.manufacturer,
+          s.quantity,
+          s.variant_id,
+          p.purchase_price,
+          p.retail_purchase_price,
+          p.wholesale_package,
+          p.retail_package,
+          (s.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value,
+          w.id AS warehouse_id,
+          w.name AS warehouse_name
+        FROM stock s
+        JOIN products p ON p.id = s.product_id
+        JOIN warehouses w ON w.id = s.warehouse_id
+        ${where}
+        ORDER BY w.name, p.name
+        `,
+        values,
+      );
     }
-
-    if (manufacturer) {
-      conditions.push(`LOWER(TRIM(p.manufacturer)) = $${idx++}`);
-      values.push(manufacturer);
-    }
-
-    const where = `WHERE ${conditions.join(" AND ")}`;
-
-    const result = await pool.query(
-      `
-      SELECT
-        p.id AS product_id,
-        p.name AS product_name,
-        p.manufacturer,
-        s.quantity,
-        s.variant_id,
-        p.purchase_price,
-        p.retail_purchase_price,
-        p.wholesale_package,
-        p.retail_package,
-        (s.quantity * CASE WHEN w.id = 1 THEN p.retail_purchase_price ELSE p.purchase_price END) AS total_value,
-        w.id AS warehouse_id,
-        w.name AS warehouse_name
-      FROM stock s
-      JOIN products p ON p.id = s.product_id
-      JOIN warehouses w ON w.id = s.warehouse_id
-      ${where}
-      ORDER BY w.name, p.name
-      `,
-      values,
-    );
 
     // Get all variants to map variant_id → package + purchase_price
     const variantsRes = await pool.query(
