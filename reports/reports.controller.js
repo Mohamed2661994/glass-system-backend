@@ -1368,11 +1368,18 @@ exports.getCustomerDebtDetails = async (req, res) => {
     const BALANCE_EPSILON = 0.01;
     const balancesMatch = (a, b) => Math.abs(toNumber(a) - toNumber(b)) <= BALANCE_EPSILON;
 
+    const toIsoDateString = (d) => {
+      if (!d) return "";
+      if (d instanceof Date) return isNaN(d.getTime()) ? "" : d.toISOString();
+      const parsed = new Date(d);
+      return isNaN(parsed.getTime()) ? String(d) : parsed.toISOString();
+    };
+
     // ⚡ ترتيب ذكي للحركات المتزامنة في نفس اليوم (مثل سداد دفعة تسبق فاتورة مسجل بها الحساب السابق)
     const indexed = result.rows.map((row, index) => ({ row, index }));
     indexed.sort((left, right) => {
-      const leftKey = String(left.row.invoice_date ?? "");
-      const rightKey = String(right.row.invoice_date ?? "");
+      const leftKey = toIsoDateString(left.row.invoice_date);
+      const rightKey = toIsoDateString(right.row.invoice_date);
       const byDate = leftKey.localeCompare(rightKey);
       return byDate !== 0 ? byDate : left.index - right.index;
     });
@@ -1382,11 +1389,11 @@ exports.getCustomerDebtDetails = async (req, res) => {
     let start = 0;
 
     while (start < indexed.length) {
-      const dayKey = String(indexed[start].row.invoice_date ?? "").substring(0, 10);
+      const dayKey = toIsoDateString(indexed[start].row.invoice_date).substring(0, 10);
       let end = start;
       while (
         end < indexed.length &&
-        String(indexed[end].row.invoice_date ?? "").substring(0, 10) === dayKey
+        toIsoDateString(indexed[end].row.invoice_date).substring(0, 10) === dayKey
       ) {
         end++;
       }
