@@ -13969,6 +13969,23 @@ async function runStartupMigrations() {
         CREATE INDEX IF NOT EXISTS idx_payroll_adj_branch ON payroll_adjustments(branch_id, status);
         CREATE INDEX IF NOT EXISTS idx_payroll_adj_emp ON payroll_adjustments(employee_id, status);
 
+        CREATE TABLE IF NOT EXISTS payroll_retained_dues (
+          id SERIAL PRIMARY KEY,
+          branch_id INTEGER NOT NULL REFERENCES branches(id),
+          employee_id INTEGER NOT NULL REFERENCES payroll_employees(id) ON DELETE CASCADE,
+          amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+          due_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          reason TEXT,
+          status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'cancelled')),
+          payroll_record_id INTEGER,
+          created_by INTEGER,
+          created_by_name VARCHAR(100),
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_retained_dues_branch ON payroll_retained_dues(branch_id, status);
+        CREATE INDEX IF NOT EXISTS idx_retained_dues_emp ON payroll_retained_dues(employee_id, status);
+
         CREATE TABLE IF NOT EXISTS payroll_attendance (
           id SERIAL PRIMARY KEY,
           branch_id INTEGER NOT NULL REFERENCES branches(id),

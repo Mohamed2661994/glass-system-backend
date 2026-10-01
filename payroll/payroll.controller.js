@@ -388,33 +388,46 @@ async function getAdjustments(req, res) {
     const periodStart = req.query.period_start;
     const periodEnd = req.query.period_end;
 
-    let query = `
+    let whereAdj = "pa.branch_id = $1";
+    let whereRet = "rd.branch_id = $1";
+    const params = [branchId];
+
+    if (employeeId) {
+      params.push(employeeId);
+      whereAdj += ` AND pa.employee_id = $${params.length}`;
+      whereRet += ` AND rd.employee_id = $${params.length}`;
+    }
+
+    if (status !== "all") {
+      params.push(status);
+      whereAdj += ` AND pa.status = $${params.length}`;
+      whereRet += ` AND rd.status = $${params.length}`;
+    }
+
+    if (periodStart && periodEnd) {
+      params.push(periodStart, periodEnd);
+      whereAdj += ` AND pa.adjustment_date >= $${params.length - 1} AND pa.adjustment_date <= $${params.length}`;
+      whereRet += ` AND rd.due_date >= $${params.length - 1} AND rd.due_date <= $${params.length}`;
+    }
+
+    const query = `
       SELECT 
         pa.id, pa.branch_id, pa.employee_id, pa.type, pa.amount, pa.adjustment_date,
         pa.reason, pa.status, pa.payroll_record_id, pa.created_by, pa.created_by_name, pa.created_at,
         pe.name as employee_name, pe.job_title, pe.salary_type
       FROM payroll_adjustments pa
       JOIN payroll_employees pe ON pa.employee_id = pe.id
-      WHERE pa.branch_id = $1
+      WHERE ${whereAdj}
+      UNION ALL
+      SELECT 
+        rd.id, rd.branch_id, rd.employee_id, 'retained_dues' as type, rd.amount, rd.due_date as adjustment_date,
+        rd.reason, rd.status, rd.payroll_record_id, rd.created_by, rd.created_by_name, rd.created_at,
+        pe.name as employee_name, pe.job_title, pe.salary_type
+      FROM payroll_retained_dues rd
+      JOIN payroll_employees pe ON rd.employee_id = pe.id
+      WHERE ${whereRet}
+      ORDER BY adjustment_date DESC, id DESC
     `;
-    const params = [branchId];
-
-    if (employeeId) {
-      params.push(employeeId);
-      query += ` AND pa.employee_id = $${params.length}`;
-    }
-
-    if (status !== "all") {
-      params.push(status);
-      query += ` AND pa.status = $${params.length}`;
-    }
-
-    if (periodStart && periodEnd) {
-      params.push(periodStart, periodEnd);
-      query += ` AND pa.adjustment_date >= $${params.length - 1} AND pa.adjustment_date <= $${params.length}`;
-    }
-
-    query += ` ORDER BY pa.adjustment_date DESC, pa.id DESC`;
 
     const result = await pool.query(query, params);
     res.json({ success: true, adjustments: result.rows });
@@ -491,15 +504,28 @@ async function createAdjustment(req, res) {
     const createdBy = currentUser?.id || null;
     const createdByName = currentUser?.name || currentUser?.full_name || currentUser?.username || "الإدارة";
 
-    const insertRes = await pool.query(
-      `
-      INSERT INTO payroll_adjustments 
-        (branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by, created_by_name)
-      VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
-      RETURNING *
-      `,
-      [safeBranchId, empId, type, numAmount, safeDate, cleanReason, createdBy, createdByName],
-    );
+    let insertRes;
+    if (type === "retained_dues") {
+      insertRes = await pool.query(
+        `
+        INSERT INTO payroll_retained_dues 
+          (branch_id, employee_id, amount, due_date, reason, status, created_by, created_by_name)
+        VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+        RETURNING id, branch_id, employee_id, 'retained_dues' as type, amount, due_date as adjustment_date, reason, status, created_by, created_by_name, created_at
+        `,
+        [safeBranchId, empId, numAmount, safeDate, cleanReason, createdBy, createdByName],
+      );
+    } else {
+      insertRes = await pool.query(
+        `
+        INSERT INTO payroll_adjustments 
+          (branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by, created_by_name)
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
+        RETURNING *
+        `,
+        [safeBranchId, empId, type, numAmount, safeDate, cleanReason, createdBy, createdByName],
+      );
+    }
 
     const adjustment = insertRes.rows[0];
 
@@ -527,7 +553,12 @@ async function deleteAdjustment(req, res) {
     const adjId = Number(req.params.id);
     const currentUser = req.user;
 
-    const findRes = await pool.query("SELECT * FROM payroll_adjustments WHERE id = $1", [adjId]);
+    let findRes = await pool.query("SELECT * FROM payroll_adjustments WHERE id = $1", [adjId]);
+    let isRetained = false;
+    if (findRes.rows.length === 0) {
+      findRes = await pool.query("SELECT * FROM payroll_retained_dues WHERE id = $1", [adjId]);
+      isRetained = true;
+    }
     if (findRes.rows.length === 0) {
       return res.status(404).json({ error: "الحركة غير موجودة" });
     }
@@ -545,7 +576,11 @@ async function deleteAdjustment(req, res) {
       }
     }
 
-    await pool.query("DELETE FROM payroll_adjustments WHERE id = $1", [adjId]);
+    if (isRetained) {
+      await pool.query("DELETE FROM payroll_retained_dues WHERE id = $1", [adjId]);
+    } else {
+      await pool.query("DELETE FROM payroll_adjustments WHERE id = $1", [adjId]);
+    }
 
     const broadcast = req.app?.get("broadcastRealtime");
     if (typeof broadcast === "function") {
@@ -690,12 +725,16 @@ async function getPayrollSheet(req, res) {
       advancesByEmp[adv.employee_id].push(adv);
     }
 
-    // 2.b Fetch pending adjustments (bonuses, overtime, deductions) up to periodEnd
+    // 2.b Fetch pending adjustments (bonuses, overtime, deductions, retained dues) up to periodEnd
     const adjRes = await pool.query(
       `
       SELECT id, branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by_name, created_at
       FROM payroll_adjustments
       WHERE branch_id = $1 AND employee_id = ANY($2) AND status = 'pending' AND adjustment_date <= $3
+      UNION ALL
+      SELECT id, branch_id, employee_id, 'retained_dues' as type, amount, due_date as adjustment_date, reason, status, created_by_name, created_at
+      FROM payroll_retained_dues
+      WHERE branch_id = $1 AND employee_id = ANY($2) AND status = 'pending' AND due_date <= $3
       ORDER BY adjustment_date ASC, id ASC
       `,
       [branchId, empIds, periodEnd],
@@ -747,6 +786,10 @@ async function getPayrollSheet(req, res) {
         `
         SELECT id, branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by_name, created_at
         FROM payroll_adjustments
+        WHERE branch_id = $1 AND payroll_record_id = ANY($2)
+        UNION ALL
+        SELECT id, branch_id, employee_id, 'retained_dues' as type, amount, due_date as adjustment_date, reason, status, created_by_name, created_at
+        FROM payroll_retained_dues
         WHERE branch_id = $1 AND payroll_record_id = ANY($2)
         ORDER BY adjustment_date ASC, id ASC
         `,
@@ -964,10 +1007,10 @@ async function confirmPayrollPayout(req, res) {
       if (empScope === "arrears_only") {
         const arrearsRes = await client.query(
           `
-          SELECT id, amount, reason, adjustment_date
-          FROM payroll_adjustments
-          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND type = 'retained_dues' AND adjustment_date <= $3
-          ORDER BY adjustment_date ASC, id ASC
+          SELECT id, amount, reason, due_date as adjustment_date
+          FROM payroll_retained_dues
+          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND due_date <= $3
+          ORDER BY due_date ASC, id ASC
           `,
           [safeBranchId, empId, safeEnd],
         );
@@ -1027,11 +1070,11 @@ async function confirmPayrollPayout(req, res) {
         const payrollRecord = recordRes.rows[0];
         createdRecords.push(payrollRecord);
 
-        // Mark the retained_dues adjustments as applied
+        // Mark the retained_dues as applied
         const adjIds = arrearsRes.rows.map((r) => r.id);
         await client.query(
           `
-          UPDATE payroll_adjustments 
+          UPDATE payroll_retained_dues 
           SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
           WHERE id = ANY($2) AND branch_id = $3
           `,
@@ -1109,8 +1152,8 @@ async function confirmPayrollPayout(req, res) {
         const retainedRes = await client.query(
           `
           SELECT id, amount 
-          FROM payroll_adjustments
-          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND type = 'retained_dues' AND adjustment_date <= $3
+          FROM payroll_retained_dues
+          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND due_date <= $3
           `,
           [safeBranchId, empId, safeEnd],
         );
@@ -1214,9 +1257,9 @@ async function confirmPayrollPayout(req, res) {
 
         await client.query(
           `
-          INSERT INTO payroll_adjustments 
-            (branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by, created_by_name)
-          VALUES ($1, $2, 'retained_dues', $3, $4, $5, 'pending', $6, $7)
+          INSERT INTO payroll_retained_dues 
+            (branch_id, employee_id, amount, due_date, reason, status, created_by, created_by_name)
+          VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
           `,
           [
             safeBranchId,
@@ -1302,7 +1345,7 @@ async function confirmPayrollPayout(req, res) {
       if (empScope === "full" && retainedDuesAdjIds.length > 0) {
         await client.query(
           `
-          UPDATE payroll_adjustments 
+          UPDATE payroll_retained_dues 
           SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
           WHERE id = ANY($2) AND branch_id = $3
           `,
@@ -1786,7 +1829,15 @@ async function getEmployeeLedger(req, res) {
         FROM payroll_adjustments padj
         WHERE padj.employee_id = $1
           AND (padj.reason NOT LIKE 'خصم غياب%' OR padj.reason IS NULL)
-        ORDER BY padj.adjustment_date DESC, padj.id DESC
+        UNION ALL
+        SELECT 
+          rd.id, 'retained_dues' as tx_type, rd.amount, rd.due_date as tx_date,
+          COALESCE(rd.reason, 'مستحق مرحل سابق') as description,
+          NULL as permission_number, rd.created_by_name as actor_name, rd.status,
+          rd.reason as notes
+        FROM payroll_retained_dues rd
+        WHERE rd.employee_id = $1
+        ORDER BY tx_date DESC, id DESC
         `,
         [empId],
       ),
