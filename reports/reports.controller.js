@@ -1282,13 +1282,13 @@ exports.getCustomerDebtDetails = async (req, res) => {
     }
 
     let invoiceConditions = [
-      "i.customer_name = $1",
+      "(i.customer_name = $1 OR REPLACE(REPLACE(TRIM(i.customer_name), 'ى', 'ي'), 'ة', 'ه') = REPLACE(REPLACE(TRIM($1), 'ى', 'ي'), 'ة', 'ه'))",
       "i.movement_type = 'sale'",
       "i.is_void = false",
     ];
     let paymentConditions = [
       "cp.source_type = 'customer_payment'",
-      "cp.customer_name = $1",
+      "(cp.customer_name = $1 OR REPLACE(REPLACE(TRIM(cp.customer_name), 'ى', 'ي'), 'ة', 'ه') = REPLACE(REPLACE(TRIM($1), 'ى', 'ي'), 'ة', 'ه'))",
     ];
 
     let values = [customer_name];
@@ -1297,14 +1297,14 @@ exports.getCustomerDebtDetails = async (req, res) => {
     if (from) {
       const param = `$${idx++}`;
       invoiceConditions.push(`i.invoice_date >= ${param}`);
-      paymentConditions.push(`cp.created_at >= ${param}`);
+      paymentConditions.push(`COALESCE(cp.transaction_date::date, cp.created_at::date) >= ${param}::date`);
       values.push(from);
     }
 
     if (to) {
       const param = `$${idx++}`;
       invoiceConditions.push(`i.invoice_date <= ${param}`);
-      paymentConditions.push(`cp.created_at <= ${param}`);
+      paymentConditions.push(`COALESCE(cp.transaction_date::date, cp.created_at::date) <= ${param}::date`);
       values.push(to);
     }
 
@@ -1345,7 +1345,7 @@ exports.getCustomerDebtDetails = async (req, res) => {
       SELECT
         'payment' AS record_type,
         cp.id AS invoice_id,
-        cp.created_at AS invoice_date,
+        COALESCE(cp.transaction_date::timestamp, cp.created_at) AS invoice_date,
         0 AS subtotal,
         0 AS discount_total,
         0 AS total,
@@ -1361,25 +1361,80 @@ exports.getCustomerDebtDetails = async (req, res) => {
       values,
     );
 
-    let runningBalance = 0;
-    const rows = result.rows.map((row) => {
-      const paidAmount = Number(row.paid_amount || 0);
-      const remainingAmount = Number(row.remaining_amount || 0);
+    const toNumber = (v) => {
+      const n = Number(v ?? 0);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const BALANCE_EPSILON = 0.01;
+    const balancesMatch = (a, b) => Math.abs(toNumber(a) - toNumber(b)) <= BALANCE_EPSILON;
 
-      if (row.record_type === "invoice") {
-        runningBalance = remainingAmount;
-      } else {
-        runningBalance -= paidAmount;
-      }
-
-      return {
-        ...row,
-        remaining_amount: runningBalance,
-        running_balance: runningBalance,
-      };
+    // ⚡ ترتيب ذكي للحركات المتزامنة في نفس اليوم (مثل سداد دفعة تسبق فاتورة مسجل بها الحساب السابق)
+    const indexed = result.rows.map((row, index) => ({ row, index }));
+    indexed.sort((left, right) => {
+      const leftKey = String(left.row.invoice_date ?? "");
+      const rightKey = String(right.row.invoice_date ?? "");
+      const byDate = leftKey.localeCompare(rightKey);
+      return byDate !== 0 ? byDate : left.index - right.index;
     });
 
-    res.json(rows);
+    const orderedRows = [];
+    let currentBalance = 0;
+    let start = 0;
+
+    while (start < indexed.length) {
+      const dayKey = String(indexed[start].row.invoice_date ?? "").substring(0, 10);
+      let end = start;
+      while (
+        end < indexed.length &&
+        String(indexed[end].row.invoice_date ?? "").substring(0, 10) === dayKey
+      ) {
+        end++;
+      }
+
+      const dayRows = indexed.slice(start, end).map((e) => e.row);
+      while (dayRows.length > 0) {
+        let nextIndex = dayRows.findIndex(
+          (r) => r.record_type === "invoice" && balancesMatch(r.previous_balance, currentBalance)
+        );
+
+        if (nextIndex === -1) {
+          nextIndex = dayRows.findIndex(
+            (r) =>
+              r.record_type !== "invoice" &&
+              dayRows.some(
+                (c) =>
+                  c.record_type === "invoice" &&
+                  balancesMatch(c.previous_balance, currentBalance - toNumber(r.paid_amount))
+              )
+          );
+        }
+
+        if (nextIndex === -1) nextIndex = 0;
+        const [row] = dayRows.splice(nextIndex, 1);
+
+        const paid = toNumber(row.paid_amount);
+        const remaining = toNumber(row.remaining_amount);
+
+        if (row.record_type === "invoice") {
+          currentBalance =
+            row.previous_balance != null
+              ? remaining
+              : currentBalance + remaining;
+        } else {
+          currentBalance -= paid;
+        }
+
+        orderedRows.push({
+          ...row,
+          remaining_amount: currentBalance,
+          running_balance: currentBalance,
+        });
+      }
+
+      start = end;
+    }
+
+    res.json(orderedRows);
   } catch (err) {
     console.error("CUSTOMER DEBT DETAILS ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });
