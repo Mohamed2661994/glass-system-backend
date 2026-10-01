@@ -448,8 +448,8 @@ async function createAdjustment(req, res) {
       return res.status(400).json({ error: "يرجى تحديد العامل والمبلغ بشكل صحيح (أكبر من صفر)" });
     }
 
-    if (!["bonus", "deduction", "overtime"].includes(type)) {
-      return res.status(400).json({ error: "نوع الحركة غير صالح (يجب أن يكون حافز أو خصم أو إضافي)" });
+    if (!["bonus", "deduction", "overtime", "retained_dues"].includes(type)) {
+      return res.status(400).json({ error: "نوع الحركة غير صالح (يجب أن يكون حافز أو خصم أو إضافي أو مستحق مرحل)" });
     }
 
     // Branch authorization check
@@ -564,6 +564,69 @@ async function deleteAdjustment(req, res) {
    ========================================================================== */
 
 /**
+ * Helper to get current Date object in Cairo timezone (Africa/Cairo)
+ */
+function getCairoNow() {
+  const str = new Date().toLocaleString("en-US", { timeZone: "Africa/Cairo" });
+  return new Date(str);
+}
+
+/**
+ * Checks if current date in Cairo allows paying the current cycle salary.
+ * - Weekly: Unlocked on Thursday (day === 4) OR retroactive (todayStr > periodEnd).
+ * - Monthly: Unlocked on the last day of the month OR retroactive (todayStr > periodEnd).
+ * Returns { isPayrollDay: boolean, isRetroactive: boolean, todayStr: string, reason: string }
+ */
+function checkIsPayrollDay(cycleType, periodEnd) {
+  const cairoNow = getCairoNow();
+  const year = cairoNow.getFullYear();
+  const month = String(cairoNow.getMonth() + 1).padStart(2, "0");
+  const day = String(cairoNow.getDate()).padStart(2, "0");
+  const todayStr = `${year}-${month}-${day}`;
+
+  const cleanEnd = String(periodEnd || "").slice(0, 10);
+
+  // If this is a historical period (ended before today), it is retroactive and always unlocked!
+  if (cleanEnd && cleanEnd < todayStr) {
+    return { isPayrollDay: true, isRetroactive: true, todayStr, reason: "فترة سابقة منتهية (أثر رجعي)" };
+  }
+
+  const normCycle = String(cycleType || "weekly").toLowerCase();
+
+  if (normCycle === "weekly" || normCycle === "daily") {
+    // Thursday is day 4 (Sunday=0, Monday=1, Tuesday=2, Wednesday=3, Thursday=4, Friday=5, Saturday=6)
+    const dayOfWeek = cairoNow.getDay();
+    const isThu = dayOfWeek === 4;
+    return {
+      isPayrollDay: isThu,
+      isRetroactive: false,
+      todayStr,
+      reason: isThu
+        ? "اليوم الخميس (موعد الصرف الأسبوعي الرسمي)"
+        : "صرف راتب الأسبوع الحالي متاح يوم الخميس فقط (أو للفترات المنتهية سابقاً).",
+    };
+  }
+
+  if (normCycle === "monthly") {
+    const curYear = cairoNow.getFullYear();
+    const curMonth = cairoNow.getMonth(); // 0-indexed
+    const lastDayOfMonth = new Date(curYear, curMonth + 1, 0).getDate();
+    const curDay = cairoNow.getDate();
+    const isLast = curDay >= lastDayOfMonth;
+    return {
+      isPayrollDay: isLast,
+      isRetroactive: false,
+      todayStr,
+      reason: isLast
+        ? "اليوم الأخير من الشهر (موعد الصرف الشهري الرسمي)"
+        : "صرف راتب الشهر الحالي متاح في اليوم الأخير من الشهر فقط (أو للفترات المنتهية سابقاً).",
+    };
+  }
+
+  return { isPayrollDay: true, isRetroactive: false, todayStr, reason: "" };
+}
+
+/**
  * GET /payroll/sheet?branch_id=1&cycle_type=weekly&period_start=YYYY-MM-DD&period_end=YYYY-MM-DD
  * Calculates proposed payout sheet with un-deducted advances
  */
@@ -658,6 +721,7 @@ async function getPayrollSheet(req, res) {
       WHERE pr.branch_id = $1
         AND pr.employee_id = ANY($2)
         AND pr.payment_status = 'paid'
+        AND pr.cycle_type != 'arrears'
         AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
         AND (
           (pr.period_start = $3 AND pr.period_end = $4)
@@ -757,6 +821,9 @@ async function getPayrollSheet(req, res) {
       const sumDeductions = empAdjustmentsList
         .filter((a) => a.type === "deduction")
         .reduce((s, a) => s + Number(a.amount || 0), 0);
+      const sumRetainedDues = empAdjustmentsList
+        .filter((a) => a.type === "retained_dues")
+        .reduce((s, a) => s + Number(a.amount || 0), 0);
 
       const overtimeAmount = isPaid ? Number(paidRecord.overtime_amount || 0) : sumOvertime;
       const bonusAmount = isPaid ? Number(paidRecord.bonus_amount || 0) : sumBonus;
@@ -771,9 +838,16 @@ async function getPayrollSheet(req, res) {
         ? 0
         : Math.max(0, Math.round((pendingAdvances - grossEarnings) * 100) / 100);
 
-      const paidNetAmount = isPaid
+      const currentPeriodNet = isPaid
         ? Number(paidRecord.net_amount || 0)
         : Math.max(0, Math.round((grossEarnings - pendingAdvances) * 100) / 100);
+
+      const carriedOverDues = isPaid ? 0 : Math.round(sumRetainedDues * 100) / 100;
+      const totalPayableNet = isPaid
+        ? Number(paidRecord.net_amount || 0)
+        : Math.round((currentPeriodNet + carriedOverDues) * 100) / 100;
+
+      const dayCheck = checkIsPayrollDay(emp.salary_type, periodEnd);
 
       return {
         employee_id: emp.id,
@@ -792,7 +866,13 @@ async function getPayrollSheet(req, res) {
         excess_advances: excessAdvances,
         advances_list: isPaid ? [] : empAdvances,
         adjustments_list: empAdjustmentsList,
-        net_amount: paidNetAmount,
+        carried_over_dues: carriedOverDues,
+        current_net: currentPeriodNet,
+        net_amount: isPaid ? currentPeriodNet : totalPayableNet,
+        is_payroll_day: dayCheck.isPayrollDay,
+        can_pay_current: dayCheck.isPayrollDay,
+        can_pay_arrears: carriedOverDues > 0,
+        lock_reason: dayCheck.isPayrollDay ? "" : dayCheck.reason,
         notes: isPaid ? (paidRecord.notes || "") : "",
         is_paid: isPaid,
         payout_info: isPaid
@@ -800,7 +880,7 @@ async function getPayrollSheet(req, res) {
               record_id: paidRecord.id,
               paid_at: paidRecord.paid_at,
               paid_by_name: paidRecord.paid_by_name,
-              net_amount: paidNetAmount,
+              net_amount: currentPeriodNet,
               cash_out_id: paidRecord.cash_out_id,
               permission_number: paidRecord.permission_number,
               cycle_type: paidRecord.cycle_type,
@@ -818,12 +898,17 @@ async function getPayrollSheet(req, res) {
       };
     });
 
+    const serverCheck = checkIsPayrollDay(rawCycle, periodEnd);
+
     res.json({
       success: true,
       branch_id: branchId,
       cycle_type: rawCycle,
       period_start: periodStart,
       period_end: periodEnd,
+      server_today: serverCheck.todayStr,
+      is_payroll_day: serverCheck.isPayrollDay,
+      lock_reason: serverCheck.isPayrollDay ? "" : serverCheck.reason,
       rows: sheetRows,
     });
   } catch (err) {
@@ -849,6 +934,7 @@ async function confirmPayrollPayout(req, res) {
       period_start,
       period_end,
       record_cash_out = true,
+      payout_scope = "full", // 'full' | 'arrears_only' | 'current_only' | 'carry_forward'
     } = req.body;
 
     if (!branch_id || !Array.isArray(items) || items.length === 0) {
@@ -868,6 +954,105 @@ async function confirmPayrollPayout(req, res) {
 
     for (const item of items) {
       const empId = Number(item.employee_id);
+      const empScope = item.payout_scope || payout_scope || "full";
+      const itemCycle = item.cycle_type || item.salary_type || cycle_type;
+
+      // -------------------------------------------------------------
+      // CASE 1: ARREARS ONLY (صرف المستحقات والمتأخرات السابقة فقط)
+      // متاح في أي يوم من أيام الأسبوع أو الشهر!
+      // -------------------------------------------------------------
+      if (empScope === "arrears_only") {
+        const arrearsRes = await client.query(
+          `
+          SELECT id, amount, reason, adjustment_date
+          FROM payroll_adjustments
+          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND type = 'retained_dues' AND adjustment_date <= $3
+          ORDER BY adjustment_date ASC, id ASC
+          `,
+          [safeBranchId, empId, safeEnd],
+        );
+
+        const arrearsAmount = arrearsRes.rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+        if (arrearsAmount <= 0) {
+          throw new Error(`لا توجد مستحقات مرحلة سابقة معلقة للصرف للعامل [${item.name || empId}].`);
+        }
+
+        let cashOutId = null;
+        let permissionNumber = null;
+        if (record_cash_out && arrearsAmount > 0) {
+          permissionNumber = generatePermissionNumber(safeEnd);
+          const cashOutRes = await client.query(
+            `
+            INSERT INTO cash_out 
+              (branch_id, name, amount, notes, transaction_date, permission_number, entry_type)
+            VALUES ($1, $2, $3, $4, $5, $6, 'expense')
+            RETURNING id
+            `,
+            [
+              safeBranchId,
+              `مستحقات مرحلة: ${item.name || "عامل"}`,
+              arrearsAmount,
+              `صرف مستحقات مرحلة سابقة للعامل ${item.name || ""} - بقيمة ${arrearsAmount} ج.م`,
+              safeEnd,
+              permissionNumber,
+            ],
+          );
+          cashOutId = cashOutRes.rows[0].id;
+          totalCashPaidOut += arrearsAmount;
+        }
+
+        // Insert into payroll_records with cycle_type = 'arrears' so it doesn't close current cycle
+        const recordRes = await client.query(
+          `
+          INSERT INTO payroll_records 
+            (branch_id, employee_id, cycle_type, period_start, period_end, base_amount, days_worked,
+             overtime_amount, bonus_amount, deductions_amount, advances_deducted, net_amount,
+             cash_out_id, payment_status, paid_at, paid_by, paid_by_name, notes)
+          VALUES ($1, $2, 'arrears', $3, $4, 0, 0, 0, 0, 0, 0, $5, $6, 'paid', NOW(), $7, $8, $9)
+          RETURNING *
+          `,
+          [
+            safeBranchId,
+            empId,
+            safeStart,
+            safeEnd,
+            arrearsAmount,
+            cashOutId,
+            user.id || null,
+            paidByName,
+            item.notes || `صرف مستحقات مرحلة سابقة بقيمة ${arrearsAmount} ج.م`,
+          ],
+        );
+
+        const payrollRecord = recordRes.rows[0];
+        createdRecords.push(payrollRecord);
+
+        // Mark the retained_dues adjustments as applied
+        const adjIds = arrearsRes.rows.map((r) => r.id);
+        await client.query(
+          `
+          UPDATE payroll_adjustments 
+          SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
+          WHERE id = ANY($2) AND branch_id = $3
+          `,
+          [payrollRecord.id, adjIds, safeBranchId],
+        );
+
+        continue; // Proceed to next employee item
+      }
+
+      // -------------------------------------------------------------
+      // CASES 2, 3, 4: CURRENT SALARY INVOLVED ('full', 'current_only', 'carry_forward')
+      // -------------------------------------------------------------
+      const dayCheck = checkIsPayrollDay(itemCycle, safeEnd);
+
+      // Enforce strict payroll day guard if paying cash for current cycle
+      if (empScope !== "carry_forward" && !dayCheck.isPayrollDay) {
+        throw new Error(
+          `غير مصرح بصرف راتب الفترة الحالية للعامل [${item.name || empId}] قبل موعد الصرف الرسمي (${dayCheck.reason})`
+        );
+      }
+
       const baseAmount = Number(item.base_amount || 0);
       const daysWorked = Number(item.days_worked || 0);
       const overtimeAmount = Number(item.overtime_amount || 0);
@@ -896,15 +1081,14 @@ async function confirmPayrollPayout(req, res) {
         );
       }
 
-      const itemCycle = item.cycle_type || item.salary_type || cycle_type;
-
-      // 0. Double payout guard: ensure employee has not already been paid for this period with an active cash_out
+      // Double payout guard: ensure employee has not already been paid for this period with an active cash_out
       const dupCheck = await client.query(
         `
         SELECT pr.id, pr.paid_at 
         FROM payroll_records pr
         LEFT JOIN cash_out co ON pr.cash_out_id = co.id
         WHERE pr.branch_id = $1 AND pr.employee_id = $2 AND pr.payment_status = 'paid'
+          AND pr.cycle_type != 'arrears'
           AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
           AND (
             (pr.period_start = $3 AND pr.period_end = $4)
@@ -918,11 +1102,40 @@ async function confirmPayrollPayout(req, res) {
         throw new Error(`تم اعتماد وصرف راتب العامل [${item.name || empId}] بالفعل عن هذه الفترة.`);
       }
 
-      // 1. Create cash_out voucher if netAmount > 0 and requested
+      // Fetch pending retained_dues if scope is 'full'
+      let retainedDuesAmount = 0;
+      let retainedDuesAdjIds = [];
+      if (empScope === "full") {
+        const retainedRes = await client.query(
+          `
+          SELECT id, amount 
+          FROM payroll_adjustments
+          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND type = 'retained_dues' AND adjustment_date <= $3
+          `,
+          [safeBranchId, empId, safeEnd],
+        );
+        retainedDuesAmount = retainedRes.rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+        retainedDuesAdjIds = retainedRes.rows.map((r) => r.id);
+      }
+
+      const totalCashToPay = empScope === "full" ? (netAmount + retainedDuesAmount) : netAmount;
+
+      // 1. Create cash_out voucher if totalCashToPay > 0 and requested (and not carry_forward)
       let cashOutId = null;
       let permissionNumber = null;
-      if (record_cash_out && netAmount > 0) {
+      if (record_cash_out && empScope !== "carry_forward" && totalCashToPay > 0) {
         permissionNumber = generatePermissionNumber(safeEnd);
+        const nameTitle = empScope === "full" && retainedDuesAmount > 0
+          ? `راتب ومستحقات: ${item.name || "عامل"}`
+          : `راتب: ${item.name || "عامل"}`;
+
+        const notesBreakdown = [
+          `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} : ${item.name || ""}`,
+          `الفترة من ${safeStart} إلى ${safeEnd}`,
+          retainedDuesAmount > 0 ? `(شامل ${retainedDuesAmount} ج مستحقات مرحلة سابقة)` : null,
+          actualDeductedInRecord > 0 ? `(بعد خصم سلف ${actualDeductedInRecord} ج)` : null,
+        ].filter(Boolean).join(" - ");
+
         const cashOutRes = await client.query(
           `
           INSERT INTO cash_out 
@@ -932,15 +1145,15 @@ async function confirmPayrollPayout(req, res) {
           `,
           [
             safeBranchId,
-            `راتب: ${item.name || "عامل"}`,
-            netAmount,
-            `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} : ${item.name || ""} - الفترة من ${safeStart} إلى ${safeEnd}${actualDeductedInRecord > 0 ? ` (بعد خصم سلف ${actualDeductedInRecord} ج)` : ""}`,
+            nameTitle,
+            totalCashToPay,
+            notesBreakdown,
             safeEnd,
             permissionNumber,
           ],
         );
         cashOutId = cashOutRes.rows[0].id;
-        totalCashPaidOut += netAmount;
+        totalCashPaidOut += totalCashToPay;
       }
 
       // 2. Prepare notes and insert into payroll_records
@@ -949,6 +1162,16 @@ async function confirmPayrollPayout(req, res) {
         const carryMsg = `(تم استهلاك كامل الراتب مقابل السلف، وترحيل ${carryOverExcess} ج سلف متبقية للأسبوع القادم)`;
         recordNotes = recordNotes ? `${recordNotes} - ${carryMsg}` : carryMsg;
       }
+      if (empScope === "full" && retainedDuesAmount > 0) {
+        const retMsg = `(تم صرف مستحقات مرحلة سابقة بقيمة ${retainedDuesAmount} ج مع الراتب)`;
+        recordNotes = recordNotes ? `${recordNotes} - ${retMsg}` : retMsg;
+      }
+      if (empScope === "carry_forward") {
+        const fwdMsg = `(تم ترحيل صافي المستحق ${netAmount} ج كمتأخرات للمسير القادم دون صرف نقدية)`;
+        recordNotes = recordNotes ? `${recordNotes} - ${fwdMsg}` : fwdMsg;
+      }
+
+      const paymentStatus = empScope === "carry_forward" ? "carried_forward" : "paid";
 
       const recordRes = await client.query(
         `
@@ -956,7 +1179,7 @@ async function confirmPayrollPayout(req, res) {
           (branch_id, employee_id, cycle_type, period_start, period_end, base_amount, days_worked,
            overtime_amount, bonus_amount, deductions_amount, advances_deducted, net_amount,
            cash_out_id, payment_status, paid_at, paid_by, paid_by_name, notes)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'paid', NOW(), $14, $15, $16)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17)
         RETURNING *
         `,
         [
@@ -971,8 +1194,9 @@ async function confirmPayrollPayout(req, res) {
           bonusAmount,
           deductionsAmount,
           actualDeductedInRecord,
-          netAmount,
+          empScope === "carry_forward" ? 0 : totalCashToPay,
           cashOutId,
+          paymentStatus,
           user.id || null,
           paidByName,
           recordNotes || null,
@@ -981,6 +1205,30 @@ async function confirmPayrollPayout(req, res) {
 
       const payrollRecord = recordRes.rows[0];
       createdRecords.push(payrollRecord);
+
+      // If carry_forward: insert netAmount as retained_dues for the next cycle
+      if (empScope === "carry_forward" && netAmount > 0) {
+        const nextDayObj = new Date(safeEnd + "T12:00:00");
+        nextDayObj.setDate(nextDayObj.getDate() + 1);
+        const nextDateStr = nextDayObj.toISOString().slice(0, 10);
+
+        await client.query(
+          `
+          INSERT INTO payroll_adjustments 
+            (branch_id, employee_id, type, amount, adjustment_date, reason, status, created_by, created_by_name)
+          VALUES ($1, $2, 'retained_dues', $3, $4, $5, 'pending', $6, $7)
+          `,
+          [
+            safeBranchId,
+            empId,
+            netAmount,
+            nextDateStr,
+            `مستحق مرحل من مسير الفترة (${safeStart} إلى ${safeEnd})`,
+            user.id || null,
+            paidByName,
+          ],
+        );
+      }
 
       // 3. Mark linked advances as deducted
       const advanceIds = Array.isArray(item.advance_ids) ? item.advance_ids.map(Number).filter(Boolean) : [];
@@ -1047,6 +1295,18 @@ async function confirmPayrollPayout(req, res) {
           WHERE employee_id = $2 AND branch_id = $3 AND status = 'pending' AND adjustment_date <= $4
           `,
           [payrollRecord.id, empId, safeBranchId, safeEnd],
+        );
+      }
+
+      // If scope was 'full' and had retained_dues, ensure they are marked applied with this payroll_record_id
+      if (empScope === "full" && retainedDuesAdjIds.length > 0) {
+        await client.query(
+          `
+          UPDATE payroll_adjustments 
+          SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
+          WHERE id = ANY($2) AND branch_id = $3
+          `,
+          [payrollRecord.id, retainedDuesAdjIds, safeBranchId],
         );
       }
 
