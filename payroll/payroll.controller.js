@@ -1020,9 +1020,13 @@ async function confirmPayrollPayout(req, res) {
           throw new Error(`لا توجد مستحقات مرحلة سابقة معلقة للصرف للعامل [${item.name || empId}].`);
         }
 
+        const shouldRecordCashOut = item.record_cash_out !== undefined
+          ? Boolean(item.record_cash_out)
+          : (record_cash_out !== undefined ? Boolean(record_cash_out) : true);
+
         let cashOutId = null;
         let permissionNumber = null;
-        if (record_cash_out && arrearsAmount > 0) {
+        if (shouldRecordCashOut && arrearsAmount > 0) {
           permissionNumber = generatePermissionNumber(safeEnd);
           const cashOutRes = await client.query(
             `
@@ -1035,7 +1039,7 @@ async function confirmPayrollPayout(req, res) {
               safeBranchId,
               `مستحقات مرحلة: ${item.name || "عامل"}`,
               arrearsAmount,
-              `صرف مستحقات مرحلة سابقة للعامل ${item.name || ""} - بقيمة ${arrearsAmount} ج.م`,
+              item.notes || `صرف مستحقات مرحلة سابقة للعامل ${item.name || ""} - بقيمة ${arrearsAmount} ج.م`,
               safeEnd,
               permissionNumber,
             ],
@@ -1043,6 +1047,12 @@ async function confirmPayrollPayout(req, res) {
           cashOutId = cashOutRes.rows[0].id;
           totalCashPaidOut += arrearsAmount;
         }
+
+        const notesText = item.notes
+          ? String(item.notes).trim()
+          : (shouldRecordCashOut
+              ? `صرف مستحقات مرحلة سابقة بقيمة ${arrearsAmount} ج.م`
+              : `تسوية مستحقات مرحلة سابقة بقيمة ${arrearsAmount} ج.م (تسوية داخلية دون تسجيل سند باليومية)`);
 
         // Insert into payroll_records with cycle_type = 'arrears' so it doesn't close current cycle
         const recordRes = await client.query(
@@ -1063,7 +1073,7 @@ async function confirmPayrollPayout(req, res) {
             cashOutId,
             user.id || null,
             paidByName,
-            item.notes || `صرف مستحقات مرحلة سابقة بقيمة ${arrearsAmount} ج.م`,
+            notesText,
           ],
         );
 
