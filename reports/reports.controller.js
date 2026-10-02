@@ -1587,7 +1587,7 @@ exports.getWarehouseAccount = async (req, res) => {
       `
       SELECT
         st.id                                             AS transfer_id,
-        (st.created_at AT TIME ZONE 'Africa/Cairo')::date AS date,
+        to_char(st.created_at AT TIME ZONE 'Africa/Cairo', 'YYYY-MM-DD') AS date,
         st.note                                           AS note,
         COALESCE(SUM(sti.total_price), 0)                 AS amount
       FROM stock_transfer_items sti
