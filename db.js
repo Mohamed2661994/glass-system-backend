@@ -1,4 +1,7 @@
-const { Pool } = require("pg");
+const { Pool, types } = require("pg");
+// Ensure PostgreSQL DATE columns (OID 1082) return exact 'YYYY-MM-DD' strings,
+// preventing UTC timezone offset shifts when serialized to JSON.
+types.setTypeParser(1082, (val) => val);
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
