@@ -62,7 +62,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.9.25";
+const SYSTEM_VERSION = "v.26.10.2";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -352,12 +352,18 @@ app.get("/health", async (req, res) => {
   const isDataStudio =
     primaryHost.includes("dbstudio") ||
     primaryHost.startsWith("100.") ||
-    primaryHost === "34.45.146.89";
+    primaryHost === "34.45.146.89" ||
+    primaryHost.startsWith("igk75") ||
+    primaryHost.includes("164.68.115.239");
   const primaryName = isDataStudio
-    ? "Data Studio Dedicated Container"
+    ? "Data Studio Dedicated Server"
     : primaryHost.includes("18.185.48.10")
       ? "AWS Cloud"
       : primaryHost;
+
+  const displayHost = primaryHost.startsWith("igk75")
+    ? (process.env.DB_DISPLAY_HOST || "164.68.115.239:5433")
+    : primaryHost;
 
   res.json({
     status: "ok",
@@ -366,7 +372,7 @@ app.get("/health", async (req, res) => {
     activeDb: dbState.activeDb || "primary",
     activeServer: {
       name: primaryName,
-      host: primaryHost,
+      host: displayHost,
       role: "الأساسي (Master)",
       status: "online",
       isDataStudio: isDataStudio
