@@ -361,8 +361,8 @@ app.get("/health", async (req, res) => {
       ? "AWS Cloud"
       : primaryHost;
 
-  const displayHost = primaryHost.startsWith("igk75")
-    ? (process.env.DB_DISPLAY_HOST || "164.68.115.239:5433")
+  const displayHost = isDataStudio
+    ? (process.env.DB_DISPLAY_HOST || "dbstudio.hg-alshour.online")
     : primaryHost;
 
   res.json({
