@@ -11,6 +11,59 @@ function generatePermissionNumber(dateStr) {
   return `${datePart}-${randomPart}`;
 }
 
+/**
+ * Format job title with appropriate Arabic prefix for receipts and vouchers
+ * e.g., 'مدير' -> 'للمدير', 'عامل' -> 'للعامل', 'سائق' -> 'للسائق', 'Marketing Manager' -> 'لـ (Marketing Manager)'
+ */
+function formatJobTitleWithPrefix(jobTitle) {
+  if (!jobTitle || !String(jobTitle).trim()) return "للموظف";
+  const title = String(jobTitle).trim();
+
+  const map = {
+    "مدير": "للمدير",
+    "المدير": "للمدير",
+    "عامل": "للعامل",
+    "العامل": "للعامل",
+    "سائق": "للسائق",
+    "السائق": "للسائق",
+    "سواق": "للسائق",
+    "محاسب": "للمحاسب",
+    "المحاسب": "للمحاسب",
+    "مشرف": "للمشرف",
+    "المشرف": "للمشرف",
+    "مندوب": "للمندوب",
+    "المندوب": "للمندوب",
+    "كاشير": "للكاشير",
+    "الكاشير": "للكاشير",
+    "مسؤول": "للمسؤول",
+    "المسؤول": "للمسؤول",
+    "أمين مخزن": "لأمين المخزن",
+    "امين مخزن": "لأمين المخزن",
+    "فني": "للفني",
+    "الفني": "للفني",
+    "عامل مخزن": "لعامل المخزن",
+    "عامل معرض": "لعامل المعرض",
+  };
+
+  if (map[title]) {
+    return map[title];
+  }
+
+  if (title.startsWith("لـ") || title.startsWith("لل")) {
+    return title;
+  }
+
+  if (title.startsWith("ال")) {
+    return `لل${title.slice(2)}`;
+  }
+
+  if (/^[\u0600-\u06FF\s]+$/.test(title)) {
+    return `لـ ${title}`;
+  }
+
+  return `لـ (${title})`;
+}
+
 /* ==========================================================================
    1. EMPLOYEES MANAGEMENT (PER BRANCH)
    ========================================================================== */
@@ -259,6 +312,7 @@ async function createAdvance(req, res) {
     let permissionNumber = null;
     if (record_cash_out) {
       permissionNumber = generatePermissionNumber(safeDate);
+      const rolePrefix = formatJobTitleWithPrefix(emp.job_title);
       const cashOutRes = await client.query(
         `
         INSERT INTO cash_out 
@@ -270,7 +324,7 @@ async function createAdvance(req, res) {
           safeBranchId,
           `سلفة مرتب: ${emp.name}`,
           safeAmount,
-          `سلفة نقدية للعامل: ${emp.name}${notes ? ` - ${notes}` : ""}`,
+          `سلفة نقدية ${rolePrefix}: ${emp.name}${notes ? ` - ${notes}` : ""}`,
           safeDate,
           permissionNumber,
         ],
@@ -1028,6 +1082,7 @@ async function confirmPayrollPayout(req, res) {
         let permissionNumber = null;
         if (shouldRecordCashOut && arrearsAmount > 0) {
           permissionNumber = generatePermissionNumber(safeEnd);
+          const rolePrefix = formatJobTitleWithPrefix(item.job_title);
           const cashOutRes = await client.query(
             `
             INSERT INTO cash_out 
@@ -1037,9 +1092,9 @@ async function confirmPayrollPayout(req, res) {
             `,
             [
               safeBranchId,
-              `مستحقات مرحلة: ${item.name || "عامل"}`,
+              `مستحقات مرحلة: ${item.name || "موظف"}`,
               arrearsAmount,
-              item.notes || `صرف مستحقات مرحلة سابقة للعامل ${item.name || ""} - بقيمة ${arrearsAmount} ج.م`,
+              item.notes || `صرف مستحقات مرحلة سابقة ${rolePrefix}: ${item.name || ""} - بقيمة ${arrearsAmount} ج.م`,
               safeEnd,
               permissionNumber,
             ],
@@ -1179,11 +1234,12 @@ async function confirmPayrollPayout(req, res) {
       if (record_cash_out && empScope !== "carry_forward" && totalCashToPay > 0) {
         permissionNumber = generatePermissionNumber(safeEnd);
         const nameTitle = empScope === "full" && retainedDuesAmount > 0
-          ? `راتب ومستحقات: ${item.name || "عامل"}`
-          : `راتب: ${item.name || "عامل"}`;
+          ? `راتب ومستحقات: ${item.name || "موظف"}`
+          : `راتب: ${item.name || "موظف"}`;
 
+        const rolePrefix = formatJobTitleWithPrefix(item.job_title);
         const notesBreakdown = [
-          `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} : ${item.name || ""}`,
+          `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} ${rolePrefix}: ${item.name || ""}`,
           `الفترة من ${safeStart} إلى ${safeEnd}`,
           retainedDuesAmount > 0 ? `(شامل ${retainedDuesAmount} ج مستحقات مرحلة سابقة)` : null,
           actualDeductedInRecord > 0 ? `(بعد خصم سلف ${actualDeductedInRecord} ج)` : null,
@@ -1806,7 +1862,7 @@ async function getEmployeeLedger(req, res) {
         `
         SELECT 
           pa.id, 'advance' as tx_type, pa.amount, pa.advance_date as tx_date,
-          COALESCE(pa.notes, 'سلفة نقدية للعامل') as description,
+          COALESCE(pa.notes, 'سلفة نقدية للموظف') as description,
           co.permission_number, pa.created_by_name as actor_name, pa.status,
           pa.notes
         FROM payroll_advances pa
