@@ -4114,6 +4114,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       created_by_name,
       supplier_name,
       supplier_phone,
+      cash_breakdown = null,
       force_journal_post_when_unpaid = false,
     } = req.body;
     if (invoice_type !== "wholesale") {
@@ -4253,10 +4254,11 @@ app.post("/invoices", authMiddleware, async (req, res) => {
   supplier_id,
   supplier_name,
   supplier_phone,
-  notes
+  notes,
+  cash_breakdown
 )
 VALUES
-($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
       RETURNING id
       `,
       [
@@ -4284,6 +4286,7 @@ VALUES
         supplier_name || null,
         supplier_phone || null,
         notes || null,
+        cash_breakdown ? JSON.stringify(cash_breakdown) : null,
       ],
     );
 
@@ -4577,6 +4580,7 @@ app.post("/invoices/retail", async (req, res) => {
       supplier_name,
       supplier_phone,
       notes,
+      cash_breakdown = null,
       force_journal_post_when_unpaid = false,
     } = req.body;
 
@@ -4687,10 +4691,11 @@ app.post("/invoices/retail", async (req, res) => {
         supplier_id,
         supplier_name,
         supplier_phone,
-        notes
+        notes,
+        cash_breakdown
       )
       VALUES
-      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+      ($1,'retail',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
       RETURNING id
       `,
       [
@@ -4716,6 +4721,7 @@ app.post("/invoices/retail", async (req, res) => {
         supplier_name || null,
         supplier_phone || null,
         notes || null,
+        cash_breakdown ? JSON.stringify(cash_breakdown) : null,
       ],
     );
 
@@ -4959,6 +4965,7 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
       supplier_phone,
       invoice_date,
       notes,
+      cash_breakdown,
     } = req.body;
 
     if (!items || !items.length || final_total === undefined) {
@@ -5191,7 +5198,8 @@ SET
   supplier_phone = $17,
   invoice_date = COALESCE($18::date, invoice_date),
   notes = $19,
-  invoice_revision = $21
+  invoice_revision = $21,
+  cash_breakdown = COALESCE($22::jsonb, cash_breakdown)
 WHERE id = $14
 RETURNING invoice_revision
       `,
@@ -5217,6 +5225,7 @@ RETURNING invoice_revision
         notes || null,
         customerId,
         currentRevision + 1,
+        cash_breakdown !== undefined ? (cash_breakdown ? JSON.stringify(cash_breakdown) : null) : null,
       ],
     );
 
@@ -5648,6 +5657,7 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
       supplier_phone,
       invoice_date,
       notes,
+      cash_breakdown,
     } = req.body;
     if (!items || !items.length) {
       throw new Error("لا يوجد أصناف في الفاتورة");
@@ -5890,7 +5900,8 @@ SET
     supplier_phone = $18,
     invoice_date = COALESCE($19::date, invoice_date),
       notes = $20,
-      invoice_revision = $22
+      invoice_revision = $22,
+      cash_breakdown = COALESCE($23::jsonb, cash_breakdown)
   WHERE id = $15
       RETURNING invoice_revision
   `,
@@ -5917,6 +5928,7 @@ SET
         notes || null,
         customerId,
         currentRevision + 1,
+        cash_breakdown !== undefined ? (cash_breakdown ? JSON.stringify(cash_breakdown) : null) : null,
       ],
     );
 
