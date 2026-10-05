@@ -358,11 +358,14 @@ app.get("/health", async (req, res) => {
   // Real live database metrics
   let dbStats = { invoicesCount: 3248, tablesCount: 49, status: "connected" };
   try {
-    const statsRes = await pool.query(`
-      SELECT 
-        (SELECT COUNT(*) FROM invoices) AS invoices_count,
-        (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public') AS tables_count
-    `);
+    const statsRes = await Promise.race([
+      pool.query(`
+        SELECT 
+          (SELECT COUNT(*) FROM invoices) AS invoices_count,
+          (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public') AS tables_count
+      `),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DB Query Timeout')), 1500))
+    ]);
     if (statsRes.rows[0]) {
       dbStats = {
         invoicesCount: parseInt(statsRes.rows[0].invoices_count, 10),
