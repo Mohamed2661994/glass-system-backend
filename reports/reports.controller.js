@@ -1442,14 +1442,15 @@ exports.getCustomerDebtDetails = async (req, res) => {
       SELECT
         'invoice' AS record_type,
         i.id AS invoice_id,
-        i.invoice_date,
+        to_char(i.invoice_date, 'YYYY-MM-DD') AS invoice_date,
         COALESCE(i.subtotal, i.total) AS subtotal,
         COALESCE(i.discount_total, 0) AS discount_total,
         i.total,
         i.paid_amount,
         i.remaining_amount,
         ${prevBalanceCol},
-        ${additionalAmountCol}
+        ${additionalAmountCol},
+        to_char(i.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
       FROM invoices i
       ${invoiceWhere}
 
@@ -1459,18 +1460,19 @@ exports.getCustomerDebtDetails = async (req, res) => {
       SELECT
         'payment' AS record_type,
         cp.id AS invoice_id,
-        COALESCE(cp.transaction_date::timestamp, cp.created_at) AS invoice_date,
+        to_char(COALESCE(cp.transaction_date, cp.created_at::date), 'YYYY-MM-DD') AS invoice_date,
         0 AS subtotal,
         0 AS discount_total,
         0 AS total,
         cp.amount AS paid_amount,
         0 AS remaining_amount,
         0 AS previous_balance,
-        0 AS additional_amount
+        0 AS additional_amount,
+        to_char(cp.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
       FROM cash_in cp
       ${paymentWhere}
 
-      ORDER BY invoice_date ASC
+      ORDER BY invoice_date ASC, created_at ASC
       `,
       values,
     );
@@ -1492,10 +1494,17 @@ exports.getCustomerDebtDetails = async (req, res) => {
     // ⚡ ترتيب ذكي للحركات المتزامنة في نفس اليوم (مثل سداد دفعة تسبق فاتورة مسجل بها الحساب السابق)
     const indexed = result.rows.map((row, index) => ({ row, index }));
     indexed.sort((left, right) => {
-      const leftKey = toIsoDateString(left.row.invoice_date);
-      const rightKey = toIsoDateString(right.row.invoice_date);
-      const byDate = leftKey.localeCompare(rightKey);
-      return byDate !== 0 ? byDate : left.index - right.index;
+      const leftDate = (left.row.invoice_date || "").substring(0, 10);
+      const rightDate = (right.row.invoice_date || "").substring(0, 10);
+      const byDate = leftDate.localeCompare(rightDate);
+      if (byDate !== 0) return byDate;
+
+      const leftTime = left.row.created_at || "";
+      const rightTime = right.row.created_at || "";
+      const byTime = leftTime.localeCompare(rightTime);
+      if (byTime !== 0) return byTime;
+
+      return left.index - right.index;
     });
 
     const orderedRows = [];
@@ -1503,11 +1512,11 @@ exports.getCustomerDebtDetails = async (req, res) => {
     let start = 0;
 
     while (start < indexed.length) {
-      const dayKey = toIsoDateString(indexed[start].row.invoice_date).substring(0, 10);
+      const dayKey = (indexed[start].row.invoice_date || "").substring(0, 10);
       let end = start;
       while (
         end < indexed.length &&
-        toIsoDateString(indexed[end].row.invoice_date).substring(0, 10) === dayKey
+        (indexed[end].row.invoice_date || "").substring(0, 10) === dayKey
       ) {
         end++;
       }
