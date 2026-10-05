@@ -355,7 +355,7 @@ app.get("/health", async (req, res) => {
   // Real live database metrics
   let dbStats = { invoicesCount: 3248, tablesCount: 49, status: "connected" };
   try {
-    const statsRes = await primaryPool.query(`
+    const statsRes = await pool.query(`
       SELECT 
         (SELECT COUNT(*) FROM invoices) AS invoices_count,
         (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public') AS tables_count
