@@ -197,8 +197,11 @@ app.use((req, res, next) => {
   if (req.path.startsWith("/socket.io")) return next();
   // Check auth
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-  const token = authHeader.split(" ")[1];
+  let token = authHeader ? authHeader.split(" ")[1] : null;
+  if (!token && req.query.token) {
+    token = String(req.query.token);
+  }
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
   try {
     const decoded = verifyJwtToken(token);
     req.user = decoded;
@@ -372,7 +375,7 @@ app.get("/health", async (req, res) => {
   }
 
   // Real server backup snapshot
-  const realBackup = {
+  const realBackup = lastBackup || {
     file: "glass_system_backup_sync2_2026-10-05.sql",
     time: "2026-10-05T11:46:34.848Z",
     sizeMB: 22.0,
@@ -642,22 +645,55 @@ const PG_DUMP = isWindows
   : "pg_dump";
 
 function getDbEnv(target) {
+  let host = process.env.DB_HOST_LOCAL || process.env.DB_HOST || "100.91.137.34";
+  let port = process.env.DB_PORT_LOCAL || process.env.DB_PORT || "5433";
+  let user = process.env.DB_USER_LOCAL || process.env.DB_USER || "hoglass_admin";
+  let pass = process.env.DB_PASSWORD_LOCAL || process.env.DB_PASSWORD || "HogSecure_CZEwRK2qt1lsngI4ZXurJIA0RcTkgBGNEnTFLz";
+  let name = process.env.DB_NAME_LOCAL || process.env.DB_NAME || "postgres";
+
   if (target === "cloud") {
-    return {
-      host: process.env.DB_HOST_CLOUD,
-      port: process.env.DB_PORT_CLOUD || "5432",
-      user: process.env.DB_USER_CLOUD,
-      pass: process.env.DB_PASSWORD_CLOUD,
-      name: process.env.DB_NAME_CLOUD,
-    };
+    host = process.env.DB_HOST_CLOUD || host;
+    port = process.env.DB_PORT_CLOUD || port;
+    user = process.env.DB_USER_CLOUD || user;
+    pass = process.env.DB_PASSWORD_CLOUD || pass;
+    name = process.env.DB_NAME_CLOUD || name;
   }
-  return {
-    host: process.env.DB_HOST_LOCAL,
-    port: process.env.DB_PORT_LOCAL || "5432",
-    user: process.env.DB_USER_LOCAL,
-    pass: process.env.DB_PASSWORD_LOCAL,
-    name: process.env.DB_NAME_LOCAL,
-  };
+
+  if (process.env.DATABASE_URL) {
+    try {
+      const u = new URL(process.env.DATABASE_URL);
+      if (u.hostname) host = u.hostname;
+      if (u.port) port = u.port;
+      if (u.username) user = decodeURIComponent(u.username);
+      if (u.password) pass = decodeURIComponent(u.password);
+      if (u.pathname && u.pathname.length > 1) name = u.pathname.slice(1);
+    } catch {}
+  }
+
+  return { host, port, user, pass, name };
+}
+
+function pruneLocalBackups(keepCount = 5) {
+  try {
+    const bDir = isWindows ? "D:\\glass-backups" : path.join(__dirname, "backups");
+    if (!fs.existsSync(bDir)) return;
+    const files = fs
+      .readdirSync(bDir)
+      .filter((f) => f.startsWith("glass_system_") && f.endsWith(".sql"))
+      .map((f) => ({
+        name: f,
+        path: path.join(bDir, f),
+        mtime: fs.statSync(path.join(bDir, f)).mtimeMs,
+      }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (files.length > keepCount) {
+      for (const oldFile of files.slice(keepCount)) {
+        try {
+          fs.unlinkSync(oldFile.path);
+        } catch {}
+      }
+    }
+  } catch {}
 }
 
 function buildPgCmd(tool, dbEnv, extraArgs) {
@@ -768,64 +804,108 @@ async function uploadToDrive(filePath) {
   return res.data;
 }
 
-/* ── Admin: Manual Backup (SSE progress) ── */
-app.post("/admin/backup", requireAdminRole, (req, res) => {
-  const send = setupSSE(res);
-  send(5, "جاري تجهيز الباك أب...");
+/* ── Admin: Instant Backup & Direct Device Download ── */
+app.get("/admin/backup/download", requireAdminRole, async (req, res) => {
+  try {
+    const bDir = isWindows ? "D:\\glass-backups" : path.join(__dirname, "backups");
+    if (!fs.existsSync(bDir)) {
+      fs.mkdirSync(bDir, { recursive: true });
+    }
 
-  if (!fs.existsSync(BACKUP_DIR)) {
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const ts = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+    const fileName = `glass_system_backup_${ts}.sql`;
+    const filePath = path.join(bDir, fileName);
+
+    const dbEnv = getDbEnv();
+    const cmd = buildPgCmd(
+      PG_DUMP,
+      dbEnv,
+      `--clean --if-exists --no-owner --no-privileges --encoding=UTF8 -f "${filePath}"`,
+    );
+
+    console.log(`[Backup] Starting instant database export to ${fileName}...`);
+    exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error("Backup export error:", err.message, stderr);
+        return res.status(500).json({ error: `فشل استخراج الباك أب: ${err.message}` });
+      }
+
+      if (!fs.existsSync(filePath)) {
+        return res.status(500).json({ error: "ملف النسخة الاحتياطية غير موجود بعد التصدير" });
+      }
+
+      const size = fs.statSync(filePath).size;
+      const sizeMB = (size / 1024 / 1024).toFixed(2);
+      console.log(`[Backup] Export complete (${sizeMB} MB). Sending download to client...`);
+
+      res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+      res.setHeader("Content-Type", "application/sql");
+      res.setHeader("Content-Length", size);
+
+      res.download(filePath, fileName, (downloadErr) => {
+        if (downloadErr && !res.headersSent) {
+          console.error("Download error:", downloadErr.message);
+        }
+        pruneLocalBackups(5);
+      });
+    });
+  } catch (e) {
+    console.error("Backup download error:", e);
+    res.status(500).json({ error: e.message || "Server backup error" });
+  }
+});
+
+/* ── Admin: Download Specific Backup File ── */
+app.get("/admin/backup/download/:file", requireAdminRole, (req, res) => {
+  const bDir = isWindows ? "D:\\glass-backups" : path.join(__dirname, "backups");
+  const safeFile = path.basename(req.params.file);
+  const filePath = path.join(bDir, safeFile);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "الملف غير موجود" });
+  }
+  res.download(filePath, safeFile);
+});
+
+/* ── Admin: Manual Backup (JSON / SSE) ── */
+app.post("/admin/backup", requireAdminRole, (req, res) => {
+  const bDir = isWindows ? "D:\\glass-backups" : path.join(__dirname, "backups");
+  if (!fs.existsSync(bDir)) {
+    fs.mkdirSync(bDir, { recursive: true });
   }
 
-  const ts = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}_${String(d.getHours()).padStart(2, "0")}-${String(d.getMinutes()).padStart(2, "0")}`;
-  })();
-  const backupFile = path.join(BACKUP_DIR, `glass_system_${ts}.sql`);
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const ts = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+  const fileName = `glass_system_backup_${ts}.sql`;
+  const filePath = path.join(bDir, fileName);
 
   const dbEnv = getDbEnv();
   const cmd = buildPgCmd(
     PG_DUMP,
     dbEnv,
-    `--clean --if-exists --no-owner --no-privileges --inserts --encoding=UTF8 -f "${backupFile}"`,
+    `--clean --if-exists --no-owner --no-privileges --encoding=UTF8 -f "${filePath}"`,
   );
 
-  send(15, "جاري تصدير قاعدة البيانات...");
-
-  exec(cmd, { timeout: 180000 }, async (err, stdout, stderr) => {
+  exec(cmd, { timeout: 180000 }, (err, stdout, stderr) => {
     if (err) {
       console.error("backup error:", err.message, stderr);
-      return send(0, `فشل الباك أب: ${err.message}`, false, true);
+      return res.status(500).json({ error: `فشل الباك أب: ${err.message}` });
     }
     try {
-      const size = fs.statSync(backupFile).size;
-      const sizeMB = (size / 1024 / 1024).toFixed(2);
-
-      send(65, `تم التصدير (${sizeMB} MB) — جاري الرفع على Google Drive...`);
-
-      try {
-        await uploadToDrive(backupFile);
-        send(
-          100,
-          `تم الباك أب + الرفع على Drive: ${path.basename(backupFile)} (${sizeMB} MB)`,
-          true,
-          false,
-          { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
-        );
-      } catch (uploadErr) {
-        console.error("Drive upload error:", uploadErr.message);
-        send(
-          100,
-          `تم الباك أب: ${path.basename(backupFile)} (${sizeMB} MB) — فشل الرفع على Drive: ${uploadErr.message}`,
-          true,
-          false,
-          { file: path.basename(backupFile), sizeMB: parseFloat(sizeMB) },
-        );
-      }
+      const size = fs.statSync(backupFile || filePath).size;
+      const sizeMB = parseFloat((size / 1024 / 1024).toFixed(2));
+      pruneLocalBackups(5);
+      res.json({
+        success: true,
+        file: fileName,
+        sizeMB,
+        downloadUrl: `/admin/backup/download/${fileName}`,
+        message: `تم إنشاء النسخة الاحتياطية بنجاح (${sizeMB} MB)`,
+      });
     } catch (e) {
-      send(0, e.message, false, true);
-    } finally {
-      pruneLocalBackups(2);
+      res.status(500).json({ error: e.message });
     }
   });
 });
