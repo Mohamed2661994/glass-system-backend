@@ -377,12 +377,12 @@ app.get("/health", async (req, res) => {
       status: "online",
       isDataStudio: isDataStudio
     },
-    standbyServer: {
+    standbyServer: (process.env.STANDBY_BACKUP_ENABLED === "true" && process.env.IS_STANDBY_WORKER === "true") ? {
       name: "AWS Cloud Standby",
       host: standbyHost,
       role: "الاحتياطي اللحظي (Standby)",
       status: "synchronized"
-    },
+    } : null,
     localAlive: dbState.localAlive,
     cloudAlive: dbState.cloudAlive,
     syncInProgress: dbState.syncInProgress,
