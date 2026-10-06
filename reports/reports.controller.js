@@ -195,12 +195,42 @@ exports.getProductMovement = async (req, res) => {
   }
 };
 
+// 📦 Stock In-Memory Cache (LRU/TTL pattern with instant real-time invalidation)
+const productStockCache = new Map();
+const PRODUCT_STOCK_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes max TTL (invalidated instantly on any mutations)
+
+function getStockCacheKey(productId, warehouseId) {
+  return `${productId}:${warehouseId || "all"}`;
+}
+
+function invalidateProductStockCache(productId = null) {
+  if (productId) {
+    const pStr = String(productId);
+    for (const key of productStockCache.keys()) {
+      if (key.startsWith(`${pStr}:`)) {
+        productStockCache.delete(key);
+      }
+    }
+  } else {
+    productStockCache.clear();
+  }
+}
+
+exports.invalidateProductStockCache = invalidateProductStockCache;
+
 exports.getProductCurrentStock = async (req, res) => {
   try {
     const { product_id, warehouse_id } = req.query;
 
     if (!product_id) {
       return res.status(400).json({ error: "product_id مطلوب" });
+    }
+
+    const cacheKey = getStockCacheKey(product_id, warehouse_id);
+    const cached = productStockCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < PRODUCT_STOCK_CACHE_TTL_MS) {
+      res.setHeader("X-Stock-Cache", "HIT");
+      return res.json(cached.data);
     }
 
     let where = `WHERE s.product_id IN (
@@ -235,12 +265,23 @@ exports.getProductCurrentStock = async (req, res) => {
       values,
     );
 
-    const variantsRes = await pool.query(
-      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`,
-    );
+    // ⚡ Optimization: Only fetch variants that exist in the stock rows for this product
+    const variantIds = result.rows
+      .map((row) => Number(row.variant_id) || 0)
+      .filter((id) => id > 0);
+
     const variantsById = {};
-    for (const v of variantsRes.rows) {
-      variantsById[v.id] = v;
+    if (variantIds.length > 0) {
+      const variantsRes = await pool.query(
+        `SELECT id, product_id, wholesale_package, retail_package 
+         FROM product_variants 
+         WHERE id = ANY($1) 
+         ORDER BY id`,
+        [variantIds],
+      );
+      for (const v of variantsRes.rows) {
+        variantsById[v.id] = v;
+      }
     }
 
     const rows = result.rows.map((row) => {
@@ -270,11 +311,24 @@ exports.getProductCurrentStock = async (req, res) => {
       0,
     );
 
-    res.json({
+    const payload = {
       product_id: Number(product_id),
       total_current_stock: totalCurrentStock,
       rows,
+    };
+
+    // Store in cache (keep max 2000 entries)
+    if (productStockCache.size > 2000) {
+      const oldestKey = productStockCache.keys().next().value;
+      productStockCache.delete(oldestKey);
+    }
+    productStockCache.set(cacheKey, {
+      data: payload,
+      timestamp: Date.now(),
     });
+
+    res.setHeader("X-Stock-Cache", "MISS");
+    res.json(payload);
   } catch (err) {
     console.error("PRODUCT CURRENT STOCK ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });

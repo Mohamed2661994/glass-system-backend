@@ -1304,6 +1304,10 @@ const soundUpload = multer({
   },
 });
 
+const {
+  invalidateProductStockCache,
+} = require("./reports/reports.controller");
+
 /* ========== Real-time: auto-emit socket events on successful writes ========== */
 app.use((req, res, next) => {
   if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
@@ -1317,7 +1321,14 @@ app.use((req, res, next) => {
         if (p.includes("/invoices")) channel = "data:invoices";
         else if (p.includes("/cash")) channel = "data:cash";
         else if (p.includes("/inter-branch")) channel = "data:inter-branch";
-        else if (p.includes("/stock-transfer") || p.includes("/stock") || p.includes("/transfer"))
+        else if (
+          p.includes("/stock-transfer") ||
+          p.includes("/stock") ||
+          p.includes("/transfer") ||
+          p.includes("/adjustment") ||
+          p.includes("/replace") ||
+          p.includes("/opening-stock")
+        )
           channel = "data:stock";
         else if (p.includes("/products") || p.includes("/manufacturers"))
           channel = "data:products";
@@ -1335,8 +1346,8 @@ app.use((req, res, next) => {
 
         if (typeof broadcast === "function") {
           broadcast(channel, payload);
-          // Inter-branch transfers also change stock levels across branches
-          if (channel === "data:inter-branch") {
+          // Inter-branch transfers and invoices also change stock levels across branches
+          if (channel === "data:inter-branch" || channel === "data:invoices") {
             broadcast("data:stock", payload);
           }
           // Ensure specific cash-in channel is also broadcasted
@@ -1344,21 +1355,42 @@ app.use((req, res, next) => {
             broadcast("data:cash-in", payload);
           }
           // Also broadcast specific cross-client invalidation if stock or product changed
-          if (channel === "data:stock" || channel === "data:products" || channel === "data:invoices" || channel === "data:inter-branch") {
+          if (
+            channel === "data:stock" ||
+            channel === "data:products" ||
+            channel === "data:invoices" ||
+            channel === "data:inter-branch" ||
+            p.includes("/adjustment") ||
+            p.includes("/replace")
+          ) {
             invalidateProductsCache();
             invalidateDashboardStatsCache();
-            broadcast("product_updated", { invalidateProducts: true, path: p, ts: Date.now() });
+            invalidateProductStockCache();
+            broadcast("product_updated", {
+              invalidateProducts: true,
+              path: p,
+              ts: Date.now(),
+            });
           }
           if (channel === "data:cash") {
             invalidateDashboardStatsCache();
           }
         } else if (io) {
           io.emit(channel, payload);
+          if (channel === "data:inter-branch" || channel === "data:invoices") {
+            io.emit("data:stock", payload);
+          }
           if (p.includes("/cash-in")) {
             io.emit("data:cash-in", payload);
           }
-          if (channel === "data:invoices" || channel === "data:cash" || channel === "data:stock") {
+          if (
+            channel === "data:invoices" ||
+            channel === "data:cash" ||
+            channel === "data:stock" ||
+            channel === "data:inter-branch"
+          ) {
             invalidateDashboardStatsCache();
+            invalidateProductStockCache();
           }
         }
 
@@ -1369,6 +1401,7 @@ app.use((req, res, next) => {
           channel === "data:inter-branch" ||
           p.includes("/transfer") ||
           p.includes("/replace") ||
+          p.includes("/adjustment") ||
           p.includes("/opening-stock")
         ) {
           if (io) stockWatchdogService.scheduleDebouncedAudit({ io });
