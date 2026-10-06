@@ -1422,7 +1422,7 @@ exports.getCustomerBalances = async (req, res) => {
     const [invRes, cashRes, custRes] = await Promise.all([
       pool.query(
         `
-        SELECT id, customer_name, total, subtotal, discount_total, paid_amount, remaining_amount, previous_balance,
+        SELECT id, customer_name, customer_phone, total, subtotal, discount_total, paid_amount, remaining_amount, previous_balance,
                to_char(invoice_date, 'YYYY-MM-DD') AS invoice_date,
                to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
         FROM invoices
@@ -1442,18 +1442,22 @@ exports.getCustomerBalances = async (req, res) => {
         `,
         cashParams,
       ),
-      pool.query(`SELECT id, name, is_market_customer FROM customers`),
+      pool.query(`SELECT id, name, phone, is_market_customer FROM customers`),
     ]);
 
     const isBranch1 = Number(warehouse_id) === 1;
     const marketMap = new Map();
     const customerMap = new Map();
+    const profilePhoneMap = new Map();
 
     for (const c of custRes.rows) {
       const k = getCustomerLookupKey(c.name);
       marketMap.set(k, Boolean(c.is_market_customer));
       if (!customerMap.has(k)) {
         customerMap.set(k, c.name);
+      }
+      if (c.phone && c.phone.trim()) {
+        profilePhoneMap.set(k, c.phone.trim());
       }
     }
 
@@ -1597,8 +1601,23 @@ exports.getCustomerBalances = async (req, res) => {
 
       const netDebt = Math.round(currentBalance * 100) / 100;
 
+      let customerPhone = null;
+      if (group.invoices && group.invoices.length > 0) {
+        for (let i = group.invoices.length - 1; i >= 0; i--) {
+          const p = (group.invoices[i].customer_phone || "").trim();
+          if (p) {
+            customerPhone = p;
+            break;
+          }
+        }
+      }
+      if (!customerPhone && profilePhoneMap.get(key)) {
+        customerPhone = profilePhoneMap.get(key);
+      }
+
       results.push({
         customer_name: group.displayName,
+        customer_phone: customerPhone || null,
         total_sales: Math.round(totalSales * 100) / 100,
         total_paid: Math.round(totalPaid * 100) / 100,
         balance_due: netDebt,
@@ -1613,6 +1632,7 @@ exports.getCustomerBalances = async (req, res) => {
         if (!customerGroups.has(k)) {
           results.push({
             customer_name: c.name,
+            customer_phone: (c.phone || "").trim() || null,
             total_sales: 0,
             total_paid: 0,
             balance_due: 0,
