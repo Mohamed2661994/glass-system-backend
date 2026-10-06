@@ -1345,93 +1345,305 @@ exports.getProductSalesProfit = async (req, res) => {
   }
 };
 
+/* =========================================================
+   👥 كشف وأرصدة العملاء - Customer Balances (High-Performance Engine)
+   ========================================================= */
+
+const customerBalancesCache = new Map();
+const CUSTOMER_BALANCES_CACHE_TTL = 120 * 1000; // 2 minutes in RAM
+
+exports.invalidateCustomerBalancesCache = () => {
+  customerBalancesCache.clear();
+};
+
+const normalizeArabic = (text) => {
+  if (!text) return "";
+  return text
+    .toString()
+    .trim()
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ة/g, "ه")
+    .replace(/ى/g, "ي")
+    .replace(/[\u064B-\u065F]/g, "");
+};
+
+const getCustomerLookupKey = (value) =>
+  normalizeArabic((value || "").toLowerCase().replace(/\s+/g, ""));
+
+const toNumber = (v) => {
+  const n = Number(v ?? 0);
+  return Number.isFinite(n) ? n : 0;
+};
+const BALANCE_EPSILON = 0.01;
+const balancesMatch = (a, b) => Math.abs(toNumber(a) - toNumber(b)) <= BALANCE_EPSILON;
+
 exports.getCustomerBalances = async (req, res) => {
   try {
-    const { from, to, customer_name, warehouse_id } = req.query;
+    const { from, to, customer_name, warehouse_id, show_all, market_only } = req.query;
 
-    let conditions_main = ["i.movement_type = 'sale'", "i.is_void = false"];
-    let conditions_cte = ["movement_type = 'sale'", "is_void = false"];
-    let conditions_cash = ["source_type = 'customer_payment'"];
+    const cacheKey = `${warehouse_id || "all"}_${from || ""}_${to || ""}_${customer_name || ""}_${show_all ? "1" : "0"}_${market_only ? "1" : "0"}`;
+    const cached = customerBalancesCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CUSTOMER_BALANCES_CACHE_TTL) {
+      res.setHeader("X-Balances-Cache", "HIT");
+      return res.json(cached.data);
+    }
 
-    let values = [];
-    let idx = 1;
+    let invConditions = ["movement_type = 'sale'", "is_void IS NOT TRUE"];
+    let cashConditions = ["source_type = 'customer_payment'"];
+    let invParams = [];
+    let cashParams = [];
+    let invIdx = 1;
+    let cashIdx = 1;
+
+    if (warehouse_id) {
+      invConditions.push(`branch_id = $${invIdx++}`);
+      invParams.push(warehouse_id);
+
+      cashConditions.push(`branch_id = $${cashIdx++}`);
+      cashParams.push(warehouse_id);
+    }
 
     if (from) {
-      const p = "$" + idx++;
-      conditions_main.push("i.invoice_date >= " + p);
-      conditions_cte.push("invoice_date >= " + p);
-      conditions_cash.push("created_at >= " + p);
-      values.push(from);
+      invConditions.push(`invoice_date >= $${invIdx++}`);
+      invParams.push(from);
+
+      cashConditions.push(`COALESCE(transaction_date, created_at::date) >= $${cashIdx++}::date`);
+      cashParams.push(from);
     }
 
     if (to) {
-      const p = "$" + idx++;
-      conditions_main.push("i.invoice_date <= " + p);
-      conditions_cte.push("invoice_date <= " + p);
-      conditions_cash.push("created_at <= " + p);
-      values.push(to);
+      invConditions.push(`invoice_date <= $${invIdx++}`);
+      invParams.push(to);
+
+      cashConditions.push(`COALESCE(transaction_date, created_at::date) <= $${cashIdx++}::date`);
+      cashParams.push(to);
     }
 
-    if (customer_name) {
-      const p = "$" + idx++;
-      conditions_main.push("i.customer_name ILIKE " + p);
-      conditions_cte.push("customer_name ILIKE " + p);
-      conditions_cash.push("customer_name ILIKE " + p);
-      values.push("%" + customer_name + "%");
-    }
-
-    if (warehouse_id) {
-      const p = "$" + idx++;
-      conditions_main.push("i.branch_id = " + p);
-      conditions_cte.push("branch_id = " + p);
-      conditions_cash.push("branch_id = " + p);
-      values.push(warehouse_id);
-    }
-
-    const mainWhere = "WHERE " + conditions_main.join(" AND ");
-    const cteWhere = "WHERE " + conditions_cte.join(" AND ");
-    const cashWhere = "WHERE " + conditions_cash.join(" AND ");
-
-    const result = await pool.query(
-      `
-      WITH opening AS (
-        SELECT DISTINCT ON (customer_name)
-          customer_name,
-          COALESCE(previous_balance, 0) AS opening_balance
+    const [invRes, cashRes, custRes] = await Promise.all([
+      pool.query(
+        `
+        SELECT id, customer_name, total, subtotal, discount_total, paid_amount, remaining_amount, previous_balance,
+               to_char(invoice_date, 'YYYY-MM-DD') AS invoice_date,
+               to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
         FROM invoices
-        ${cteWhere}
-        ORDER BY customer_name, invoice_date ASC, id ASC
-      )
-      SELECT
-        i.customer_name,
-        COALESCE(ob.opening_balance, 0) AS opening_balance,
-        SUM(i.total) AS total_sales,
-        SUM(i.paid_amount) + COALESCE(cp.extra_paid, 0) AS total_paid,
-        GREATEST(
-          COALESCE(ob.opening_balance, 0) + SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
-          0
-        ) AS balance_due,
-        MAX(i.invoice_date) AS last_invoice_date
-      FROM invoices i
-      LEFT JOIN opening ob ON ob.customer_name = i.customer_name
-      LEFT JOIN (
-        SELECT customer_name, SUM(amount) AS extra_paid
+        WHERE ${invConditions.join(" AND ")}
+        ORDER BY invoice_date ASC, created_at ASC
+        `,
+        invParams,
+      ),
+      pool.query(
+        `
+        SELECT id, customer_name, amount,
+               to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM-DD') AS transaction_date,
+               to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
         FROM cash_in
-        ${cashWhere}
-        GROUP BY customer_name
-      ) cp ON cp.customer_name = i.customer_name
-      ${mainWhere}
-      GROUP BY i.customer_name, cp.extra_paid, ob.opening_balance
-      HAVING GREATEST(
-        COALESCE(ob.opening_balance, 0) + SUM(i.total) - SUM(i.paid_amount) - COALESCE(cp.extra_paid, 0),
-        0
-      ) > 0
-      ORDER BY balance_due DESC
-      `,
-      values,
-    );
+        WHERE ${cashConditions.join(" AND ")}
+        ORDER BY COALESCE(transaction_date, created_at::date) ASC, created_at ASC
+        `,
+        cashParams,
+      ),
+      pool.query(`SELECT id, name, is_market_customer FROM customers`),
+    ]);
 
-    res.json(result.rows);
+    const isBranch1 = Number(warehouse_id) === 1;
+    const marketMap = new Map();
+    const customerMap = new Map();
+
+    for (const c of custRes.rows) {
+      const k = getCustomerLookupKey(c.name);
+      marketMap.set(k, Boolean(c.is_market_customer));
+      if (!customerMap.has(k)) {
+        customerMap.set(k, c.name);
+      }
+    }
+
+    const customerGroups = new Map();
+
+    for (const inv of invRes.rows) {
+      const rawName = inv.customer_name ? inv.customer_name.trim() : "";
+      if (!rawName) continue;
+      const key = getCustomerLookupKey(rawName);
+      if (!customerGroups.has(key)) {
+        customerGroups.set(key, { displayName: customerMap.get(key) || rawName, invoices: [], payments: [] });
+      }
+      customerGroups.get(key).invoices.push(inv);
+    }
+
+    for (const pay of cashRes.rows) {
+      const rawName = pay.customer_name ? pay.customer_name.trim() : "";
+      if (!rawName) continue;
+      const key = getCustomerLookupKey(rawName);
+      if (!customerGroups.has(key)) {
+        customerGroups.set(key, { displayName: customerMap.get(key) || rawName, invoices: [], payments: [] });
+      }
+      customerGroups.get(key).payments.push(pay);
+    }
+
+    const results = [];
+
+    for (const [key, group] of customerGroups.entries()) {
+      const rows = [];
+      let totalSales = 0;
+      let totalPaid = 0;
+      let lastDate = null;
+
+      for (const inv of group.invoices) {
+        const subtotal = toNumber(inv.subtotal != null ? inv.subtotal : inv.total);
+        const discount = toNumber(inv.discount_total);
+        const total = toNumber(inv.total);
+        const paid = toNumber(inv.paid_amount);
+        const remaining = toNumber(inv.remaining_amount);
+        const prevBal = isBranch1 && inv.previous_balance != null ? toNumber(inv.previous_balance) : undefined;
+        const invDate = (inv.invoice_date || "").substring(0, 10);
+
+        totalSales += subtotal;
+        totalPaid += paid;
+        if (invDate && (!lastDate || invDate > lastDate)) lastDate = invDate;
+
+        rows.push({
+          record_type: "invoice",
+          invoice_id: inv.id,
+          invoice_date: invDate,
+          subtotal,
+          discount_total: discount,
+          total,
+          paid_amount: paid,
+          remaining_amount: remaining,
+          previous_balance: prevBal,
+          created_at: inv.created_at || "",
+        });
+      }
+
+      for (const pay of group.payments) {
+        const payAmount = toNumber(pay.amount);
+        totalPaid += payAmount;
+        const payDate = (pay.transaction_date || "").substring(0, 10);
+
+        rows.push({
+          record_type: "payment",
+          invoice_id: pay.id,
+          invoice_date: payDate,
+          subtotal: 0,
+          discount_total: 0,
+          total: 0,
+          paid_amount: payAmount,
+          remaining_amount: 0,
+          previous_balance: undefined,
+          created_at: pay.created_at || "",
+        });
+      }
+
+      const indexed = rows.map((row, index) => ({ row, index }));
+      indexed.sort((left, right) => {
+        const lDate = (left.row.invoice_date || "").substring(0, 10);
+        const rDate = (right.row.invoice_date || "").substring(0, 10);
+        const byDate = lDate.localeCompare(rDate);
+        if (byDate !== 0) return byDate;
+
+        const lTime = left.row.created_at ? String(left.row.created_at) : "";
+        const rTime = right.row.created_at ? String(right.row.created_at) : "";
+        const byTime = lTime.localeCompare(rTime);
+        if (byTime !== 0) return byTime;
+
+        return left.index - right.index;
+      });
+
+      let currentBalance = 0;
+      let start = 0;
+
+      while (start < indexed.length) {
+        const dayKey = (indexed[start].row.invoice_date || "").substring(0, 10);
+        let end = start;
+        while (
+          end < indexed.length &&
+          (indexed[end].row.invoice_date || "").substring(0, 10) === dayKey
+        ) {
+          end++;
+        }
+
+        const dayRows = indexed.slice(start, end).map((e) => e.row);
+        while (dayRows.length > 0) {
+          let nextIndex = dayRows.findIndex(
+            (r) => r.record_type === "invoice" && balancesMatch(r.previous_balance, currentBalance),
+          );
+
+          if (nextIndex === -1) {
+            nextIndex = dayRows.findIndex(
+              (r) =>
+                r.record_type !== "invoice" &&
+                dayRows.some(
+                  (c) =>
+                    c.record_type === "invoice" &&
+                    balancesMatch(c.previous_balance, currentBalance - toNumber(r.paid_amount)),
+                ),
+            );
+          }
+
+          if (nextIndex === -1) nextIndex = 0;
+          const [row] = dayRows.splice(nextIndex, 1);
+
+          if (row.record_type === "invoice") {
+            currentBalance =
+              row.previous_balance != null
+                ? toNumber(row.remaining_amount)
+                : currentBalance + toNumber(row.remaining_amount);
+          } else {
+            currentBalance -= toNumber(row.paid_amount);
+          }
+        }
+
+        start = end;
+      }
+
+      const netDebt = Math.round(currentBalance * 100) / 100;
+
+      results.push({
+        customer_name: group.displayName,
+        total_sales: Math.round(totalSales * 100) / 100,
+        total_paid: Math.round(totalPaid * 100) / 100,
+        balance_due: netDebt,
+        last_invoice_date: lastDate,
+        is_market_customer: marketMap.get(key) || false,
+      });
+    }
+
+    if (show_all === "1" || show_all === "true") {
+      for (const c of custRes.rows) {
+        const k = getCustomerLookupKey(c.name);
+        if (!customerGroups.has(k)) {
+          results.push({
+            customer_name: c.name,
+            total_sales: 0,
+            total_paid: 0,
+            balance_due: 0,
+            last_invoice_date: null,
+            is_market_customer: Boolean(c.is_market_customer),
+          });
+        }
+      }
+    }
+
+    let filtered = results;
+    if (show_all !== "1" && show_all !== "true") {
+      filtered = filtered.filter((r) => Math.abs(r.balance_due) > 0.01);
+    }
+    if (market_only === "1" || market_only === "true") {
+      filtered = filtered.filter((r) => r.is_market_customer);
+    }
+    if (customer_name && customer_name.trim()) {
+      const q = getCustomerLookupKey(customer_name);
+      filtered = filtered.filter((r) => getCustomerLookupKey(r.customer_name).includes(q));
+    }
+
+    filtered.sort((a, b) => {
+      const diff = Number(b.balance_due || 0) - Number(a.balance_due || 0);
+      if (diff !== 0) return diff;
+      return a.customer_name.localeCompare(b.customer_name, "ar");
+    });
+
+    customerBalancesCache.set(cacheKey, { timestamp: Date.now(), data: filtered });
+    res.setHeader("X-Balances-Cache", "MISS");
+    res.json(filtered);
   } catch (err) {
     console.error("CUSTOMER BALANCES ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });

@@ -1306,6 +1306,7 @@ const soundUpload = multer({
 
 const {
   invalidateProductStockCache,
+  invalidateCustomerBalancesCache,
 } = require("./reports/reports.controller");
 
 /* ========== Real-time: auto-emit socket events on successful writes ========== */
@@ -1372,6 +1373,14 @@ app.use((req, res, next) => {
               ts: Date.now(),
             });
           }
+          if (
+            channel === "data:invoices" ||
+            channel === "data:cash" ||
+            channel === "data:customers" ||
+            p.includes("/cash-in")
+          ) {
+            invalidateCustomerBalancesCache();
+          }
           if (channel === "data:cash") {
             invalidateDashboardStatsCache();
           }
@@ -1382,6 +1391,14 @@ app.use((req, res, next) => {
           }
           if (p.includes("/cash-in")) {
             io.emit("data:cash-in", payload);
+          }
+          if (
+            channel === "data:invoices" ||
+            channel === "data:cash" ||
+            channel === "data:customers" ||
+            p.includes("/cash-in")
+          ) {
+            invalidateCustomerBalancesCache();
           }
           if (
             channel === "data:invoices" ||
