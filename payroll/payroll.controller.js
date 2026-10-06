@@ -885,10 +885,28 @@ async function getPayrollSheet(req, res) {
       console.warn("payroll_attendance query note:", attErr.message);
     }
 
+    // 3.c Fetch latest paid period_end for each employee (to determine boundaries of un-settled prior cycles)
+    const latestPaidRes = await pool.query(
+      `
+      SELECT employee_id, MAX(period_end) as last_period_end
+      FROM payroll_records
+      WHERE branch_id = $1 AND employee_id = ANY($2) AND payment_status = 'paid' AND cycle_type != 'arrears'
+      GROUP BY employee_id
+      `,
+      [branchId, empIds],
+    );
+    const lastPaidEndByEmp = {};
+    for (const r of latestPaidRes.rows) {
+      if (r.last_period_end) {
+        lastPaidEndByEmp[r.employee_id] = r.last_period_end instanceof Date
+          ? r.last_period_end.toISOString().slice(0, 10)
+          : String(r.last_period_end).slice(0, 10);
+      }
+    }
+
     // 4. Build sheet rows
     const sheetRows = employees.map((emp) => {
       const empAdvances = advancesByEmp[emp.id] || [];
-      const totalAdvances = empAdvances.reduce((sum, a) => sum + Number(a.amount || 0), 0);
       const baseSalary = Number(emp.base_salary || 0);
 
       const paidRecord = paidByEmp[emp.id];
@@ -925,7 +943,60 @@ async function getPayrollSheet(req, res) {
       const overtimeAmount = isPaid ? Number(paidRecord.overtime_amount || 0) : sumOvertime;
       const bonusAmount = isPaid ? Number(paidRecord.bonus_amount || 0) : sumBonus;
       const deductionsAmount = isPaid ? Number(paidRecord.deductions_amount || 0) : sumDeductions;
-      const pendingAdvances = isPaid ? Number(paidRecord.advances_deducted || 0) : totalAdvances;
+
+      // Separate prior advances (before periodStart) vs current period advances (within period window)
+      const priorAdvances = [];
+      const currentAdvances = [];
+      for (const adv of empAdvances) {
+        const advDateStr = adv.advance_date instanceof Date
+          ? adv.advance_date.toISOString().slice(0, 10)
+          : String(adv.advance_date || "").slice(0, 10);
+        if (advDateStr < periodStart) {
+          priorAdvances.push(adv);
+        } else {
+          currentAdvances.push(adv);
+        }
+      }
+
+      // Calculate unclosed prior cycles between lastPaidPeriodEnd and periodStart
+      let priorExcessAdvances = 0;
+      let priorUnpaidDues = 0;
+
+      if (!isPaid && priorAdvances.length > 0) {
+        const lastPaidEnd = lastPaidEndByEmp[emp.id] || (
+          emp.hire_date
+            ? (emp.hire_date instanceof Date ? emp.hire_date.toISOString().slice(0, 10) : String(emp.hire_date).slice(0, 10))
+            : null
+        );
+
+        let unclosedCyclesCount = 1;
+        if (lastPaidEnd) {
+          const startMs = new Date(periodStart + "T12:00:00").getTime();
+          const endMs = new Date(lastPaidEnd + "T12:00:00").getTime();
+          const diffDays = Math.max(0, Math.round((startMs - endMs) / (1000 * 60 * 60 * 24)));
+          if (emp.salary_type === "weekly" || emp.salary_type === "daily") {
+            unclosedCyclesCount = Math.max(1, Math.floor(diffDays / 7));
+          } else if (emp.salary_type === "monthly") {
+            unclosedCyclesCount = Math.max(1, Math.floor(diffDays / 30));
+          }
+        }
+
+        const priorEarnedSalary = unclosedCyclesCount * baseSalary;
+        const totalPriorAdvances = priorAdvances.reduce((s, a) => s + Number(a.amount || 0), 0);
+
+        if (totalPriorAdvances > priorEarnedSalary) {
+          priorExcessAdvances = Math.round((totalPriorAdvances - priorEarnedSalary) * 100) / 100;
+        } else {
+          // Exactly as user requested: if covered by prior unclosed work, carried forward advance is 0!
+          priorExcessAdvances = 0;
+          priorUnpaidDues = Math.round((priorEarnedSalary - totalPriorAdvances) * 100) / 100;
+        }
+      }
+
+      const currentAdvancesTotal = currentAdvances.reduce((sum, a) => sum + Number(a.amount || 0), 0);
+      const effectivePendingAdvances = isPaid
+        ? Number(paidRecord.advances_deducted || 0)
+        : Math.round((currentAdvancesTotal + priorExcessAdvances) * 100) / 100;
 
       const grossEarnings = Math.max(
         0,
@@ -933,13 +1004,13 @@ async function getPayrollSheet(req, res) {
       );
       const excessAdvances = isPaid
         ? 0
-        : Math.max(0, Math.round((pendingAdvances - grossEarnings) * 100) / 100);
+        : Math.max(0, Math.round((effectivePendingAdvances - grossEarnings) * 100) / 100);
 
       const currentPeriodNet = isPaid
         ? Number(paidRecord.net_amount || 0)
-        : Math.max(0, Math.round((grossEarnings - pendingAdvances) * 100) / 100);
+        : Math.max(0, Math.round((grossEarnings - effectivePendingAdvances) * 100) / 100);
 
-      const carriedOverDues = isPaid ? 0 : Math.round(sumRetainedDues * 100) / 100;
+      const carriedOverDues = isPaid ? 0 : Math.round((sumRetainedDues + priorUnpaidDues) * 100) / 100;
       const totalPayableNet = isPaid
         ? Number(paidRecord.net_amount || 0)
         : Math.round((currentPeriodNet + carriedOverDues) * 100) / 100;
@@ -959,9 +1030,10 @@ async function getPayrollSheet(req, res) {
         overtime_amount: overtimeAmount,
         bonus_amount: bonusAmount,
         deductions_amount: deductionsAmount,
-        pending_advances: pendingAdvances,
+        pending_advances: effectivePendingAdvances,
         excess_advances: excessAdvances,
-        advances_list: isPaid ? [] : empAdvances,
+        advances_list: isPaid ? [] : (priorExcessAdvances > 0 ? empAdvances : currentAdvances),
+        all_pending_advance_ids: isPaid ? [] : empAdvances.map((a) => a.id),
         adjustments_list: empAdjustmentsList,
         carried_over_dues: carriedOverDues,
         current_net: currentPeriodNet,
@@ -1154,8 +1226,9 @@ async function confirmPayrollPayout(req, res) {
       // -------------------------------------------------------------
       const dayCheck = checkIsPayrollDay(itemCycle, safeEnd);
 
-      // Enforce strict payroll day guard if paying cash for current cycle
-      if (empScope !== "carry_forward" && !dayCheck.isPayrollDay) {
+      // Enforce strict payroll day guard if paying cash for current cycle (Admins can override for early settlement)
+      const isAdmin = Number(user.id) === 7 || user.role === "admin";
+      if (empScope !== "carry_forward" && !dayCheck.isPayrollDay && !isAdmin && !item.admin_override) {
         throw new Error(
           `غير مصرح بصرف راتب الفترة الحالية للعامل [${item.name || empId}] قبل موعد الصرف الرسمي (${dayCheck.reason})`
         );
