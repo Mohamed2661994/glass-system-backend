@@ -2235,7 +2235,8 @@ async function ensureSyncSchema() {
   }
   const ensureReceivedSql = `
     ALTER TABLE stock_transfer_items
-    ADD COLUMN IF NOT EXISTS received BOOLEAN DEFAULT FALSE
+    ADD COLUMN IF NOT EXISTS received BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS notes TEXT
   `;
 
   const ensureUsersAccessSql = `

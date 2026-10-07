@@ -7443,7 +7443,8 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
            fw.name AS from_warehouse, tw.name AS to_warehouse,
            CASE WHEN st.status = 'cancelled' THEN 'cancelled' ELSE sti.status END AS status,
            st.status AS transfer_status, st.created_at,
-           COALESCE(sti.received, false) AS received
+           COALESCE(sti.received, false) AS received,
+           sti.notes
          FROM stock_transfer_items sti
          JOIN stock_transfers st ON st.id = sti.transfer_id
          JOIN products p ON p.id = sti.product_id
@@ -11057,9 +11058,10 @@ app.post(
           to_warehouse_id,
           from_quantity,
           to_quantity,
-          total_price
+          total_price,
+          notes
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
         `,
           [
             transferId,
@@ -11070,6 +11072,7 @@ app.post(
             quantity,
             conversion.retail_quantity,
             item.final_price || 0,
+            item.notes || item.note || null,
           ],
         );
 
@@ -11315,7 +11318,8 @@ app.get("/stock-transfers/by-date", async (req, res) => {
         END              AS status,
         st.status         AS transfer_status,
         st.created_at,
-        COALESCE(sti.received, false) AS received
+        COALESCE(sti.received, false) AS received,
+        sti.notes
         
       FROM stock_transfer_items sti
       JOIN stock_transfers st ON st.id = sti.transfer_id
@@ -11376,7 +11380,8 @@ app.get("/stock-transfers/:id", async (req, res) => {
   sti.to_quantity,
   sti.total_price,
   w1.name AS from_warehouse,
-  w2.name AS to_warehouse
+  w2.name AS to_warehouse,
+  sti.notes
 FROM stock_transfer_items sti
 JOIN products p ON p.id = sti.product_id
 JOIN warehouses w1 ON w1.id = sti.from_warehouse_id
