@@ -1060,7 +1060,7 @@ async function getPayrollSheet(req, res) {
               overtime_amount: overtimeAmount,
               bonus_amount: bonusAmount,
               deductions_amount: deductionsAmount,
-              advances_deducted: pendingAdvances,
+              advances_deducted: Number(paidRecord.advances_deducted || 0),
               notes: paidRecord.notes || "",
             }
           : null,
