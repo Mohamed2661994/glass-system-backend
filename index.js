@@ -14120,7 +14120,9 @@ async function runStartupMigrations() {
           created_at TIMESTAMPTZ DEFAULT NOW(),
           updated_at TIMESTAMPTZ DEFAULT NOW()
         );
+        ALTER TABLE payroll_employees ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id);
         CREATE INDEX IF NOT EXISTS idx_payroll_emp_branch ON payroll_employees(branch_id, status);
+        CREATE INDEX IF NOT EXISTS idx_payroll_emp_user_id ON payroll_employees(user_id);
 
         CREATE TABLE IF NOT EXISTS payroll_advances (
           id SERIAL PRIMARY KEY,

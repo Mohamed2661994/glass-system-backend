@@ -2316,6 +2316,359 @@ async function getEmployeeLedger(req, res) {
   }
 }
 
+/* ==========================================================================
+   8. SELF-SERVICE MANAGER PAYROLL PAYOUT (صرف واعتماد راتب مدير الفرع ذاتياً)
+   ========================================================================== */
+
+function getWeeklyPeriodBounds(referenceDate = getCairoNow()) {
+  const d = new Date(referenceDate);
+  const day = d.getDay(); // 0: Sun, 1: Mon, 2: Tue, 3: Wed, 4: Thu, 5: Fri, 6: Sat
+  
+  let diffToSaturday = 0;
+  if (day === 6) diffToSaturday = 0;
+  else if (day === 0) diffToSaturday = -1;
+  else if (day === 1) diffToSaturday = -2;
+  else if (day === 2) diffToSaturday = -3;
+  else if (day === 3) diffToSaturday = -4;
+  else if (day === 4) diffToSaturday = -5;
+  else if (day === 5) diffToSaturday = -6;
+
+  const sat = new Date(d);
+  sat.setDate(d.getDate() + diffToSaturday);
+  
+  const thu = new Date(sat);
+  thu.setDate(sat.getDate() + 5);
+
+  const format = (dt) => {
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, "0");
+    const dStr = String(dt.getDate()).padStart(2, "0");
+    return `${y}-${m}-${dStr}`;
+  };
+
+  return { periodStart: format(sat), periodEnd: format(thu) };
+}
+
+/**
+ * GET /payroll/my-salary
+ * Returns the current salary status for the logged-in manager
+ */
+async function getMySalaryStatus(req, res) {
+  try {
+    const userId = Number(req.user?.id);
+    if (!userId) {
+      return res.status(401).json({ error: "غير مصرح" });
+    }
+
+    // Find linked employee: either by user_id OR fallback for user 11 (خالد)
+    const empRes = await pool.query(
+      `
+      SELECT e.*, b.name as branch_name
+      FROM payroll_employees e
+      LEFT JOIN branches b ON b.id = e.branch_id
+      WHERE (e.user_id = $1 OR ($1 = 11 AND e.id = 9)) AND e.status = 'active'
+      LIMIT 1
+      `,
+      [userId],
+    );
+
+    if (empRes.rows.length === 0) {
+      return res.json({ has_profile: false });
+    }
+
+    const emp = empRes.rows[0];
+    const cairoNow = getCairoNow();
+    const isThu = cairoNow.getDay() === 4;
+
+    const { periodStart, periodEnd } = getWeeklyPeriodBounds(cairoNow);
+
+    // Check if employee has already been paid for this weekly period
+    const paidCheck = await pool.query(
+      `
+      SELECT id, paid_at, net_amount, advances_deducted, cash_out_id, period_start, period_end
+      FROM payroll_records
+      WHERE employee_id = $1 AND branch_id = $2 AND payment_status = 'paid'
+        AND cycle_type != 'arrears'
+        AND (
+          (period_start = $3 AND period_end = $4)
+          OR (period_end >= $3 AND period_start <= $4)
+        )
+      LIMIT 1
+      `,
+      [emp.id, emp.branch_id, periodStart, periodEnd],
+    );
+
+    const isPaid = paidCheck.rows.length > 0;
+    const paidRecord = isPaid ? paidCheck.rows[0] : null;
+
+    // Pending advances for this employee up to periodEnd
+    const advRes = await pool.query(
+      `
+      SELECT id, amount, advance_date, notes
+      FROM payroll_advances
+      WHERE employee_id = $1 AND branch_id = $2 AND status = 'pending' AND advance_date <= $3
+      ORDER BY advance_date ASC, id ASC
+      `,
+      [emp.id, emp.branch_id, periodEnd],
+    );
+    const pendingAdvancesList = advRes.rows;
+    const pendingAdvancesSum = pendingAdvancesList.reduce((s, a) => s + Number(a.amount || 0), 0);
+
+    // Check any pending retained dues
+    const retainedRes = await pool.query(
+      `
+      SELECT COALESCE(SUM(amount), 0) as total_retained
+      FROM payroll_retained_dues
+      WHERE employee_id = $1 AND branch_id = $2 AND status = 'pending' AND due_date <= $3
+      `,
+      [emp.id, emp.branch_id, periodEnd],
+    );
+    const retainedDuesSum = Number(retainedRes.rows[0]?.total_retained || 0);
+
+    const baseSalary = Number(emp.base_salary || 0);
+    const netAmount = Math.max(0, Math.round((baseSalary - pendingAdvancesSum + retainedDuesSum) * 100) / 100);
+
+    let lockReason = "";
+    if (isPaid) {
+      lockReason = "تم صرف راتب هذا الأسبوع بالفعل (مدفوع)";
+    } else if (!isThu) {
+      lockReason = "صرف الراتب الأسبوعي للمدير متاح يوم الخميس فقط";
+    }
+
+    return res.json({
+      has_profile: true,
+      employee_id: emp.id,
+      name: emp.name,
+      job_title: emp.job_title,
+      branch_id: emp.branch_id,
+      branch_name: emp.branch_name,
+      salary_type: emp.salary_type,
+      base_salary: baseSalary,
+      pending_advances: pendingAdvancesSum,
+      pending_advances_list: pendingAdvancesList,
+      retained_dues: retainedDuesSum,
+      net_amount: isPaid ? Number(paidRecord.net_amount || 0) : netAmount,
+      period_start: periodStart,
+      period_end: periodEnd,
+      is_payroll_day: isThu,
+      is_paid: isPaid,
+      paid_info: paidRecord,
+      can_payout: isThu && !isPaid,
+      lock_reason: lockReason,
+    });
+  } catch (err) {
+    console.error("getMySalaryStatus error:", err);
+    return res.status(500).json({ error: "فشل فحص حالة الراتب", details: err.message });
+  }
+}
+
+/**
+ * POST /payroll/my-salary/payout
+ * Confirms weekly salary payout by the manager on Thursday
+ */
+async function confirmMySalaryPayout(req, res) {
+  const client = await pool.connect();
+  try {
+    const userId = Number(req.user?.id);
+    if (!userId) {
+      return res.status(401).json({ error: "غير مصرح" });
+    }
+
+    // 1. Verify employee link
+    const empRes = await client.query(
+      `
+      SELECT e.*, b.name as branch_name
+      FROM payroll_employees e
+      LEFT JOIN branches b ON b.id = e.branch_id
+      WHERE (e.user_id = $1 OR ($1 = 11 AND e.id = 9)) AND e.status = 'active'
+      LIMIT 1
+      `,
+      [userId],
+    );
+
+    if (empRes.rows.length === 0) {
+      return res.status(404).json({ error: "لا يوجد ملف رواتب مرتبط بهذا الحساب" });
+    }
+
+    const emp = empRes.rows[0];
+    const cairoNow = getCairoNow();
+    const isThu = cairoNow.getDay() === 4;
+    const isAdmin = Number(req.user.id) === 7 || req.user.role === "admin";
+
+    // 2. Strict day check: must be Thursday unless Admin override
+    if (!isThu && !isAdmin) {
+      return res.status(403).json({
+        error: "غير مصرح بصرف الراتب الأسبوعي قبل موعد الصرف الرسمي (يوم الخميس فقط).",
+      });
+    }
+
+    const { periodStart, periodEnd } = getWeeklyPeriodBounds(cairoNow);
+    const safeEnd = periodEnd;
+
+    await client.query("BEGIN");
+
+    // 3. Double payout guard: ensure employee has not already been paid for this period
+    const dupCheck = await client.query(
+      `
+      SELECT pr.id, pr.paid_at 
+      FROM payroll_records pr
+      LEFT JOIN cash_out co ON pr.cash_out_id = co.id
+      WHERE pr.branch_id = $1 AND pr.employee_id = $2 AND pr.payment_status = 'paid'
+        AND pr.cycle_type != 'arrears'
+        AND (pr.cash_out_id IS NULL OR co.id IS NOT NULL)
+        AND (
+          (period_start = $3 AND period_end = $4)
+          OR (period_end >= $3 AND period_start <= $4)
+        )
+      LIMIT 1
+      `,
+      [emp.branch_id, emp.id, periodStart, periodEnd],
+    );
+
+    if (dupCheck.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "تم اعتماد وصرف راتب هذا الأسبوع بالفعل." });
+    }
+
+    // 4. Calculate advances and net payable
+    const advRes = await client.query(
+      `
+      SELECT id, amount 
+      FROM payroll_advances 
+      WHERE employee_id = $1 AND branch_id = $2 AND status = 'pending' AND advance_date <= $3
+      ORDER BY advance_date ASC, id ASC
+      `,
+      [emp.id, emp.branch_id, safeEnd],
+    );
+    const advanceIds = advRes.rows.map((a) => a.id);
+    const totalAdvances = advRes.rows.reduce((s, a) => s + Number(a.amount || 0), 0);
+
+    // Retained dues if any
+    const retainedRes = await client.query(
+      `
+      SELECT id, amount 
+      FROM payroll_retained_dues
+      WHERE employee_id = $1 AND branch_id = $2 AND status = 'pending' AND due_date <= $3
+      `,
+      [emp.id, emp.branch_id, safeEnd],
+    );
+    const retainedIds = retainedRes.rows.map((r) => r.id);
+    const totalRetained = retainedRes.rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+
+    const baseSalary = Number(emp.base_salary || 0);
+    const netAmount = Math.max(0, Math.round((baseSalary - totalAdvances + totalRetained) * 100) / 100);
+
+    // 5. Create cash_out entry in treasury
+    let cashOutId = null;
+    let permissionNumber = null;
+    if (netAmount > 0) {
+      permissionNumber = generatePermissionNumber(safeEnd);
+      const rolePrefix = formatJobTitleWithPrefix(emp.job_title);
+      const notesBreakdown = [
+        `صرف راتب أسبوعي ${rolePrefix}: ${emp.name}`,
+        `الفترة من ${periodStart} إلى ${periodEnd}`,
+        totalRetained > 0 ? `(شامل ${totalRetained} ج مستحقات مرحلة)` : null,
+        totalAdvances > 0 ? `(بعد خصم سلف ${totalAdvances} ج)` : null,
+      ].filter(Boolean).join(" - ");
+
+      const cashOutRes = await client.query(
+        `
+        INSERT INTO cash_out 
+          (branch_id, name, amount, notes, transaction_date, permission_number, entry_type)
+        VALUES ($1, $2, $3, $4, $5, $6, 'expense')
+        RETURNING id
+        `,
+        [
+          emp.branch_id,
+          `راتب: ${emp.name}`,
+          netAmount,
+          notesBreakdown,
+          safeEnd,
+          permissionNumber,
+        ],
+      );
+      cashOutId = cashOutRes.rows[0].id;
+    }
+
+    // 6. Insert payroll_records
+    const paidByName = req.user.full_name || req.user.username || emp.name;
+    const recordRes = await client.query(
+      `
+      INSERT INTO payroll_records 
+        (branch_id, employee_id, cycle_type, period_start, period_end, base_amount, days_worked,
+         overtime_amount, bonus_amount, deductions_amount, advances_deducted, net_amount,
+         cash_out_id, payment_status, paid_at, paid_by, paid_by_name, notes)
+      VALUES ($1, $2, 'weekly', $3, $4, $5, 6, 0, 0, 0, $6, $7, $8, 'paid', NOW(), $9, $10, $11)
+      RETURNING *
+      `,
+      [
+        emp.branch_id,
+        emp.id,
+        periodStart,
+        periodEnd,
+        baseSalary,
+        totalAdvances,
+        netAmount,
+        cashOutId,
+        req.user.id || null,
+        paidByName,
+        `صرف واعتماد ذاتي لرصيد الراتب الأسبوعي (إذن رقم ${permissionNumber || "-"})`,
+      ],
+    );
+
+    const payrollRecord = recordRes.rows[0];
+
+    // 7. Mark linked advances as deducted
+    if (advanceIds.length > 0) {
+      await client.query(
+        `
+        UPDATE payroll_advances 
+        SET status = 'deducted', payroll_record_id = $1 
+        WHERE id = ANY($2) AND branch_id = $3
+        `,
+        [payrollRecord.id, advanceIds, emp.branch_id],
+      );
+    }
+
+    // 8. Mark retained dues as applied
+    if (retainedIds.length > 0) {
+      await client.query(
+        `
+        UPDATE payroll_retained_dues 
+        SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
+        WHERE id = ANY($2) AND branch_id = $3
+        `,
+        [payrollRecord.id, retainedIds, emp.branch_id],
+      );
+    }
+
+    await client.query("COMMIT");
+
+    // Realtime broadcast to update dashboard and cash registries
+    const broadcast = req.app?.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("data:payroll", { action: "payroll_paid", branch_id: emp.branch_id, ts: Date.now() });
+      if (netAmount > 0) {
+        broadcast("data:cash", { action: "cash_out_created", branch_id: emp.branch_id, ts: Date.now() });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: "تم اعتماد وصرف الراتب بنجاح وتسجيل إذن الصرف بالخزينة",
+      record: payrollRecord,
+      permission_number: permissionNumber,
+      net_amount: netAmount,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("confirmMySalaryPayout error:", err);
+    return res.status(500).json({ error: "فشل اعتماد وصرف الراتب", details: err.message });
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   getEmployees,
   createEmployee,
@@ -2332,4 +2685,6 @@ module.exports = {
   revertPayrollRecord,
   toggleAttendance,
   getEmployeeLedger,
+  getMySalaryStatus,
+  confirmMySalaryPayout,
 };

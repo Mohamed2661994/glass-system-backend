@@ -42,5 +42,9 @@ router.post("/attendance/toggle", requireAdmin, controller.toggleAttendance);
 // 7. Employee Audit Log & Ledger (كشف حساب وسجل حركات العامل الشامل)
 router.get("/employees/:id/ledger", controller.getEmployeeLedger);
 
+// 8. Self-Service Manager Payroll Payout (القبض الذاتي لمدير الفرع)
+router.get("/my-salary", controller.getMySalaryStatus);
+router.post("/my-salary/payout", controller.confirmMySalaryPayout);
+
 module.exports = router;
 
