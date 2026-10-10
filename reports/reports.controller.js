@@ -2668,6 +2668,9 @@ exports.getManufacturerAnalytics = async (req, res) => {
       chart_date_to,
       only_timeline,
       apply_distribution,
+      sort_by = "name",
+      sort_order,
+      stock_filter = "all",
     } = req.query;
 
     const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
@@ -3206,6 +3209,105 @@ exports.getManufacturerAnalytics = async (req, res) => {
           String(row.sku).toLowerCase().includes(q)
       );
     }
+
+    // Apply stock & sales activity filters
+    if (stock_filter && stock_filter !== "all") {
+      switch (stock_filter) {
+        case "in_stock":
+          allProductRows = allProductRows.filter((r) => r.current_stock_qty > 0);
+          break;
+        case "out_of_stock":
+          allProductRows = allProductRows.filter((r) => r.current_stock_qty <= 0);
+          break;
+        case "low_stock":
+          allProductRows = allProductRows.filter((r) => r.current_stock_qty > 0 && r.current_stock_qty <= 5);
+          break;
+        case "negative_stock":
+          allProductRows = allProductRows.filter((r) => r.current_stock_qty < 0);
+          break;
+        case "sold_only":
+          allProductRows = allProductRows.filter((r) => r.sold_quantity > 0);
+          break;
+        case "stagnant":
+          allProductRows = allProductRows.filter((r) => r.sold_quantity === 0);
+          break;
+        case "profitable":
+          allProductRows = allProductRows.filter((r) => r.net_profit > 0);
+          break;
+        case "loss_or_zero":
+          allProductRows = allProductRows.filter((r) => r.net_profit <= 0);
+          break;
+      }
+    }
+
+    // Determine sort direction (default: name -> asc, numeric metrics -> desc)
+    const effectiveSortOrder = sort_order
+      ? String(sort_order).toLowerCase()
+      : (sort_by === "name" ? "asc" : "desc");
+    const isDesc = effectiveSortOrder === "desc";
+
+    // Smart multi-criteria sorting across the entire list before pagination
+    allProductRows.sort((a, b) => {
+      let valA = 0;
+      let valB = 0;
+
+      switch (sort_by) {
+        case "sold_qty":
+          valA = Number(a.sold_quantity || 0);
+          valB = Number(b.sold_quantity || 0);
+          break;
+        case "sales_total":
+          valA = Number(a.sales_total || 0);
+          valB = Number(b.sales_total || 0);
+          break;
+        case "profit":
+          valA = Number(a.net_profit || 0);
+          valB = Number(b.net_profit || 0);
+          break;
+        case "margin":
+          valA = Number(a.profit_margin_percent || 0);
+          valB = Number(b.profit_margin_percent || 0);
+          break;
+        case "stock_qty":
+          valA = Number(a.current_stock_qty || 0);
+          valB = Number(b.current_stock_qty || 0);
+          break;
+        case "stock_value":
+          valA = Number(a.current_stock_value || 0);
+          valB = Number(b.current_stock_value || 0);
+          break;
+        case "acquired_qty":
+          valA = Number(a.total_acquired_qty || 0);
+          valB = Number(b.total_acquired_qty || 0);
+          break;
+        case "total_cost":
+          valA = Number(a.total_cost || 0);
+          valB = Number(b.total_cost || 0);
+          break;
+        case "selling_price":
+          valA = Number(a.selling_price || 0);
+          valB = Number(b.selling_price || 0);
+          break;
+        case "purchase_price":
+          valA = Number(a.purchase_price || 0);
+          valB = Number(b.purchase_price || 0);
+          break;
+        case "avg_selling_price":
+          valA = Number(a.avg_selling_price || 0);
+          valB = Number(b.avg_selling_price || 0);
+          break;
+        case "name":
+        default:
+          return isDesc
+            ? b.product_name.localeCompare(a.product_name, "ar")
+            : a.product_name.localeCompare(b.product_name, "ar");
+      }
+
+      if (valA === valB) {
+        return a.product_name.localeCompare(b.product_name, "ar");
+      }
+      return isDesc ? valB - valA : valA - valB;
+    });
 
     // Global summary totals
     const overallProfitMargin = totalSalesAmount > 0 ? (totalNetProfit / totalSalesAmount) * 100 : 0;
