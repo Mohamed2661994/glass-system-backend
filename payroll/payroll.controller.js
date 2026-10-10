@@ -1127,6 +1127,7 @@ async function confirmPayrollPayout(req, res) {
       const itemCycle = item.cycle_type || item.salary_type || cycle_type;
 
       // -------------------------------------------------------------
+      // -------------------------------------------------------------
       // CASE 1: ARREARS ONLY (صرف المستحقات والمتأخرات السابقة فقط)
       // متاح في أي يوم من أيام الأسبوع أو الشهر!
       // -------------------------------------------------------------
@@ -1140,10 +1141,75 @@ async function confirmPayrollPayout(req, res) {
           `,
           [safeBranchId, empId, safeEnd],
         );
+        const retainedAmount = arrearsRes.rows.reduce((s, r) => s + Number(r.amount || 0), 0);
 
-        const arrearsAmount = arrearsRes.rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+        // Also check if employee has unclosed prior cycles with prior advances (priorUnpaidDues)
+        const priorAdvRes = await client.query(
+          `
+          SELECT id, amount, advance_date
+          FROM payroll_advances
+          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND advance_date < $3
+          ORDER BY advance_date ASC, id ASC
+          `,
+          [safeBranchId, empId, safeStart],
+        );
+        const priorAdvances = priorAdvRes.rows;
+
+        const empRes = await client.query(
+          `SELECT id, name, job_title, salary_type, base_salary, hire_date FROM payroll_employees WHERE id = $1`,
+          [empId],
+        );
+        const empInfo = empRes.rows[0];
+
+        const latestPaidRes = await client.query(
+          `
+          SELECT MAX(period_end) as last_period_end
+          FROM payroll_records
+          WHERE branch_id = $1 AND employee_id = $2 AND payment_status = 'paid' AND cycle_type != 'arrears'
+          `,
+          [safeBranchId, empId],
+        );
+        const lastPaidEnd = latestPaidRes.rows[0]?.last_period_end ? (
+          latestPaidRes.rows[0].last_period_end instanceof Date
+            ? latestPaidRes.rows[0].last_period_end.toISOString().slice(0, 10)
+            : String(latestPaidRes.rows[0].last_period_end).slice(0, 10)
+        ) : (
+          empInfo?.hire_date ? (
+            empInfo.hire_date instanceof Date
+              ? empInfo.hire_date.toISOString().slice(0, 10)
+              : String(empInfo.hire_date).slice(0, 10)
+          ) : null
+        );
+
+        let priorUnpaidDues = 0;
+        let priorEarnedSalary = 0;
+        let totalPriorAdvances = 0;
+        let unclosedCyclesCount = 1;
+
+        if (priorAdvances.length > 0) {
+          if (lastPaidEnd) {
+            const startMs = new Date(safeStart + "T12:00:00").getTime();
+            const endMs = new Date(lastPaidEnd + "T12:00:00").getTime();
+            const diffDays = Math.max(0, Math.round((startMs - endMs) / (1000 * 60 * 60 * 24)));
+            if (empInfo?.salary_type === "weekly" || empInfo?.salary_type === "daily") {
+              unclosedCyclesCount = Math.max(1, Math.floor(diffDays / 7));
+            } else if (empInfo?.salary_type === "monthly") {
+              unclosedCyclesCount = Math.max(1, Math.floor(diffDays / 30));
+            }
+          }
+
+          const empBaseSalary = Number(empInfo?.base_salary || item.base_amount || 0);
+          priorEarnedSalary = unclosedCyclesCount * empBaseSalary;
+          totalPriorAdvances = priorAdvances.reduce((s, a) => s + Number(a.amount || 0), 0);
+
+          if (totalPriorAdvances <= priorEarnedSalary) {
+            priorUnpaidDues = Math.round((priorEarnedSalary - totalPriorAdvances) * 100) / 100;
+          }
+        }
+
+        const arrearsAmount = Math.round((retainedAmount + priorUnpaidDues) * 100) / 100;
         if (arrearsAmount <= 0) {
-          throw new Error(`لا توجد مستحقات مرحلة سابقة معلقة للصرف للعامل [${item.name || empId}].`);
+          throw new Error(`لا توجد مستحقات مرحلة سابقة معلقة للصرف للعامل [${item.name || empInfo?.name || empId}].`);
         }
 
         const shouldRecordCashOut = item.record_cash_out !== undefined
@@ -1154,7 +1220,7 @@ async function confirmPayrollPayout(req, res) {
         let permissionNumber = null;
         if (shouldRecordCashOut && arrearsAmount > 0) {
           permissionNumber = generatePermissionNumber(safeEnd);
-          const rolePrefix = formatJobTitleWithPrefix(item.job_title);
+          const rolePrefix = formatJobTitleWithPrefix(item.job_title || empInfo?.job_title);
           const cashOutRes = await client.query(
             `
             INSERT INTO cash_out 
@@ -1164,9 +1230,9 @@ async function confirmPayrollPayout(req, res) {
             `,
             [
               safeBranchId,
-              `مستحقات مرحلة: ${item.name || "موظف"}`,
+              `مستحقات مرحلة: ${item.name || empInfo?.name || "موظف"}`,
               arrearsAmount,
-              item.notes || `صرف مستحقات مرحلة سابقة ${rolePrefix}: ${item.name || ""} - بقيمة ${arrearsAmount} ج.م`,
+              item.notes || `صرف مستحقات مرحلة سابقة ${rolePrefix}: ${item.name || empInfo?.name || ""} - بقيمة ${arrearsAmount} ج.م`,
               safeEnd,
               permissionNumber,
             ],
@@ -1181,21 +1247,43 @@ async function confirmPayrollPayout(req, res) {
               ? `صرف مستحقات مرحلة سابقة بقيمة ${arrearsAmount} ج.م`
               : `تسوية مستحقات مرحلة سابقة بقيمة ${arrearsAmount} ج.م (تسوية داخلية دون تسجيل سند باليومية)`);
 
-        // Insert into payroll_records with cycle_type = 'arrears' so it doesn't close current cycle
+        let unclosedStartStr = safeStart;
+        let unclosedEndStr = safeEnd;
+        if (lastPaidEnd && priorUnpaidDues > 0) {
+          const lastEndObj = new Date(lastPaidEnd + "T12:00:00");
+          lastEndObj.setDate(lastEndObj.getDate() + 1);
+          if (lastEndObj.getDay() === 5) lastEndObj.setDate(lastEndObj.getDate() + 1);
+          unclosedStartStr = lastEndObj.toISOString().slice(0, 10);
+
+          const curStartObj = new Date(safeStart + "T12:00:00");
+          curStartObj.setDate(curStartObj.getDate() - 1);
+          if (curStartObj.getDay() === 5) curStartObj.setDate(curStartObj.getDate() - 1);
+          unclosedEndStr = curStartObj.toISOString().slice(0, 10);
+        }
+
+        const cycleTypeToUse = priorUnpaidDues > 0 ? (empInfo?.salary_type || itemCycle || "weekly") : "arrears";
+        const recPeriodStart = priorUnpaidDues > 0 ? unclosedStartStr : safeStart;
+        const recPeriodEnd = priorUnpaidDues > 0 ? unclosedEndStr : safeEnd;
+
+        // Insert into payroll_records
         const recordRes = await client.query(
           `
           INSERT INTO payroll_records 
             (branch_id, employee_id, cycle_type, period_start, period_end, base_amount, days_worked,
              overtime_amount, bonus_amount, deductions_amount, advances_deducted, net_amount,
              cash_out_id, payment_status, paid_at, paid_by, paid_by_name, notes)
-          VALUES ($1, $2, 'arrears', $3, $4, 0, 0, 0, 0, 0, 0, $5, $6, 'paid', NOW(), $7, $8, $9)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 0, $8, $9, $10, 'paid', NOW(), $11, $12, $13)
           RETURNING *
           `,
           [
             safeBranchId,
             empId,
-            safeStart,
-            safeEnd,
+            cycleTypeToUse,
+            recPeriodStart,
+            recPeriodEnd,
+            priorUnpaidDues > 0 ? priorEarnedSalary : 0,
+            priorUnpaidDues > 0 ? (unclosedCyclesCount * 6) : 0,
+            priorUnpaidDues > 0 ? totalPriorAdvances : 0,
             arrearsAmount,
             cashOutId,
             user.id || null,
@@ -1208,15 +1296,30 @@ async function confirmPayrollPayout(req, res) {
         createdRecords.push(payrollRecord);
 
         // Mark the retained_dues as applied
-        const adjIds = arrearsRes.rows.map((r) => r.id);
-        await client.query(
-          `
-          UPDATE payroll_retained_dues 
-          SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
-          WHERE id = ANY($2) AND branch_id = $3
-          `,
-          [payrollRecord.id, adjIds, safeBranchId],
-        );
+        if (arrearsRes.rows.length > 0) {
+          const adjIds = arrearsRes.rows.map((r) => r.id);
+          await client.query(
+            `
+            UPDATE payroll_retained_dues 
+            SET status = 'applied', payroll_record_id = $1, updated_at = NOW() 
+            WHERE id = ANY($2) AND branch_id = $3
+            `,
+            [payrollRecord.id, adjIds, safeBranchId],
+          );
+        }
+
+        // Mark prior advances as deducted
+        if (priorAdvances.length > 0 && priorUnpaidDues > 0) {
+          const priorAdvIds = priorAdvances.map((a) => a.id);
+          await client.query(
+            `
+            UPDATE payroll_advances 
+            SET status = 'deducted', payroll_record_id = $1 
+            WHERE id = ANY($2) AND branch_id = $3
+            `,
+            [payrollRecord.id, priorAdvIds, safeBranchId],
+          );
+        }
 
         continue; // Proceed to next employee item
       }
@@ -1286,6 +1389,14 @@ async function confirmPayrollPayout(req, res) {
       // Fetch pending retained_dues if scope is 'full'
       let retainedDuesAmount = 0;
       let retainedDuesAdjIds = [];
+      let priorUnpaidDuesAmount = 0;
+      let fullPriorAdvances = [];
+      let fullPriorEarnedSalary = 0;
+      let fullTotalPriorAdvances = 0;
+      let fullUnclosedCyclesCount = 1;
+      let fullUnclosedStart = safeStart;
+      let fullUnclosedEnd = safeEnd;
+
       if (empScope === "full") {
         const retainedRes = await client.query(
           `
@@ -1297,16 +1408,86 @@ async function confirmPayrollPayout(req, res) {
         );
         retainedDuesAmount = retainedRes.rows.reduce((s, r) => s + Number(r.amount || 0), 0);
         retainedDuesAdjIds = retainedRes.rows.map((r) => r.id);
+
+        // Also check if employee has unclosed prior cycles with prior advances (priorUnpaidDues)
+        const priorAdvRes = await client.query(
+          `
+          SELECT id, amount, advance_date
+          FROM payroll_advances
+          WHERE branch_id = $1 AND employee_id = $2 AND status = 'pending' AND advance_date < $3
+          ORDER BY advance_date ASC, id ASC
+          `,
+          [safeBranchId, empId, safeStart],
+        );
+        fullPriorAdvances = priorAdvRes.rows;
+
+        if (fullPriorAdvances.length > 0) {
+          const empRes = await client.query(
+            `SELECT id, name, salary_type, base_salary, hire_date FROM payroll_employees WHERE id = $1`,
+            [empId],
+          );
+          const empInfo = empRes.rows[0];
+
+          const latestPaidRes = await client.query(
+            `
+            SELECT MAX(period_end) as last_period_end
+            FROM payroll_records
+            WHERE branch_id = $1 AND employee_id = $2 AND payment_status = 'paid' AND cycle_type != 'arrears'
+            `,
+            [safeBranchId, empId],
+          );
+          const lastPaidEnd = latestPaidRes.rows[0]?.last_period_end ? (
+            latestPaidRes.rows[0].last_period_end instanceof Date
+              ? latestPaidRes.rows[0].last_period_end.toISOString().slice(0, 10)
+              : String(latestPaidRes.rows[0].last_period_end).slice(0, 10)
+          ) : (
+            empInfo?.hire_date ? (
+              empInfo.hire_date instanceof Date
+                ? empInfo.hire_date.toISOString().slice(0, 10)
+                : String(empInfo.hire_date).slice(0, 10)
+            ) : null
+          );
+
+          if (lastPaidEnd) {
+            const startMs = new Date(safeStart + "T12:00:00").getTime();
+            const endMs = new Date(lastPaidEnd + "T12:00:00").getTime();
+            const diffDays = Math.max(0, Math.round((startMs - endMs) / (1000 * 60 * 60 * 24)));
+            if (empInfo?.salary_type === "weekly" || empInfo?.salary_type === "daily") {
+              fullUnclosedCyclesCount = Math.max(1, Math.floor(diffDays / 7));
+            } else if (empInfo?.salary_type === "monthly") {
+              fullUnclosedCyclesCount = Math.max(1, Math.floor(diffDays / 30));
+            }
+
+            const lastEndObj = new Date(lastPaidEnd + "T12:00:00");
+            lastEndObj.setDate(lastEndObj.getDate() + 1);
+            if (lastEndObj.getDay() === 5) lastEndObj.setDate(lastEndObj.getDate() + 1);
+            fullUnclosedStart = lastEndObj.toISOString().slice(0, 10);
+
+            const curStartObj = new Date(safeStart + "T12:00:00");
+            curStartObj.setDate(curStartObj.getDate() - 1);
+            if (curStartObj.getDay() === 5) curStartObj.setDate(curStartObj.getDate() - 1);
+            fullUnclosedEnd = curStartObj.toISOString().slice(0, 10);
+          }
+
+          const empBaseSalary = Number(empInfo?.base_salary || item.base_amount || 0);
+          fullPriorEarnedSalary = fullUnclosedCyclesCount * empBaseSalary;
+          fullTotalPriorAdvances = fullPriorAdvances.reduce((s, a) => s + Number(a.amount || 0), 0);
+
+          if (fullTotalPriorAdvances <= fullPriorEarnedSalary) {
+            priorUnpaidDuesAmount = Math.round((fullPriorEarnedSalary - fullTotalPriorAdvances) * 100) / 100;
+          }
+        }
       }
 
-      const totalCashToPay = empScope === "full" ? (netAmount + retainedDuesAmount) : netAmount;
+      const totalCarriedDues = retainedDuesAmount + priorUnpaidDuesAmount;
+      const totalCashToPay = empScope === "full" ? (netAmount + totalCarriedDues) : netAmount;
 
       // 1. Create cash_out voucher if totalCashToPay > 0 and requested (and not carry_forward)
       let cashOutId = null;
       let permissionNumber = null;
       if (record_cash_out && empScope !== "carry_forward" && totalCashToPay > 0) {
         permissionNumber = generatePermissionNumber(safeEnd);
-        const nameTitle = empScope === "full" && retainedDuesAmount > 0
+        const nameTitle = empScope === "full" && totalCarriedDues > 0
           ? `راتب ومستحقات: ${item.name || "موظف"}`
           : `راتب: ${item.name || "موظف"}`;
 
@@ -1314,7 +1495,7 @@ async function confirmPayrollPayout(req, res) {
         const notesBreakdown = [
           `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} ${rolePrefix}: ${item.name || ""}`,
           `الفترة من ${safeStart} إلى ${safeEnd}`,
-          retainedDuesAmount > 0 ? `(شامل ${retainedDuesAmount} ج مستحقات مرحلة سابقة)` : null,
+          totalCarriedDues > 0 ? `(شامل ${totalCarriedDues} ج مستحقات مرحلة سابقة)` : null,
           actualDeductedInRecord > 0 ? `(بعد خصم سلف ${actualDeductedInRecord} ج)` : null,
         ].filter(Boolean).join(" - ");
 
@@ -1336,6 +1517,45 @@ async function confirmPayrollPayout(req, res) {
         );
         cashOutId = cashOutRes.rows[0].id;
         totalCashPaidOut += totalCashToPay;
+      }
+
+      // If full scope has prior unclosed dues, insert a record for the unclosed period first
+      if (empScope === "full" && priorUnpaidDuesAmount > 0) {
+        const priorRecRes = await client.query(
+          `
+          INSERT INTO payroll_records 
+            (branch_id, employee_id, cycle_type, period_start, period_end, base_amount, days_worked,
+             overtime_amount, bonus_amount, deductions_amount, advances_deducted, net_amount,
+             cash_out_id, payment_status, paid_at, paid_by, paid_by_name, notes)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 0, $8, $9, $10, 'paid', NOW(), $11, $12, $13)
+          RETURNING *
+          `,
+          [
+            safeBranchId,
+            empId,
+            itemCycle,
+            fullUnclosedStart,
+            fullUnclosedEnd,
+            fullPriorEarnedSalary,
+            fullUnclosedCyclesCount * 6,
+            fullTotalPriorAdvances,
+            priorUnpaidDuesAmount,
+            cashOutId,
+            user.id || null,
+            paidByName,
+            `تسوية مسير متأخر سابق (${fullUnclosedStart} إلى ${fullUnclosedEnd}) ضمن الصرف الشامل`,
+          ],
+        );
+        createdRecords.push(priorRecRes.rows[0]);
+
+        // Mark prior advances as deducted
+        if (fullPriorAdvances.length > 0) {
+          const pIds = fullPriorAdvances.map((a) => a.id);
+          await client.query(
+            `UPDATE payroll_advances SET status = 'deducted', payroll_record_id = $1 WHERE id = ANY($2) AND branch_id = $3`,
+            [priorRecRes.rows[0].id, pIds, safeBranchId],
+          );
+        }
       }
 
       // 2. Prepare notes and insert into payroll_records
