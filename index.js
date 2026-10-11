@@ -62,7 +62,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.10.13";
+const SYSTEM_VERSION = "v.26.10.14";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
