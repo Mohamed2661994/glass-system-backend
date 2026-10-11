@@ -62,7 +62,7 @@ const {
 } = require("./services/wholesaleToRetailConverter");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
-const SYSTEM_VERSION = "v.26.10.12";
+const SYSTEM_VERSION = "v.26.10.13";
 
 const STARTUP_DB_TARGETS = [
   [localPool, "Local"],
@@ -6779,6 +6779,7 @@ app.get("/invoices", async (req, res) => {
       external_order_id,
       online_only,
       list_visibility,
+      apply_items_discount,
       date_from,
       date_to,
       limit = 50,
@@ -6835,6 +6836,15 @@ app.get("/invoices", async (req, res) => {
     if (is_return !== undefined) {
       conditions.push(`is_return = $${idx++}`);
       values.push(is_return === "true");
+    }
+
+    if (
+      apply_items_discount !== undefined &&
+      apply_items_discount !== "" &&
+      apply_items_discount !== "all"
+    ) {
+      conditions.push(`apply_items_discount = $${idx++}`);
+      values.push(apply_items_discount === "true" || apply_items_discount === "1");
     }
 
     if (customer_name) {
@@ -6917,7 +6927,8 @@ app.get("/invoices", async (req, res) => {
         whatsapp_phone,
         whatsapp_sent_at,
         whatsapp_error,
-        notes
+        notes,
+        apply_items_discount
       FROM invoices
       ${whereClause}
       ORDER BY id DESC
@@ -7410,7 +7421,7 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
            previous_balance, additional_amount, paid_amount, remaining_amount,
            payment_status, invoice_date, created_at, created_by, created_by_name,
            updated_by, updated_by_name, hidden_from_list, invoice_source,
-           external_order_id, whatsapp_status, notes
+           external_order_id, whatsapp_status, notes, apply_items_discount
          FROM invoices
          WHERE invoice_type = $1
            AND (COALESCE(hidden_from_list, false) = false)
