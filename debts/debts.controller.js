@@ -818,3 +818,246 @@ exports.getUpcoming = async (req, res) => {
     return res.json(upcoming);
   }
 };
+
+// 10. Get Active Debts Lookup (Accessible for Cash Out & Selectors)
+exports.getActiveList = async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        d.id,
+        d.title,
+        d.creditor_name,
+        d.creditor_phone,
+        d.total_amount,
+        d.paid_amount,
+        d.remaining_amount,
+        d.installment_count,
+        d.installment_amount,
+        d.frequency,
+        d.status,
+        d.category,
+        (
+          SELECT json_agg(
+            json_build_object(
+              'id', i.id,
+              'installment_number', i.installment_number,
+              'due_date', i.due_date,
+              'amount', i.amount,
+              'paid_amount', i.paid_amount,
+              'status', i.status
+            ) ORDER BY i.installment_number ASC
+          )
+          FROM debt_installments i
+          WHERE i.debt_id = d.id AND i.status != 'paid'
+        ) as pending_installments
+      FROM external_debts d
+      WHERE d.status != 'completed'
+      ORDER BY d.id ASC
+    `;
+    const result = await pool.query(query);
+    return res.json(
+      result.rows.map(r => ({
+        ...r,
+        total_amount: Number(r.total_amount),
+        paid_amount: Number(r.paid_amount),
+        remaining_amount: Number(r.remaining_amount),
+        installment_amount: Number(r.installment_amount),
+        pending_installments: (r.pending_installments || []).map(i => ({
+          ...i,
+          amount: Number(i.amount),
+          paid_amount: Number(i.paid_amount)
+        }))
+      }))
+    );
+  } catch (err) {
+    const store = getLocalStore();
+    const list = store.debts
+      .filter(d => d.status !== 'completed')
+      .map(d => {
+        const pInst = store.installments
+          .filter(i => i.debt_id === d.id && i.status !== 'paid')
+          .sort((a, b) => a.installment_number - b.installment_number);
+        return {
+          ...d,
+          total_amount: Number(d.total_amount),
+          paid_amount: Number(d.paid_amount),
+          remaining_amount: Number(d.remaining_amount),
+          installment_amount: Number(d.installment_amount),
+          pending_installments: pInst.map(i => ({
+            ...i,
+            amount: Number(i.amount),
+            paid_amount: Number(i.paid_amount)
+          }))
+        };
+      });
+    return res.json(list);
+  }
+};
+
+// 11. Helper: Record Debt Payment from Cash Out
+exports.recordDebtPaymentFromCashOut = async ({
+  client = pool,
+  cashOutId,
+  debtId,
+  installmentId,
+  amount,
+  date,
+  permissionNumber,
+  notes
+}) => {
+  if (!debtId || !amount || Number(amount) <= 0) return null;
+  const paymentAmount = Number(amount);
+
+  try {
+    if (installmentId) {
+      // Specific installment chosen
+      const instRes = await client.query('SELECT * FROM debt_installments WHERE id = $1', [installmentId]);
+      if (instRes.rows.length > 0) {
+        const inst = instRes.rows[0];
+        const newPaid = Number(inst.paid_amount || 0) + paymentAmount;
+        const newStatus = newPaid >= Number(inst.amount) ? 'paid' : 'partially_paid';
+        await client.query(
+          `UPDATE debt_installments
+           SET paid_amount = $1, paid_at = $2, status = $3, payment_method = 'خزينة المحل', source_type = 'treasury', treasury_tx_id = $4, notes = $5, updated_at = NOW()
+           WHERE id = $6`,
+          [
+            newPaid,
+            date || new Date().toISOString().split('T')[0],
+            newStatus,
+            cashOutId,
+            (inst.notes ? inst.notes + ' | ' : '') + `إذن صرف #${permissionNumber || cashOutId}`,
+            installmentId
+          ]
+        );
+      }
+    } else {
+      // Allocate payment automatically to pending installments in chronological order
+      const instsRes = await client.query(
+        `SELECT * FROM debt_installments 
+         WHERE debt_id = $1 AND status != 'paid' 
+         ORDER BY installment_number ASC, due_date ASC`,
+        [debtId]
+      );
+
+      let remainingPayment = paymentAmount;
+      for (const inst of instsRes.rows) {
+        if (remainingPayment <= 0) break;
+        const needed = Number(inst.amount) - Number(inst.paid_amount || 0);
+        const payNow = Math.min(remainingPayment, needed);
+        const newPaid = Number(inst.paid_amount || 0) + payNow;
+        const newStatus = newPaid >= Number(inst.amount) ? 'paid' : 'partially_paid';
+
+        await client.query(
+          `UPDATE debt_installments
+           SET paid_amount = $1, paid_at = $2, status = $3, payment_method = 'خزينة المحل', source_type = 'treasury', treasury_tx_id = $4, notes = $5, updated_at = NOW()
+           WHERE id = $6`,
+          [
+            newPaid,
+            date || new Date().toISOString().split('T')[0],
+            newStatus,
+            cashOutId,
+            (inst.notes ? inst.notes + ' | ' : '') + `إذن صرف #${permissionNumber || cashOutId}`,
+            inst.id
+          ]
+        );
+
+        remainingPayment -= payNow;
+      }
+    }
+
+    // Recalculate parent debt
+    const sumRes = await client.query(
+      `SELECT COALESCE(SUM(paid_amount), 0) as total_paid FROM debt_installments WHERE debt_id = $1`,
+      [debtId]
+    );
+    const totalPaid = Number(sumRes.rows[0]?.total_paid || 0);
+    const debtRes = await client.query(`SELECT total_amount FROM external_debts WHERE id = $1`, [debtId]);
+    const totalAmount = Number(debtRes.rows[0]?.total_amount || 0);
+    const newRemaining = Math.max(0, totalAmount - totalPaid);
+    const newDebtStatus = newRemaining <= 0 ? 'completed' : 'active';
+
+    await client.query(
+      `UPDATE external_debts
+       SET paid_amount = $1, remaining_amount = $2, status = $3, updated_at = NOW()
+       WHERE id = $4`,
+      [totalPaid, newRemaining, newDebtStatus, debtId]
+    );
+
+    return { success: true, debtId, totalPaid, newRemaining, status: newDebtStatus };
+  } catch (err) {
+    console.error('Error in recordDebtPaymentFromCashOut:', err);
+    // Local store fallback
+    try {
+      const store = getLocalStore();
+      const debt = store.debts.find(d => d.id === Number(debtId));
+      if (debt) {
+        const pInsts = store.installments
+          .filter(i => i.debt_id === Number(debtId) && i.status !== 'paid')
+          .sort((a, b) => a.installment_number - b.installment_number);
+        let rem = paymentAmount;
+        for (const i of pInsts) {
+          if (rem <= 0) break;
+          const needed = Number(i.amount) - Number(i.paid_amount || 0);
+          const payNow = Math.min(rem, needed);
+          i.paid_amount = Number(i.paid_amount || 0) + payNow;
+          i.status = i.paid_amount >= Number(i.amount) ? 'paid' : 'partially_paid';
+          i.treasury_tx_id = cashOutId;
+          i.payment_method = 'خزينة المحل';
+          i.source_type = 'treasury';
+          rem -= payNow;
+        }
+        const allInsts = store.installments.filter(i => i.debt_id === debt.id);
+        debt.paid_amount = allInsts.reduce((sum, i) => sum + Number(i.paid_amount || 0), 0);
+        debt.remaining_amount = Math.max(0, Number(debt.total_amount) - debt.paid_amount);
+        debt.status = debt.remaining_amount <= 0 ? 'completed' : 'active';
+        saveLocalStore(store);
+      }
+    } catch (lErr) {
+      console.warn('Local fallback error:', lErr.message);
+    }
+    return null;
+  }
+};
+
+// 12. Helper: Revert Debt Payment when cash_out is updated or removed
+exports.revertDebtPaymentFromCashOut = async ({ client = pool, cashOutId }) => {
+  if (!cashOutId) return;
+  try {
+    const instsRes = await client.query(
+      `SELECT * FROM debt_installments WHERE treasury_tx_id = $1`,
+      [cashOutId]
+    );
+    if (instsRes.rows.length === 0) return;
+
+    const debtIds = [...new Set(instsRes.rows.map(r => r.debt_id))];
+
+    await client.query(
+      `UPDATE debt_installments
+       SET paid_amount = 0, paid_at = NULL, status = 'pending', treasury_tx_id = NULL, source_type = 'personal', updated_at = NOW()
+       WHERE treasury_tx_id = $1`,
+      [cashOutId]
+    );
+
+    for (const dId of debtIds) {
+      const sumRes = await client.query(
+        `SELECT COALESCE(SUM(paid_amount), 0) as total_paid FROM debt_installments WHERE debt_id = $1`,
+        [dId]
+      );
+      const totalPaid = Number(sumRes.rows[0]?.total_paid || 0);
+      const debtRes = await client.query(`SELECT total_amount FROM external_debts WHERE id = $1`, [dId]);
+      const totalAmount = Number(debtRes.rows[0]?.total_amount || 0);
+      const newRemaining = Math.max(0, totalAmount - totalPaid);
+      const newDebtStatus = newRemaining <= 0 ? 'completed' : 'active';
+
+      await client.query(
+        `UPDATE external_debts
+         SET paid_amount = $1, remaining_amount = $2, status = $3, updated_at = NOW()
+         WHERE id = $4`,
+        [totalPaid, newRemaining, newDebtStatus, dId]
+      );
+    }
+  } catch (err) {
+    console.error('Error in revertDebtPaymentFromCashOut:', err);
+  }
+};
+

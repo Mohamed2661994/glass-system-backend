@@ -1440,6 +1440,7 @@ const payrollRoutes = require("./payroll/payroll.routes");
 app.use("/payroll", payrollRoutes);
 
 const debtsRoutes = require("./debts/debts.routes");
+const debtsController = require("./debts/debts.controller");
 app.use("/debts", debtsRoutes);
 app.use("/api/debts", debtsRoutes);
 
@@ -9994,13 +9995,14 @@ async function requirePermission(req, res, permissionKey) {
 app.post("/cash/out", authMiddleware, async (req, res) => {
   try {
     const branch_id = req.user.branch_id; // ✅ من التوكن
-    const { name, amount, notes, date, entry_type, supplier_id } = req.body;
+    const { name, amount, notes, date, entry_type, supplier_id, debt_id, installment_id } = req.body;
     const safeEntryType =
       entry_type === "purchase" ||
       entry_type === "expense" ||
       entry_type === "supplier_payment" ||
       entry_type === "warehouse_settlement" ||
-      entry_type === "showroom_settlement"
+      entry_type === "showroom_settlement" ||
+      entry_type === "debt_payment"
         ? entry_type
         : "expense";
 
@@ -10010,6 +10012,10 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
 
     if (safeEntryType === "supplier_payment" && !supplier_id) {
       return res.status(400).json({ error: "يجب اختيار المورد" });
+    }
+
+    if (safeEntryType === "debt_payment" && !debt_id) {
+      return res.status(400).json({ error: "يجب اختيار المديونية المراد السداد لها" });
     }
 
     // توليد رقم إذن (نفس منطق الفرونت)
@@ -10028,9 +10034,11 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
         transaction_date,
         permission_number,
         entry_type,
-        supplier_id
+        supplier_id,
+        debt_id,
+        installment_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       RETURNING id, permission_number
       `,
       [
@@ -10042,12 +10050,33 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
         permissionNumber,
         safeEntryType,
         safeEntryType === "supplier_payment" ? supplier_id : null,
+        safeEntryType === "debt_payment" ? Number(debt_id) : null,
+        safeEntryType === "debt_payment" && installment_id ? Number(installment_id) : null,
       ],
     );
 
+    const cashOutId = result.rows[0].id;
+
+    // ⚡ Automatic Debt & Installment Settlement
+    if (safeEntryType === "debt_payment" && debt_id) {
+      try {
+        await debtsController.recordDebtPaymentFromCashOut({
+          cashOutId,
+          debtId: Number(debt_id),
+          installmentId: installment_id ? Number(installment_id) : null,
+          amount: Number(amount),
+          date,
+          permissionNumber,
+          notes: notes || ""
+        });
+      } catch (dErr) {
+        console.error("Error linking cash_out to debt payment:", dErr);
+      }
+    }
+
     res.json({
       success: true,
-      id: result.rows[0].id,
+      id: cashOutId,
       permission_number: result.rows[0].permission_number,
     });
   } catch (err) {
@@ -10066,21 +10095,41 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
 
     const branch_id = currentUser.branch_id;
     const { id } = req.params;
-    const { name, amount, notes, date, entry_type, supplier_id } = req.body;
+    const { name, amount, notes, date, entry_type, supplier_id, debt_id, installment_id } = req.body;
     const safeEntryType =
       entry_type === "purchase" ||
       entry_type === "expense" ||
       entry_type === "supplier_payment" ||
       entry_type === "warehouse_settlement" ||
-      entry_type === "showroom_settlement"
+      entry_type === "showroom_settlement" ||
+      entry_type === "debt_payment"
         ? entry_type
         : "expense";
+
+    if (safeEntryType === "debt_payment" && !debt_id) {
+      return res.status(400).json({ error: "يجب اختيار المديونية المراد السداد لها" });
+    }
+
+    // Revert previous debt payment linked to this cash_out if any
+    try {
+      await debtsController.revertDebtPaymentFromCashOut({ cashOutId: id });
+    } catch (rErr) {
+      console.warn("Could not revert previous debt payment:", rErr.message);
+    }
 
     const result = await pool.query(
       `
       UPDATE cash_out
-      SET name=$1, amount=$2, notes=$3, transaction_date=$4, entry_type=$5, supplier_id=$6
-      WHERE id=$7 AND branch_id=$8
+      SET 
+        name=$1, 
+        amount=$2, 
+        notes=$3, 
+        transaction_date=$4, 
+        entry_type=$5, 
+        supplier_id=$6,
+        debt_id=$7,
+        installment_id=$8
+      WHERE id=$9 AND branch_id=$10
       RETURNING *
       `,
       [
@@ -10090,6 +10139,8 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
         date,
         safeEntryType,
         safeEntryType === "supplier_payment" ? supplier_id : null,
+        safeEntryType === "debt_payment" ? Number(debt_id) : null,
+        safeEntryType === "debt_payment" && installment_id ? Number(installment_id) : null,
         id,
         branch_id,
       ],
@@ -10097,6 +10148,23 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
 
     if (!result.rows.length) {
       return res.status(403).json({ error: "غير مسموح بالتعديل" });
+    }
+
+    // Re-record debt payment if entry_type is debt_payment
+    if (safeEntryType === "debt_payment" && debt_id) {
+      try {
+        await debtsController.recordDebtPaymentFromCashOut({
+          cashOutId: id,
+          debtId: Number(debt_id),
+          installmentId: installment_id ? Number(installment_id) : null,
+          amount: Number(amount),
+          date,
+          permissionNumber: result.rows[0]?.permission_number,
+          notes: notes || ""
+        });
+      } catch (dErr) {
+        console.error("Error re-linking cash_out to debt payment:", dErr);
+      }
     }
 
     res.json({
@@ -10167,11 +10235,16 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
         co.created_at,
         co.entry_type,
         co.supplier_id,
+        co.debt_id,
+        co.installment_id,
+        ed.title AS debt_title,
+        ed.creditor_name AS debt_creditor_name,
         s.name AS supplier_name,
         COALESCE(pe_rec.job_title, pe_adv.job_title) AS employee_job_title,
         COALESCE(pe_rec.name, pe_adv.name) AS employee_name
       FROM cash_out co
       LEFT JOIN suppliers s ON s.id = co.supplier_id
+      LEFT JOIN external_debts ed ON ed.id = co.debt_id
       LEFT JOIN payroll_records pr ON pr.cash_out_id = co.id
       LEFT JOIN payroll_employees pe_rec ON pe_rec.id = pr.employee_id
       LEFT JOIN payroll_advances pa ON pa.cash_out_id = co.id

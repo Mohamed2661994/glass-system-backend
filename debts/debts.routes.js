@@ -19,7 +19,10 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// All debts routes require admin
+// Public / Cash Out Lookup (Accessible to all authenticated users for treasury payment selector)
+router.get("/active-list", controller.getActiveList);
+
+// All debts management routes require admin
 router.use(requireAdmin);
 
 // 1. KPI & Dashboard Summary

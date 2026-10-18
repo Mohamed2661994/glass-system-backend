@@ -43,3 +43,9 @@ CREATE INDEX IF NOT EXISTS idx_debt_installments_debt_id ON debt_installments(de
 CREATE INDEX IF NOT EXISTS idx_debt_installments_due_date ON debt_installments(due_date);
 CREATE INDEX IF NOT EXISTS idx_debt_installments_status ON debt_installments(status);
 CREATE INDEX IF NOT EXISTS idx_external_debts_status ON external_debts(status);
+
+-- Treasury Integration (cash_out linked to debts)
+ALTER TABLE cash_out ADD COLUMN IF NOT EXISTS debt_id INTEGER REFERENCES external_debts(id) ON DELETE SET NULL;
+ALTER TABLE cash_out ADD COLUMN IF NOT EXISTS installment_id INTEGER REFERENCES debt_installments(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_cash_out_debt_id ON cash_out(debt_id);
+
