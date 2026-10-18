@@ -138,10 +138,29 @@ async function initDebtsTables() {
     CREATE INDEX IF NOT EXISTS idx_debt_installments_due_date ON debt_installments(due_date);
     CREATE INDEX IF NOT EXISTS idx_debt_installments_status ON debt_installments(status);
     CREATE INDEX IF NOT EXISTS idx_external_debts_status ON external_debts(status);
+
+    CREATE TABLE IF NOT EXISTS debt_installment_payments (
+      id SERIAL PRIMARY KEY,
+      debt_id INTEGER NOT NULL REFERENCES external_debts(id) ON DELETE CASCADE,
+      installment_id INTEGER NOT NULL REFERENCES debt_installments(id) ON DELETE CASCADE,
+      amount NUMERIC(12, 2) NOT NULL,
+      payment_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      payment_method VARCHAR(100) DEFAULT 'كاش',
+      source_type VARCHAR(50) DEFAULT 'personal',
+      cash_out_id INTEGER REFERENCES cash_out(id) ON DELETE SET NULL,
+      permission_number VARCHAR(100) DEFAULT '',
+      notes TEXT DEFAULT '',
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dip_installment_id ON debt_installment_payments(installment_id);
+    CREATE INDEX IF NOT EXISTS idx_dip_debt_id ON debt_installment_payments(debt_id);
+    CREATE INDEX IF NOT EXISTS idx_dip_payment_date ON debt_installment_payments(payment_date);
   `;
   try {
     await pool.query(sql);
-    console.log("✅ external_debts & debt_installments tables ready");
+    console.log("✅ external_debts, debt_installments & debt_installment_payments tables ready");
   } catch (err) {
     console.log("ℹ️ Debts tables init deferred or using local fallback:", err.message);
   }
@@ -359,6 +378,11 @@ exports.getDebtById = async (req, res) => {
       [id]
     );
 
+    const paymentsRes = await pool.query(
+      `SELECT * FROM debt_installment_payments WHERE debt_id = $1 ORDER BY payment_date DESC, id DESC`,
+      [id]
+    ).catch(() => ({ rows: [] }));
+
     const debt = debtRes.rows[0];
     debt.total_amount = Number(debt.total_amount);
     debt.paid_amount = Number(debt.paid_amount);
@@ -367,7 +391,13 @@ exports.getDebtById = async (req, res) => {
     debt.installments = instRes.rows.map(i => ({
       ...i,
       amount: Number(i.amount),
-      paid_amount: Number(i.paid_amount)
+      paid_amount: Number(i.paid_amount),
+      payments: (paymentsRes.rows || [])
+        .filter(p => Number(p.installment_id) === Number(i.id))
+        .map(p => ({
+          ...p,
+          amount: Number(p.amount)
+        }))
     }));
 
     return res.json(debt);
@@ -376,10 +406,16 @@ exports.getDebtById = async (req, res) => {
     const debt = store.debts.find(d => d.id === Number(id));
     if (!debt) return res.status(404).json({ error: "المديونية غير موجودة" });
 
+    store.payments = store.payments || [];
     const installments = store.installments
       .filter(i => i.debt_id === Number(id))
       .sort((a,b) => a.installment_number - b.installment_number)
-      .map(i => ({ ...i, amount: Number(i.amount), paid_amount: Number(i.paid_amount) }));
+      .map(i => ({
+        ...i,
+        amount: Number(i.amount),
+        paid_amount: Number(i.paid_amount),
+        payments: (store.payments || []).filter(p => p.installment_id === i.id)
+      }));
 
     return res.json({
       ...debt,
@@ -763,7 +799,7 @@ exports.updateInstallment = async (req, res) => {
           status = $4,
           payment_method = $5,
           notes = $6,
-          paid_at = CASE WHEN $3 > 0 THEN COALESCE(paid_at, NOW()) ELSE NULL END,
+          paid_at = CASE WHEN ($3::numeric) > 0 THEN COALESCE(paid_at, NOW()) ELSE NULL END,
           updated_at = NOW()
         WHERE id = $7
         RETURNING *
@@ -777,6 +813,39 @@ exports.updateInstallment = async (req, res) => {
         newNotes,
         id
       ]);
+
+      // Sync with debt_installment_payments table
+      if (paid_amount !== undefined) {
+        const pRes = await client.query(
+          `SELECT id, amount FROM debt_installment_payments WHERE installment_id = $1 ORDER BY id ASC`,
+          [id]
+        );
+        if (newPaidAmount === 0) {
+          await client.query(`DELETE FROM debt_installment_payments WHERE installment_id = $1`, [id]);
+        } else if (pRes.rows.length === 0) {
+          await client.query(
+            `INSERT INTO debt_installment_payments (debt_id, installment_id, amount, payment_date, payment_method, source_type, notes)
+             VALUES ($1, $2, $3, NOW(), $4, 'personal', $5)`,
+            [current.debt_id, id, newPaidAmount, newPaymentMethod, newNotes || 'سداد مباشر']
+          );
+        } else if (pRes.rows.length === 1) {
+          await client.query(
+            `UPDATE debt_installment_payments SET amount = $1, payment_method = $2, notes = $3, updated_at = NOW() WHERE id = $4`,
+            [newPaidAmount, newPaymentMethod, newNotes || 'سداد مباشر', pRes.rows[0].id]
+          );
+        } else {
+          const totalExisting = await client.query(`SELECT COALESCE(SUM(amount), 0) as s FROM debt_installment_payments WHERE installment_id = $1`, [id]);
+          const currentSum = Number(totalExisting.rows[0]?.s || 0);
+          const diff = newPaidAmount - currentSum;
+          if (diff !== 0) {
+            await client.query(
+              `INSERT INTO debt_installment_payments (debt_id, installment_id, amount, payment_date, payment_method, source_type, notes)
+               VALUES ($1, $2, $3, NOW(), $4, 'personal', $5)`,
+              [current.debt_id, id, diff, newPaymentMethod, 'تعديل سداد']
+            );
+          }
+        }
+      }
 
       // Recalculate parent debt
       const debtId = current.debt_id;
@@ -963,6 +1032,13 @@ exports.payInstallment = async (req, res) => {
         [newPaidAmount, newStatus, payment_method, source_type, treasuryTxId, notes || inst.notes || "", id]
       );
 
+      // Record in debt_installment_payments
+      await client.query(
+        `INSERT INTO debt_installment_payments (debt_id, installment_id, amount, payment_date, payment_method, source_type, cash_out_id, notes)
+         VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7)`,
+        [debtId, id, paymentAmount, payment_method, source_type, treasuryTxId, notes || `سداد قسط #${inst.installment_number}`]
+      );
+
       // Recalculate parent debt
       const sumRes = await client.query(
         `SELECT COALESCE(SUM(paid_amount), 0) as total_paid FROM debt_installments WHERE debt_id = $1`,
@@ -1045,6 +1121,9 @@ exports.unpayInstallment = async (req, res) => {
         [id]
       );
 
+      // Clear payments in debt_installment_payments
+      await client.query(`DELETE FROM debt_installment_payments WHERE installment_id = $1`, [id]);
+
       // Recalculate parent debt
       const sumRes = await client.query(
         `SELECT COALESCE(SUM(paid_amount), 0) as total_paid FROM debt_installments WHERE debt_id = $1`,
@@ -1090,6 +1169,218 @@ exports.unpayInstallment = async (req, res) => {
 
     saveLocalStore(store);
     return res.json({ success: true, message: "تم إلغاء السداد وإعادة القسط إلى معلق" });
+  }
+};
+
+// 8.5 Get Payments for Single Installment
+exports.getInstallmentPayments = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const pRes = await pool.query(
+      `SELECT * FROM debt_installment_payments WHERE installment_id = $1 ORDER BY payment_date DESC, id DESC`,
+      [id]
+    );
+    return res.json({ success: true, payments: pRes.rows });
+  } catch (err) {
+    const store = getLocalStore();
+    store.payments = store.payments || [];
+    const payments = store.payments.filter(p => p.installment_id === Number(id));
+    return res.json({ success: true, payments });
+  }
+};
+
+// 8.6 Update Payment Transaction
+exports.updatePaymentTransaction = async (req, res) => {
+  const { id } = req.params;
+  const { amount, payment_date, payment_method, notes } = req.body;
+  const client = await pool.connect().catch(() => null);
+
+  if (client) {
+    try {
+      await client.query("BEGIN");
+      const pRes = await client.query(`SELECT * FROM debt_installment_payments WHERE id = $1 FOR UPDATE`, [id]);
+      if (pRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "حركة السداد غير موجودة" });
+      }
+
+      const p = pRes.rows[0];
+      const installmentId = p.installment_id;
+      const debtId = p.debt_id;
+
+      const newAmount = amount !== undefined && Number(amount) > 0 ? Number(amount) : Number(p.amount);
+      const newDate = payment_date || p.payment_date;
+      const newMethod = payment_method !== undefined ? payment_method : p.payment_method;
+      const newNotes = notes !== undefined ? notes : p.notes;
+
+      await client.query(
+        `UPDATE debt_installment_payments 
+         SET amount = $1, payment_date = $2, payment_method = $3, notes = $4, updated_at = NOW() 
+         WHERE id = $5`,
+        [newAmount, newDate, newMethod, newNotes, id]
+      );
+
+      // Recalculate installment
+      const instSumRes = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) as total_paid FROM debt_installment_payments WHERE installment_id = $1`,
+        [installmentId]
+      );
+      const instTotalPaid = Number(instSumRes.rows[0].total_paid);
+      const instRes = await client.query(`SELECT amount FROM debt_installments WHERE id = $1`, [installmentId]);
+      const instAmount = Number(instRes.rows[0]?.amount || 0);
+      const instStatus = instTotalPaid >= instAmount ? 'paid' : (instTotalPaid > 0 ? 'partially_paid' : 'pending');
+
+      await client.query(
+        `UPDATE debt_installments 
+         SET paid_amount = $1, status = $2, paid_at = CASE WHEN ($1::numeric) > 0 THEN NOW() ELSE NULL END, updated_at = NOW() 
+         WHERE id = $3`,
+        [instTotalPaid, instStatus, installmentId]
+      );
+
+      // Recalculate parent debt
+      const debtSumRes = await client.query(
+        `SELECT COALESCE(SUM(paid_amount), 0) as total_paid FROM debt_installments WHERE debt_id = $1`,
+        [debtId]
+      );
+      const debtTotalPaid = Number(debtSumRes.rows[0].total_paid);
+      const debtRes = await client.query(`SELECT total_amount FROM external_debts WHERE id = $1`, [debtId]);
+      const totalDebtAmount = Number(debtRes.rows[0]?.total_amount || 0);
+      const remaining = Math.max(0, totalDebtAmount - debtTotalPaid);
+      const debtStatus = remaining <= 0 ? 'completed' : 'active';
+
+      await client.query(
+        `UPDATE external_debts SET paid_amount = $1, remaining_amount = $2, status = $3, updated_at = NOW() WHERE id = $4`,
+        [debtTotalPaid, remaining, debtStatus, debtId]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ success: true, message: "تم تعديل حركة السداد بنجاح" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
+    }
+  } else {
+    const store = getLocalStore();
+    store.payments = store.payments || [];
+    const p = store.payments.find(x => x.id === Number(id));
+    if (!p) return res.status(404).json({ error: "حركة السداد غير موجودة" });
+
+    if (amount !== undefined && Number(amount) > 0) p.amount = Number(amount);
+    if (payment_date) p.payment_date = payment_date;
+    if (payment_method) p.payment_method = payment_method;
+    if (notes !== undefined) p.notes = notes;
+
+    const inst = store.installments.find(i => i.id === p.installment_id);
+    if (inst) {
+      const allInstPayments = store.payments.filter(x => x.installment_id === inst.id);
+      inst.paid_amount = allInstPayments.reduce((s, x) => s + Number(x.amount || 0), 0);
+      inst.status = inst.paid_amount >= inst.amount ? 'paid' : (inst.paid_amount > 0 ? 'partially_paid' : 'pending');
+    }
+
+    const parentDebt = store.debts.find(d => d.id === p.debt_id);
+    if (parentDebt) {
+      const allInsts = store.installments.filter(i => i.debt_id === parentDebt.id);
+      const totalPaid = allInsts.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
+      parentDebt.paid_amount = totalPaid;
+      parentDebt.remaining_amount = Math.max(0, Number(parentDebt.total_amount) - totalPaid);
+      parentDebt.status = parentDebt.remaining_amount <= 0 ? 'completed' : 'active';
+    }
+
+    saveLocalStore(store);
+    return res.json({ success: true, message: "تم تعديل حركة السداد بنجاح" });
+  }
+};
+
+// 8.7 Delete Payment Transaction
+exports.deletePaymentTransaction = async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect().catch(() => null);
+
+  if (client) {
+    try {
+      await client.query("BEGIN");
+      const pRes = await client.query(`SELECT * FROM debt_installment_payments WHERE id = $1 FOR UPDATE`, [id]);
+      if (pRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "حركة السداد غير موجودة" });
+      }
+
+      const p = pRes.rows[0];
+      const installmentId = p.installment_id;
+      const debtId = p.debt_id;
+
+      await client.query(`DELETE FROM debt_installment_payments WHERE id = $1`, [id]);
+
+      // Recalculate installment
+      const instSumRes = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) as total_paid FROM debt_installment_payments WHERE installment_id = $1`,
+        [installmentId]
+      );
+      const instTotalPaid = Number(instSumRes.rows[0].total_paid);
+      const instRes = await client.query(`SELECT amount FROM debt_installments WHERE id = $1`, [installmentId]);
+      const instAmount = Number(instRes.rows[0]?.amount || 0);
+      const instStatus = instTotalPaid >= instAmount ? 'paid' : (instTotalPaid > 0 ? 'partially_paid' : 'pending');
+
+      await client.query(
+        `UPDATE debt_installments 
+         SET paid_amount = $1, status = $2, paid_at = CASE WHEN ($1::numeric) > 0 THEN NOW() ELSE NULL END, updated_at = NOW() 
+         WHERE id = $3`,
+        [instTotalPaid, instStatus, installmentId]
+      );
+
+      // Recalculate parent debt
+      const debtSumRes = await client.query(
+        `SELECT COALESCE(SUM(paid_amount), 0) as total_paid FROM debt_installments WHERE debt_id = $1`,
+        [debtId]
+      );
+      const debtTotalPaid = Number(debtSumRes.rows[0].total_paid);
+      const debtRes = await client.query(`SELECT total_amount FROM external_debts WHERE id = $1`, [debtId]);
+      const totalDebtAmount = Number(debtRes.rows[0]?.total_amount || 0);
+      const remaining = Math.max(0, totalDebtAmount - debtTotalPaid);
+      const debtStatus = remaining <= 0 ? 'completed' : 'active';
+
+      await client.query(
+        `UPDATE external_debts SET paid_amount = $1, remaining_amount = $2, status = $3, updated_at = NOW() WHERE id = $4`,
+        [debtTotalPaid, remaining, debtStatus, debtId]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ success: true, message: "تم حذف حركة السداد بنجاح" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
+    }
+  } else {
+    const store = getLocalStore();
+    store.payments = store.payments || [];
+    const pIdx = store.payments.findIndex(x => x.id === Number(id));
+    if (pIdx === -1) return res.status(404).json({ error: "حركة السداد غير موجودة" });
+
+    const p = store.payments[pIdx];
+    store.payments.splice(pIdx, 1);
+
+    const inst = store.installments.find(i => i.id === p.installment_id);
+    if (inst) {
+      const allInstPayments = store.payments.filter(x => x.installment_id === inst.id);
+      inst.paid_amount = allInstPayments.reduce((s, x) => s + Number(x.amount || 0), 0);
+      inst.status = inst.paid_amount >= inst.amount ? 'paid' : (inst.paid_amount > 0 ? 'partially_paid' : 'pending');
+    }
+
+    const parentDebt = store.debts.find(d => d.id === p.debt_id);
+    if (parentDebt) {
+      const allInsts = store.installments.filter(i => i.debt_id === parentDebt.id);
+      const totalPaid = allInsts.reduce((s, i) => s + Number(i.paid_amount || 0), 0);
+      parentDebt.paid_amount = totalPaid;
+      parentDebt.remaining_amount = Math.max(0, Number(parentDebt.total_amount) - totalPaid);
+      parentDebt.status = parentDebt.remaining_amount <= 0 ? 'completed' : 'active';
+    }
+
+    saveLocalStore(store);
+    return res.json({ success: true, message: "تم حذف حركة السداد بنجاح" });
   }
 };
 
@@ -1253,6 +1544,12 @@ exports.recordDebtPaymentFromCashOut = async ({
             installmentId
           ]
         );
+
+        await client.query(
+          `INSERT INTO debt_installment_payments (debt_id, installment_id, amount, payment_date, payment_method, source_type, cash_out_id, permission_number, notes)
+           VALUES ($1, $2, $3, $4, 'خزينة المحل', 'treasury', $5, $6, $7)`,
+          [debtId, installmentId, paymentAmount, date ? new Date(date).toISOString() : new Date().toISOString(), cashOutId, permissionNumber || '', (notes ? notes + ' | ' : '') + `إذن صرف #${permissionNumber || cashOutId}`]
+        );
       }
     } else {
       // Allocate payment automatically to pending installments in chronological order
@@ -1285,6 +1582,12 @@ exports.recordDebtPaymentFromCashOut = async ({
           ]
         );
 
+        await client.query(
+          `INSERT INTO debt_installment_payments (debt_id, installment_id, amount, payment_date, payment_method, source_type, cash_out_id, permission_number, notes)
+           VALUES ($1, $2, $3, $4, 'خزينة المحل', 'treasury', $5, $6, $7)`,
+          [debtId, inst.id, payNow, date ? new Date(date).toISOString() : new Date().toISOString(), cashOutId, permissionNumber || '', (notes ? notes + ' | ' : '') + `إذن صرف #${permissionNumber || cashOutId}`]
+        );
+
         remainingPayment -= payNow;
       }
     }
@@ -1310,35 +1613,6 @@ exports.recordDebtPaymentFromCashOut = async ({
     return { success: true, debtId, totalPaid, newRemaining, status: newDebtStatus };
   } catch (err) {
     console.error('Error in recordDebtPaymentFromCashOut:', err);
-    // Local store fallback
-    try {
-      const store = getLocalStore();
-      const debt = store.debts.find(d => d.id === Number(debtId));
-      if (debt) {
-        const pInsts = store.installments
-          .filter(i => i.debt_id === Number(debtId) && i.status !== 'paid')
-          .sort((a, b) => a.installment_number - b.installment_number);
-        let rem = paymentAmount;
-        for (const i of pInsts) {
-          if (rem <= 0) break;
-          const needed = Number(i.amount) - Number(i.paid_amount || 0);
-          const payNow = Math.min(rem, needed);
-          i.paid_amount = Number(i.paid_amount || 0) + payNow;
-          i.status = i.paid_amount >= Number(i.amount) ? 'paid' : 'partially_paid';
-          i.treasury_tx_id = cashOutId;
-          i.payment_method = 'خزينة المحل';
-          i.source_type = 'treasury';
-          rem -= payNow;
-        }
-        const allInsts = store.installments.filter(i => i.debt_id === debt.id);
-        debt.paid_amount = allInsts.reduce((sum, i) => sum + Number(i.paid_amount || 0), 0);
-        debt.remaining_amount = Math.max(0, Number(debt.total_amount) - debt.paid_amount);
-        debt.status = debt.remaining_amount <= 0 ? 'completed' : 'active';
-        saveLocalStore(store);
-      }
-    } catch (lErr) {
-      console.warn('Local fallback error:', lErr.message);
-    }
     return null;
   }
 };
@@ -1354,6 +1628,8 @@ exports.revertDebtPaymentFromCashOut = async ({ client = pool, cashOutId }) => {
     if (instsRes.rows.length === 0) return;
 
     const debtIds = [...new Set(instsRes.rows.map(r => r.debt_id))];
+
+    await client.query(`DELETE FROM debt_installment_payments WHERE cash_out_id = $1`, [cashOutId]);
 
     await client.query(
       `UPDATE debt_installments

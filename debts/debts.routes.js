@@ -44,4 +44,10 @@ router.delete("/installments/:id", controller.deleteInstallment);
 router.post("/installments/:id/pay", controller.payInstallment);
 router.post("/installments/:id/unpay", controller.unpayInstallment);
 
+// 5. Payment Transactions Log Actions
+router.get("/installments/:id/payments", controller.getInstallmentPayments);
+router.put("/payments/:id", controller.updatePaymentTransaction);
+router.delete("/payments/:id", controller.deletePaymentTransaction);
+
 module.exports = router;
+
