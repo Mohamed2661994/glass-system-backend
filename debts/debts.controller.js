@@ -601,13 +601,32 @@ exports.updateDebt = async (req, res) => {
         await client.query(
           `UPDATE external_debts
            SET title = $1, creditor_name = $2, creditor_phone = $3, category = $4, notes = $5, status = $6,
-               total_amount = $7, remaining_amount = $8, updated_at = NOW()
-           WHERE id = $9`,
+               total_amount = $7, remaining_amount = $8, start_date = COALESCE($9, start_date), updated_at = NOW()
+           WHERE id = $10`,
           [
             newTitle, newCreditorName, newCreditorPhone, newCategory, newNotes, newStatus,
-            newTotal, newRemaining, id
+            newTotal, newRemaining, start_date || null, id
           ]
         );
+
+        // If start_date was updated and there are pending installments, shift their due dates
+        if (start_date) {
+          const pendingInsts = await client.query(
+            `SELECT id, installment_number FROM debt_installments 
+             WHERE debt_id = $1 AND status != 'paid' 
+             ORDER BY installment_number ASC`,
+            [id]
+          );
+
+          for (let idx = 0; idx < pendingInsts.rows.length; idx++) {
+            const instRow = pendingInsts.rows[idx];
+            const newInstDueDate = calculateNextDueDate(start_date, idx, newFrequency);
+            await client.query(
+              `UPDATE debt_installments SET due_date = $1, updated_at = NOW() WHERE id = $2`,
+              [newInstDueDate, instRow.id]
+            );
+          }
+        }
       }
 
       await client.query("COMMIT");
@@ -671,6 +690,16 @@ exports.updateDebt = async (req, res) => {
           updated_at: new Date().toISOString()
         });
       }
+    } else if (currentPaid > 0 && start_date) {
+      debt.start_date = start_date;
+      const pendingInsts = store.installments
+        .filter(i => i.debt_id === Number(id) && i.status !== "paid")
+        .sort((a, b) => a.installment_number - b.installment_number);
+
+      pendingInsts.forEach((inst, idx) => {
+        inst.due_date = calculateNextDueDate(start_date, idx, debt.frequency);
+        inst.updated_at = new Date().toISOString();
+      });
     }
 
     debt.updated_at = new Date().toISOString();
@@ -691,6 +720,50 @@ exports.deleteDebt = async (req, res) => {
     store.installments = store.installments.filter(i => i.debt_id !== Number(id));
     saveLocalStore(store);
     return res.json({ success: true, message: "تم حذف المديونية وأقساطها بنجاح" });
+  }
+};
+
+// 6.5 Update Single Installment
+exports.updateInstallment = async (req, res) => {
+  const { id } = req.params;
+  const { due_date, amount, notes } = req.body;
+
+  const client = await pool.connect().catch(() => null);
+  if (client) {
+    try {
+      const updateSql = `
+        UPDATE debt_installments
+        SET 
+          due_date = COALESCE($1, due_date),
+          amount = COALESCE($2, amount),
+          notes = COALESCE($3, notes),
+          updated_at = NOW()
+        WHERE id = $4
+        RETURNING *
+      `;
+      const result = await client.query(updateSql, [
+        due_date || null,
+        amount !== undefined && Number(amount) > 0 ? Number(amount) : null,
+        notes !== undefined ? notes : null,
+        id
+      ]);
+      if (result.rows.length === 0) return res.status(404).json({ error: "القسط غير موجود" });
+      return res.json({ success: true, installment: result.rows[0] });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
+    }
+  } else {
+    const store = getLocalStore();
+    const inst = store.installments.find(i => i.id === Number(id));
+    if (!inst) return res.status(404).json({ error: "القسط غير موجود" });
+    if (due_date) inst.due_date = due_date;
+    if (amount) inst.amount = Number(amount);
+    if (notes !== undefined) inst.notes = notes;
+    inst.updated_at = new Date().toISOString();
+    saveLocalStore(store);
+    return res.json({ success: true, installment: inst });
   }
 };
 

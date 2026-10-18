@@ -39,6 +39,7 @@ router.put("/:id", controller.updateDebt);
 router.delete("/:id", controller.deleteDebt);
 
 // 4. Installments Actions
+router.put("/installments/:id", controller.updateInstallment);
 router.post("/installments/:id/pay", controller.payInstallment);
 router.post("/installments/:id/unpay", controller.unpayInstallment);
 
