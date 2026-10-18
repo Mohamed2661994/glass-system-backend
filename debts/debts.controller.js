@@ -520,34 +520,106 @@ exports.createDebt = async (req, res) => {
 // 5. Update Debt
 exports.updateDebt = async (req, res) => {
   const { id } = req.params;
-  const { title, creditor_name, creditor_phone, category, notes, status } = req.body;
+  const {
+    title,
+    creditor_name,
+    creditor_phone,
+    total_amount,
+    installment_count,
+    frequency,
+    start_date,
+    category,
+    notes,
+    status
+  } = req.body;
 
-  try {
-    const updateSql = `
-      UPDATE external_debts 
-      SET 
-        title = COALESCE($1, title),
-        creditor_name = COALESCE($2, creditor_name),
-        creditor_phone = COALESCE($3, creditor_phone),
-        category = COALESCE($4, category),
-        notes = COALESCE($5, notes),
-        status = COALESCE($6, status),
-        updated_at = NOW()
-      WHERE id = $7
-      RETURNING *
-    `;
-    const resDb = await pool.query(updateSql, [
-      title ? title.trim() : null,
-      creditor_name ? creditor_name.trim() : null,
-      creditor_phone !== undefined ? creditor_phone.trim() : null,
-      category || null,
-      notes !== undefined ? notes : null,
-      status || null,
-      id
-    ]);
-    if (resDb.rows.length === 0) return res.status(404).json({ error: "المديونية غير موجودة" });
-    return res.json({ success: true, debt: resDb.rows[0] });
-  } catch (err) {
+  const client = await pool.connect().catch(() => null);
+
+  if (client) {
+    try {
+      await client.query("BEGIN");
+      const currentRes = await client.query(`SELECT * FROM external_debts WHERE id = $1 FOR UPDATE`, [id]);
+      if (currentRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "المديونية غير موجودة" });
+      }
+
+      const current = currentRes.rows[0];
+      const newTitle = title !== undefined ? title.trim() : current.title;
+      const newCreditorName = creditor_name !== undefined ? creditor_name.trim() : current.creditor_name;
+      const newCreditorPhone = creditor_phone !== undefined ? creditor_phone.trim() : current.creditor_phone;
+      const newCategory = category !== undefined ? category : current.category;
+      const newNotes = notes !== undefined ? notes : current.notes;
+      const newStatus = status !== undefined ? status : current.status;
+
+      let newTotal = total_amount !== undefined && Number(total_amount) > 0 ? Number(total_amount) : Number(current.total_amount);
+      let newCount = installment_count !== undefined && parseInt(installment_count, 10) > 0 ? parseInt(installment_count, 10) : Number(current.installment_count);
+      let newFrequency = frequency !== undefined ? frequency : current.frequency;
+      let newStartDate = start_date !== undefined ? start_date : current.start_date;
+
+      const currentPaid = Number(current.paid_amount || 0);
+
+      // If no payments yet, allow full recalculation of installments
+      const recalculateSchedule =
+        currentPaid === 0 &&
+        (total_amount !== undefined || installment_count !== undefined || frequency !== undefined || start_date !== undefined);
+
+      if (recalculateSchedule) {
+        const baseInstallment = Math.floor((newTotal / newCount) * 100) / 100;
+        const remainder = Math.round((newTotal - baseInstallment * newCount) * 100) / 100;
+
+        await client.query(
+          `UPDATE external_debts
+           SET title = $1, creditor_name = $2, creditor_phone = $3, category = $4, notes = $5, status = $6,
+               total_amount = $7, remaining_amount = $7, installment_count = $8, installment_amount = $9,
+               frequency = $10, start_date = $11, updated_at = NOW()
+           WHERE id = $12`,
+          [
+            newTitle, newCreditorName, newCreditorPhone, newCategory, newNotes, newStatus,
+            newTotal, newCount, baseInstallment, newFrequency, newStartDate, id
+          ]
+        );
+
+        // Remove old pending installments and re-generate
+        await client.query(`DELETE FROM debt_installments WHERE debt_id = $1 AND status != 'paid'`, [id]);
+        for (let i = 1; i <= newCount; i++) {
+          const dueDate = calculateNextDueDate(newStartDate, i - 1, newFrequency);
+          const instAmount = i === newCount ? baseInstallment + remainder : baseInstallment;
+          await client.query(
+            `INSERT INTO debt_installments (debt_id, installment_number, due_date, amount, paid_amount, status)
+             VALUES ($1, $2, $3, $4, 0, 'pending')`,
+            [id, i, dueDate, instAmount]
+          );
+        }
+      } else {
+        // If payments already exist, ensure total_amount >= currentPaid
+        if (newTotal < currentPaid) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: `إجمالي المبلغ لا يمكن أن يكون أقل من المبلغ المسدد بالفعل (${currentPaid.toLocaleString()} ج)` });
+        }
+        const newRemaining = Math.max(0, newTotal - currentPaid);
+        await client.query(
+          `UPDATE external_debts
+           SET title = $1, creditor_name = $2, creditor_phone = $3, category = $4, notes = $5, status = $6,
+               total_amount = $7, remaining_amount = $8, updated_at = NOW()
+           WHERE id = $9`,
+          [
+            newTitle, newCreditorName, newCreditorPhone, newCategory, newNotes, newStatus,
+            newTotal, newRemaining, id
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
+      const updatedRes = await client.query(`SELECT * FROM external_debts WHERE id = $1`, [id]);
+      return res.json({ success: true, debt: updatedRes.rows[0] });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
+    }
+  } else {
     const store = getLocalStore();
     const debt = store.debts.find(d => d.id === Number(id));
     if (!debt) return res.status(404).json({ error: "المديونية غير موجودة" });
@@ -558,8 +630,50 @@ exports.updateDebt = async (req, res) => {
     if (category) debt.category = category;
     if (notes !== undefined) debt.notes = notes;
     if (status) debt.status = status;
-    debt.updated_at = new Date().toISOString();
 
+    const currentPaid = Number(debt.paid_amount || 0);
+    if (total_amount !== undefined && Number(total_amount) > 0) {
+      const newTotal = Number(total_amount);
+      if (newTotal < currentPaid) {
+        return res.status(400).json({ error: `إجمالي المبلغ لا يمكن أن يكون أقل من المبلغ المسدد بالفعل (${currentPaid.toLocaleString()} ج)` });
+      }
+      debt.total_amount = newTotal;
+      debt.remaining_amount = newTotal - currentPaid;
+    }
+
+    if (currentPaid === 0 && (installment_count || frequency || start_date)) {
+      if (installment_count) debt.installment_count = parseInt(installment_count, 10);
+      if (frequency) debt.frequency = frequency;
+      if (start_date) debt.start_date = start_date;
+      debt.installment_amount = Math.floor((debt.total_amount / debt.installment_count) * 100) / 100;
+      
+      store.installments = store.installments.filter(i => i.debt_id !== Number(id) || i.status === "paid");
+      let nextInstId = store.installments.length > 0 ? Math.max(...store.installments.map(i => i.id)) + 1 : 1;
+      const baseInstallment = debt.installment_amount;
+      const remainder = Math.round((debt.total_amount - baseInstallment * debt.installment_count) * 100) / 100;
+
+      for (let i = 1; i <= debt.installment_count; i++) {
+        const dueDate = calculateNextDueDate(debt.start_date, i - 1, debt.frequency);
+        const instAmount = i === debt.installment_count ? baseInstallment + remainder : baseInstallment;
+        store.installments.push({
+          id: nextInstId++,
+          debt_id: Number(id),
+          installment_number: i,
+          due_date: dueDate,
+          amount: instAmount,
+          paid_amount: 0,
+          paid_at: null,
+          status: "pending",
+          payment_method: "كاش",
+          source_type: "personal",
+          notes: "",
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+      }
+    }
+
+    debt.updated_at = new Date().toISOString();
     saveLocalStore(store);
     return res.json({ success: true, debt });
   }
