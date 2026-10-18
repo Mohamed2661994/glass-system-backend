@@ -7,7 +7,13 @@ const controller = require("./debts.controller");
  */
 function requireAdmin(req, res, next) {
   const user = req.user;
-  if (!user || (Number(user.id) !== 7 && user.role !== "admin")) {
+  const isAllowed =
+    user &&
+    (Number(user.id) === 7 ||
+      Number(user.id) === 11 ||
+      user.role === "admin" ||
+      user.username === "خالد");
+  if (!isAllowed) {
     return res.status(403).json({ error: "غير مصرح لك بالوصول لإدارة المديونيات (خاص بالإدارة فقط)" });
   }
   next();
