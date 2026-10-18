@@ -726,30 +726,79 @@ exports.deleteDebt = async (req, res) => {
 // 6.5 Update Single Installment
 exports.updateInstallment = async (req, res) => {
   const { id } = req.params;
-  const { due_date, amount, notes } = req.body;
+  const { due_date, amount, paid_amount, payment_method, notes } = req.body;
 
   const client = await pool.connect().catch(() => null);
   if (client) {
     try {
+      await client.query("BEGIN");
+      const currentRes = await client.query(`SELECT * FROM debt_installments WHERE id = $1 FOR UPDATE`, [id]);
+      if (currentRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "القسط غير موجود" });
+      }
+
+      const current = currentRes.rows[0];
+      const newDueDate = due_date || current.due_date;
+      const newAmount = amount !== undefined && Number(amount) > 0 ? Number(amount) : Number(current.amount);
+      const newPaidAmount = paid_amount !== undefined ? Math.max(0, Number(paid_amount)) : Number(current.paid_amount || 0);
+      const newPaymentMethod = payment_method !== undefined ? payment_method : current.payment_method;
+      const newNotes = notes !== undefined ? notes : current.notes;
+
+      let newStatus = current.status;
+      if (newPaidAmount >= newAmount) {
+        newStatus = "paid";
+      } else if (newPaidAmount > 0) {
+        newStatus = "partially_paid";
+      } else {
+        newStatus = "pending";
+      }
+
       const updateSql = `
         UPDATE debt_installments
         SET 
-          due_date = COALESCE($1, due_date),
-          amount = COALESCE($2, amount),
-          notes = COALESCE($3, notes),
+          due_date = $1,
+          amount = $2,
+          paid_amount = $3,
+          status = $4,
+          payment_method = $5,
+          notes = $6,
+          paid_at = CASE WHEN $3 > 0 THEN COALESCE(paid_at, NOW()) ELSE NULL END,
           updated_at = NOW()
-        WHERE id = $4
+        WHERE id = $7
         RETURNING *
       `;
       const result = await client.query(updateSql, [
-        due_date || null,
-        amount !== undefined && Number(amount) > 0 ? Number(amount) : null,
-        notes !== undefined ? notes : null,
+        newDueDate,
+        newAmount,
+        newPaidAmount,
+        newStatus,
+        newPaymentMethod,
+        newNotes,
         id
       ]);
-      if (result.rows.length === 0) return res.status(404).json({ error: "القسط غير موجود" });
+
+      // Recalculate parent debt
+      const debtId = current.debt_id;
+      const sumRes = await client.query(
+        `SELECT COALESCE(SUM(paid_amount), 0) as total_paid FROM debt_installments WHERE debt_id = $1`,
+        [debtId]
+      );
+      const totalPaid = Number(sumRes.rows[0].total_paid);
+      const debtRes = await client.query(`SELECT total_amount FROM external_debts WHERE id = $1`, [debtId]);
+      const totalAmount = Number(debtRes.rows[0]?.total_amount || 0);
+      const remainingAmount = Math.max(0, totalAmount - totalPaid);
+      const debtStatus = remainingAmount <= 0 ? "completed" : "active";
+
+      await client.query(
+        `UPDATE external_debts SET paid_amount = $1, remaining_amount = $2, status = $3, updated_at = NOW() WHERE id = $4`,
+        [totalPaid, remainingAmount, debtStatus, debtId]
+      );
+
+      await client.query("COMMIT");
       return res.json({ success: true, installment: result.rows[0] });
     } catch (err) {
+      await client.query("ROLLBACK");
       return res.status(500).json({ error: err.message });
     } finally {
       client.release();
@@ -758,12 +807,100 @@ exports.updateInstallment = async (req, res) => {
     const store = getLocalStore();
     const inst = store.installments.find(i => i.id === Number(id));
     if (!inst) return res.status(404).json({ error: "القسط غير موجود" });
+
     if (due_date) inst.due_date = due_date;
-    if (amount) inst.amount = Number(amount);
+    if (amount !== undefined && Number(amount) > 0) inst.amount = Number(amount);
+    if (paid_amount !== undefined) inst.paid_amount = Math.max(0, Number(paid_amount));
+    if (payment_method !== undefined) inst.payment_method = payment_method;
     if (notes !== undefined) inst.notes = notes;
+
+    if (inst.paid_amount >= inst.amount) {
+      inst.status = "paid";
+    } else if (inst.paid_amount > 0) {
+      inst.status = "partially_paid";
+    } else {
+      inst.status = "pending";
+    }
     inst.updated_at = new Date().toISOString();
+
+    const parentDebt = store.debts.find(d => d.id === inst.debt_id);
+    if (parentDebt) {
+      const allInsts = store.installments.filter(i => i.debt_id === parentDebt.id);
+      const sumPaid = allInsts.reduce((sum, i) => sum + Number(i.paid_amount || 0), 0);
+      parentDebt.paid_amount = sumPaid;
+      parentDebt.remaining_amount = Math.max(0, Number(parentDebt.total_amount) - sumPaid);
+      parentDebt.status = parentDebt.remaining_amount <= 0 ? "completed" : "active";
+    }
+
     saveLocalStore(store);
     return res.json({ success: true, installment: inst });
+  }
+};
+
+// 6.6 Delete Single Installment
+exports.deleteInstallment = async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect().catch(() => null);
+
+  if (client) {
+    try {
+      await client.query("BEGIN");
+      const instRes = await client.query(`SELECT debt_id FROM debt_installments WHERE id = $1`, [id]);
+      if (instRes.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "القسط غير موجود" });
+      }
+      const debtId = instRes.rows[0].debt_id;
+
+      await client.query(`DELETE FROM debt_installments WHERE id = $1`, [id]);
+
+      // Recalculate parent debt
+      const sumRes = await client.query(
+        `SELECT COALESCE(SUM(paid_amount), 0) as total_paid, COUNT(*) as inst_count FROM debt_installments WHERE debt_id = $1`,
+        [debtId]
+      );
+      const totalPaid = Number(sumRes.rows[0].total_paid);
+      const instCount = Number(sumRes.rows[0].inst_count);
+
+      const debtRes = await client.query(`SELECT total_amount FROM external_debts WHERE id = $1`, [debtId]);
+      const totalAmount = Number(debtRes.rows[0]?.total_amount || 0);
+      const remainingAmount = Math.max(0, totalAmount - totalPaid);
+      const debtStatus = remainingAmount <= 0 ? "completed" : "active";
+
+      await client.query(
+        `UPDATE external_debts 
+         SET paid_amount = $1, remaining_amount = $2, installment_count = $3, status = $4, updated_at = NOW() 
+         WHERE id = $5`,
+        [totalPaid, remainingAmount, instCount, debtStatus, debtId]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ success: true, message: "تم حذف القسط بنجاح" });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({ error: err.message });
+    } finally {
+      client.release();
+    }
+  } else {
+    const store = getLocalStore();
+    const instIndex = store.installments.findIndex(i => i.id === Number(id));
+    if (instIndex === -1) return res.status(404).json({ error: "القسط غير موجود" });
+    const debtId = store.installments[instIndex].debt_id;
+    store.installments.splice(instIndex, 1);
+
+    const parentDebt = store.debts.find(d => d.id === debtId);
+    if (parentDebt) {
+      const remainingInsts = store.installments.filter(i => i.debt_id === debtId);
+      const totalPaid = remainingInsts.reduce((sum, i) => sum + Number(i.paid_amount || 0), 0);
+      parentDebt.paid_amount = totalPaid;
+      parentDebt.remaining_amount = Math.max(0, Number(parentDebt.total_amount) - totalPaid);
+      parentDebt.installment_count = remainingInsts.length;
+      parentDebt.status = parentDebt.remaining_amount <= 0 ? "completed" : "active";
+    }
+
+    saveLocalStore(store);
+    return res.json({ success: true, message: "تم حذف القسط بنجاح" });
   }
 };
 
