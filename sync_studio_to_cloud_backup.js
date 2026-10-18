@@ -300,7 +300,8 @@ async function runBackupSync(options = {}) {
         'customers', 'customer_phones', 'stock_movements',
         'stock_transfers', 'stock_transfer_items', 'messages',
         'notifications', 'user_activity', 'payroll_advances',
-        'payroll_records', 'payroll_adjustments', 'payroll_retained_dues', 'payroll_attendance'
+        'payroll_records', 'payroll_adjustments', 'payroll_retained_dues', 'payroll_attendance',
+        'external_debts', 'debt_installments'
       ];
 
       for (const t of activeTables) {

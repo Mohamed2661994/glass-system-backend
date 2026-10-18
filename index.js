@@ -1439,6 +1439,10 @@ app.use("/api/inter-branch", interBranchRoutes);
 const payrollRoutes = require("./payroll/payroll.routes");
 app.use("/payroll", payrollRoutes);
 
+const debtsRoutes = require("./debts/debts.routes");
+app.use("/debts", debtsRoutes);
+app.use("/api/debts", debtsRoutes);
+
 const productsRoutes = require("./modules/products/products.routes");
 
 //app.use("/products", productsRoutes);
