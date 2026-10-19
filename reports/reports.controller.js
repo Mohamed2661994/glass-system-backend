@@ -444,7 +444,7 @@ exports.getLowStockReorderCount = async (req, res) => {
               (SUBSTRING(p.wholesale_package FROM 'كرتونة\\s*([0-9]+)\\s*طقم'))::integer
             WHEN (
               (CASE 
-                WHEN p.wholesale_package ~ '[0-9]+\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*دستة'))::integer * 12
+                WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
                 WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
                 ELSE 0
               END) > 0
@@ -457,7 +457,7 @@ exports.getLowStockReorderCount = async (req, res) => {
             ) THEN
               GREATEST(1, ROUND(
                 (CASE 
-                  WHEN p.wholesale_package ~ '[0-9]+\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*دستة'))::integer * 12
+                  WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
                   WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
                   ELSE 0
                 END)::numeric
@@ -556,7 +556,7 @@ exports.getLowStockReorderItems = async (req, res) => {
               (SUBSTRING(p.wholesale_package FROM 'كرتونة\\s*([0-9]+)\\s*طقم'))::integer
             WHEN (
               (CASE 
-                WHEN p.wholesale_package ~ '[0-9]+\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*دستة'))::integer * 12
+                WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
                 WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
                 ELSE 0
               END) > 0
@@ -569,7 +569,7 @@ exports.getLowStockReorderItems = async (req, res) => {
             ) THEN
               GREATEST(1, ROUND(
                 (CASE 
-                  WHEN p.wholesale_package ~ '[0-9]+\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*دستة'))::integer * 12
+                  WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
                   WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
                   ELSE 0
                 END)::numeric

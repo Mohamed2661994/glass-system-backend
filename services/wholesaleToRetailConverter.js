@@ -71,15 +71,17 @@ function convertWholesaleToRetail({
   }
 
   const retailQuantity = totalPieces / piecesPerRetailUnit;
+  const roundedQty = Math.round(retailQuantity);
+  const finalQty = Math.abs(retailQuantity - roundedQty) < 0.0001 ? roundedQty : retailQuantity;
 
-  if (!Number.isInteger(retailQuantity)) {
+  if (!Number.isInteger(finalQty)) {
     throw new Error("FRACTION_RESULT");
   }
 
   return {
     from_quantity: wholesale_quantity,
-    to_quantity: retailQuantity,
-    retail_quantity: retailQuantity,
+    to_quantity: finalQty,
+    retail_quantity: finalQty,
     mode: "analyzed",
   };
 }

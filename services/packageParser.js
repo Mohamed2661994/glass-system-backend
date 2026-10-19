@@ -6,7 +6,9 @@ function normalizeNumbers(text) {
   const arabic = "٠١٢٣٤٥٦٧٨٩";
   const english = "0123456789";
 
-  return text.replace(/[٠-٩]/g, (d) => english[arabic.indexOf(d)]);
+  return text
+    .replace(/[٠-٩]/g, (d) => english[arabic.indexOf(d)])
+    .replace(/[٫،]/g, ".");
 }
 
 function cleanText(text) {
@@ -40,27 +42,27 @@ function parsePackage(text) {
      كرتونة 4 طقم / 2 طقم
   ================================================== */
   if (normalized.includes("طقم")) {
-    const match = normalized.match(/(\d+)?\s*طقم/);
+    const match = normalized.match(/(\d+(?:[.,]\d+)?)\s*طقم/);
 
     return {
       raw: text,
       unit: "set",
-      count: match && match[1] ? parseInt(match[1], 10) : 1,
+      count: match && match[1] ? parseFloat(match[1].replace(",", ".")) : 1,
       analyzable: true,
     };
   }
 
   /* ==================================================
      2️⃣ دستة (أساس التحليل)
-     كرتونة 4 دستة / 6 دستة
+     كرتونة 4 دستة / 6 دستة / 1.5 دستة
   ================================================== */
   if (normalized.includes("دستة")) {
-    const match = normalized.match(/(\d+)?\s*دستة/);
+    const match = normalized.match(/(\d+(?:[.,]\d+)?)\s*دستة/);
 
     return {
       raw: text,
       unit: "dozen",
-      count: match && match[1] ? parseInt(match[1], 10) : 1,
+      count: match && match[1] ? parseFloat(match[1].replace(",", ".")) : 1,
       analyzable: true,
     };
   }
@@ -70,9 +72,10 @@ function parsePackage(text) {
      شيالة 6
      علبة 4
      شيالة 6 قطع
+     3 شيالة
   ================================================== */
   if (normalized.includes("شيالة") || normalized.includes("علبة")) {
-    const match = normalized.match(/(\d+)/);
+    const match = normalized.match(/(\d+(?:[.,]\d+)?)/);
 
     if (!match) {
       throw new Error("INVALID_CONTAINER_FORMAT");
@@ -82,7 +85,7 @@ function parsePackage(text) {
       raw: text,
       unit: "container",
       containerType: normalized.includes("شيالة") ? "shiala" : "box",
-      count: parseInt(match[1], 10),
+      count: parseFloat(match[1].replace(",", ".")),
       analyzable: true,
     };
   }
@@ -92,12 +95,12 @@ function parsePackage(text) {
    قطعة / 12 قطعة / 6 قطع
 ================================================== */
   if (normalized.includes("قطعة") || normalized.includes("قطع")) {
-    const match = normalized.match(/(\d+)?\s*(قطعة|قطع)/);
+    const match = normalized.match(/(\d+(?:[.,]\d+)?)\s*(قطعة|قطع)/);
 
     return {
       raw: text,
       unit: "piece",
-      count: match && match[1] ? parseInt(match[1], 10) : 1,
+      count: match && match[1] ? parseFloat(match[1].replace(",", ".")) : 1,
       analyzable: true,
     };
   }
