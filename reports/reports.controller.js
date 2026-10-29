@@ -2539,11 +2539,8 @@ async function getTimelineAnalytics({
   const timelineRes = await pool.query(timelineQuery, timelineValues);
 
   const isIncludeDebts = Boolean(includeDebts);
-  const allowedEntryTypes = isIncludeDebts
-    ? "entry_type IN ('expense', 'debt_payment')"
-    : "entry_type = 'expense'";
 
-  const expensesConditions = [allowedEntryTypes];
+  const expensesConditions = ["entry_type = 'expense'"];
   const expensesValues = [];
   let eIdx = 1;
   if (activeChartInvoiceType === 'retail') {
@@ -2565,21 +2562,79 @@ async function getTimelineAnalytics({
   const expensesQuery = `
     SELECT 
       TO_CHAR(transaction_date, ${timeGroupFormat}) AS period, 
-      SUM(CASE WHEN entry_type = 'expense' THEN amount ELSE 0 END) AS regular_expenses,
-      SUM(CASE WHEN entry_type = 'debt_payment' THEN amount ELSE 0 END) AS debt_payments,
-      SUM(amount) AS total_expenses
+      SUM(amount) AS regular_expenses
     FROM cash_out
     WHERE ${expensesConditions.join(" AND ")}
     GROUP BY period
   `;
   const expensesRes = await pool.query(expensesQuery, expensesValues);
-  const expensesMap = {};
-  const debtPaymentsMap = {};
   const regularExpensesMap = {};
   expensesRes.rows.forEach(r => {
-    expensesMap[r.period] = Math.round(Number(r.total_expenses || 0) * 100) / 100;
-    debtPaymentsMap[r.period] = Math.round(Number(r.debt_payments || 0) * 100) / 100;
     regularExpensesMap[r.period] = Math.round(Number(r.regular_expenses || 0) * 100) / 100;
+  });
+
+  const debtPaymentsMap = {};
+  if (isIncludeDebts) {
+    const debtConditions = [];
+    const debtValues = [];
+    let dIdx = 1;
+    if (activeChartInvoiceType === 'retail') {
+      debtConditions.push(`(branch_id = $${dIdx++} OR branch_id IS NULL)`);
+      debtValues.push(1);
+    } else if (activeChartInvoiceType === 'wholesale') {
+      debtConditions.push(`(branch_id = $${dIdx++} OR branch_id IS NULL)`);
+      debtValues.push(2);
+    }
+    if (effectiveChartDateFrom) {
+      debtConditions.push(`payment_date >= $${dIdx++}::date`);
+      debtValues.push(effectiveChartDateFrom);
+    }
+    if (effectiveChartDateTo) {
+      debtConditions.push(`payment_date <= $${dIdx++}::date`);
+      debtValues.push(effectiveChartDateTo);
+    }
+
+    const debtWhereClause = debtConditions.length > 0 ? `WHERE ${debtConditions.join(" AND ")}` : "";
+    const debtsQuery = `
+      WITH all_debts AS (
+        SELECT 
+          dip.id,
+          dip.amount,
+          dip.payment_date::date AS payment_date,
+          co.branch_id
+        FROM debt_installment_payments dip
+        LEFT JOIN cash_out co ON co.id = dip.cash_out_id
+
+        UNION ALL
+
+        SELECT 
+          co.id,
+          co.amount,
+          co.transaction_date AS payment_date,
+          co.branch_id
+        FROM cash_out co
+        WHERE co.entry_type = 'debt_payment'
+          AND NOT EXISTS (SELECT 1 FROM debt_installment_payments dip WHERE dip.cash_out_id = co.id)
+      )
+      SELECT 
+        TO_CHAR(payment_date, ${timeGroupFormat}) AS period,
+        SUM(amount) AS debt_payments
+      FROM all_debts
+      ${debtWhereClause}
+      GROUP BY period
+    `;
+    const debtsRes = await pool.query(debtsQuery, debtValues);
+    debtsRes.rows.forEach(r => {
+      debtPaymentsMap[r.period] = Math.round(Number(r.debt_payments || 0) * 100) / 100;
+    });
+  }
+
+  const expensesMap = {};
+  const allPeriodKeys = new Set([...Object.keys(regularExpensesMap), ...Object.keys(debtPaymentsMap)]);
+  allPeriodKeys.forEach(period => {
+    const reg = regularExpensesMap[period] || 0;
+    const debt = debtPaymentsMap[period] || 0;
+    expensesMap[period] = Math.round((reg + debt) * 100) / 100;
   });
 
   const timeline = timelineRes.rows.map(r => {
