@@ -2385,6 +2385,7 @@ async function getTimelineAnalytics({
   date_to,
   timeline_interval,
   isApplyDistribution,
+  includeDebts,
 }) {
   const effectiveChartDateFrom =
     chart_date_from !== undefined && chart_date_from !== null && chart_date_from !== ""
@@ -2537,7 +2538,12 @@ async function getTimelineAnalytics({
 
   const timelineRes = await pool.query(timelineQuery, timelineValues);
 
-  const expensesConditions = [`entry_type = 'expense'`];
+  const isIncludeDebts = Boolean(includeDebts);
+  const allowedEntryTypes = isIncludeDebts
+    ? "entry_type IN ('expense', 'debt_payment')"
+    : "entry_type = 'expense'";
+
+  const expensesConditions = [allowedEntryTypes];
   const expensesValues = [];
   let eIdx = 1;
   if (activeChartInvoiceType === 'retail') {
@@ -2557,15 +2563,23 @@ async function getTimelineAnalytics({
   }
 
   const expensesQuery = `
-    SELECT TO_CHAR(transaction_date, ${timeGroupFormat}) AS period, SUM(amount) AS total_expenses
+    SELECT 
+      TO_CHAR(transaction_date, ${timeGroupFormat}) AS period, 
+      SUM(CASE WHEN entry_type = 'expense' THEN amount ELSE 0 END) AS regular_expenses,
+      SUM(CASE WHEN entry_type = 'debt_payment' THEN amount ELSE 0 END) AS debt_payments,
+      SUM(amount) AS total_expenses
     FROM cash_out
     WHERE ${expensesConditions.join(" AND ")}
     GROUP BY period
   `;
   const expensesRes = await pool.query(expensesQuery, expensesValues);
   const expensesMap = {};
+  const debtPaymentsMap = {};
+  const regularExpensesMap = {};
   expensesRes.rows.forEach(r => {
     expensesMap[r.period] = Math.round(Number(r.total_expenses || 0) * 100) / 100;
+    debtPaymentsMap[r.period] = Math.round(Number(r.debt_payments || 0) * 100) / 100;
+    regularExpensesMap[r.period] = Math.round(Number(r.regular_expenses || 0) * 100) / 100;
   });
 
   const timeline = timelineRes.rows.map(r => {
@@ -2621,10 +2635,14 @@ async function getTimelineAnalytics({
     let iterations = 0;
     while (currentPeriod <= endPeriod && iterations < 2000) {
       const periodExpenses = expensesMap[currentPeriod] || 0;
+      const periodDebts = debtPaymentsMap[currentPeriod] || 0;
+      const periodRegular = regularExpensesMap[currentPeriod] || 0;
       if (timelineMap[currentPeriod]) {
         filledTimeline.push({
           ...timelineMap[currentPeriod],
-          expenses: periodExpenses
+          expenses: periodExpenses,
+          debt_payments: periodDebts,
+          regular_expenses: periodRegular,
         });
       } else {
         filledTimeline.push({
@@ -2632,14 +2650,21 @@ async function getTimelineAnalytics({
           sales: 0,
           cost: 0,
           profit: 0,
-          expenses: periodExpenses
+          expenses: periodExpenses,
+          debt_payments: periodDebts,
+          regular_expenses: periodRegular,
         });
       }
       currentPeriod = getNextPeriod(currentPeriod);
       iterations++;
     }
   } else {
-    filledTimeline = timeline;
+    filledTimeline = timeline.map(t => ({
+      ...t,
+      expenses: expensesMap[t.period] || 0,
+      debt_payments: debtPaymentsMap[t.period] || 0,
+      regular_expenses: regularExpensesMap[t.period] || 0,
+    }));
   }
 
   return filledTimeline;
@@ -2671,10 +2696,12 @@ exports.getManufacturerAnalytics = async (req, res) => {
       sort_by = "name",
       sort_order,
       stock_filter = "all",
+      include_debts,
     } = req.query;
 
     const normalizedManufacturer = String(manufacturer || "").trim().toLowerCase();
     const isApplyDistribution = apply_distribution === 'true';
+    const isIncludeDebts = include_debts === 'true' || include_debts === true;
 
     // إذا كان المطلوب هو تحديث الرسم البياني الزمني فقط (فائق السرعة ~25ms ومستقل 100%)
     if (only_timeline === 'true') {
@@ -2688,6 +2715,7 @@ exports.getManufacturerAnalytics = async (req, res) => {
         date_to,
         timeline_interval,
         isApplyDistribution,
+        includeDebts: isIncludeDebts,
       });
       return res.json({ timeline: filledTimeline });
     }
@@ -2953,6 +2981,7 @@ exports.getManufacturerAnalytics = async (req, res) => {
       date_to,
       timeline_interval,
       isApplyDistribution,
+      includeDebts: isIncludeDebts,
     });
 
     // 4. Fetch total purchases/inbound per product
