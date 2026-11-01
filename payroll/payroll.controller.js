@@ -1116,6 +1116,12 @@ async function confirmPayrollPayout(req, res) {
     const user = req.user || {};
     const paidByName = user.full_name || user.username || "الإدارة";
 
+    // Actual cash transaction date: defaults to Cairo today (YYYY-MM-DD) so it reflects immediately in today's daily cash
+    const cairoToday = new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Cairo" });
+    const payoutDate = req.body.payout_date && /^\d{4}-\d{2}-\d{2}$/.test(req.body.payout_date)
+      ? req.body.payout_date
+      : cairoToday;
+
     await client.query("BEGIN");
 
     const createdRecords = [];
@@ -1219,7 +1225,7 @@ async function confirmPayrollPayout(req, res) {
         let cashOutId = null;
         let permissionNumber = null;
         if (shouldRecordCashOut && arrearsAmount > 0) {
-          permissionNumber = generatePermissionNumber(safeEnd);
+          permissionNumber = generatePermissionNumber(payoutDate);
           const rolePrefix = formatJobTitleWithPrefix(item.job_title || empInfo?.job_title);
           const cashOutRes = await client.query(
             `
@@ -1233,7 +1239,7 @@ async function confirmPayrollPayout(req, res) {
               `مستحقات مرحلة: ${item.name || empInfo?.name || "موظف"}`,
               arrearsAmount,
               item.notes || `صرف مستحقات مرحلة سابقة ${rolePrefix}: ${item.name || empInfo?.name || ""} - بقيمة ${arrearsAmount} ج.م`,
-              safeEnd,
+              payoutDate,
               permissionNumber,
             ],
           );
@@ -1486,7 +1492,7 @@ async function confirmPayrollPayout(req, res) {
       let cashOutId = null;
       let permissionNumber = null;
       if (record_cash_out && empScope !== "carry_forward" && totalCashToPay > 0) {
-        permissionNumber = generatePermissionNumber(safeEnd);
+        permissionNumber = generatePermissionNumber(payoutDate);
         const nameTitle = empScope === "full" && totalCarriedDues > 0
           ? `راتب ومستحقات: ${item.name || "موظف"}`
           : `راتب: ${item.name || "موظف"}`;
@@ -1511,7 +1517,7 @@ async function confirmPayrollPayout(req, res) {
             nameTitle,
             totalCashToPay,
             notesBreakdown,
-            safeEnd,
+            payoutDate,
             permissionNumber,
           ],
         );
@@ -1811,6 +1817,12 @@ async function revertPayrollRecord(req, res) {
 
     const record = recRes.rows[0];
 
+    const user = req.user || {};
+    if (user.role !== "admin" && user.branch_id && Number(user.branch_id) !== Number(record.branch_id)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "غير مصرح لك بإلغاء سجل راتب لفرع آخر" });
+    }
+
     // 1. Revert advances back to 'pending'
     await client.query(
       "UPDATE payroll_advances SET status = 'pending', payroll_record_id = NULL WHERE payroll_record_id = $1",
@@ -1823,7 +1835,23 @@ async function revertPayrollRecord(req, res) {
       [recordId],
     );
 
-    // 1.c Revert linked attendance back
+    // 1.c Revert applied retained dues back to 'pending'
+    await client.query(
+      "UPDATE payroll_retained_dues SET status = 'pending', payroll_record_id = NULL, updated_at = NOW() WHERE payroll_record_id = $1",
+      [recordId],
+    );
+
+    // 1.d Delete any forwarded dues created if carry_forward was used for this cycle
+    try {
+      await client.query(
+        "DELETE FROM payroll_retained_dues WHERE employee_id = $1 AND branch_id = $2 AND status = 'pending' AND reason LIKE $3",
+        [record.employee_id, record.branch_id, `%(${record.period_start} إلى ${record.period_end})%`],
+      );
+    } catch (e) {
+      console.warn("revert carry_forward retained_dues note:", e.message);
+    }
+
+    // 1.e Revert linked attendance back
     try {
       await client.query(
         "UPDATE payroll_attendance SET payroll_record_id = NULL, updated_at = NOW() WHERE payroll_record_id = $1",
@@ -2562,7 +2590,8 @@ async function confirmMySalaryPayout(req, res) {
     let cashOutId = null;
     let permissionNumber = null;
     if (netAmount > 0) {
-      permissionNumber = generatePermissionNumber(safeEnd);
+      const cairoToday = cairoNow.toLocaleDateString("en-CA", { timeZone: "Africa/Cairo" });
+      permissionNumber = generatePermissionNumber(cairoToday);
       const rolePrefix = formatJobTitleWithPrefix(emp.job_title);
       const notesBreakdown = [
         `صرف راتب أسبوعي ${rolePrefix}: ${emp.name}`,
@@ -2583,7 +2612,7 @@ async function confirmMySalaryPayout(req, res) {
           `راتب: ${emp.name}`,
           netAmount,
           notesBreakdown,
-          safeEnd,
+          cairoToday,
           permissionNumber,
         ],
       );
