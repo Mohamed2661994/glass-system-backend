@@ -12,6 +12,7 @@ const router = express.Router();
 const config = require('./quaz-ai.config');
 const engine = require('./quaz-ai.engine');
 const telegram = require('./quaz-ai.telegram');
+const tts = require('./quaz-ai.tts');
 
 /**
  * POST /api/quaz-ai/chat
@@ -35,9 +36,22 @@ router.post('/chat', async (req, res) => {
     };
 
     const reply = await engine.processUserPrompt(message, history || [], userContext);
+
+    // Generate natural Egyptian Neural Voice audio in parallel
+    let audioBase64 = null;
+    try {
+      const audioBuffer = await tts.synthesizeEgyptianSpeech(reply);
+      if (audioBuffer) {
+        audioBase64 = audioBuffer.toString('base64');
+      }
+    } catch (ttsErr) {
+      console.warn('[Quaz AI Web API] TTS generation skipped:', ttsErr.message);
+    }
+
     res.json({
       success: true,
       reply,
+      audioBase64,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -70,9 +84,22 @@ router.post('/voice', express.json({ limit: '25mb' }), async (req, res) => {
 
     const audioBuffer = Buffer.from(audio, 'base64');
     const reply = await engine.processVoicePrompt(audioBuffer, mimeType || 'audio/webm', '', userContext);
+
+    // Generate natural Egyptian Neural Voice audio
+    let audioBase64 = null;
+    try {
+      const replyAudioBuffer = await tts.synthesizeEgyptianSpeech(reply);
+      if (replyAudioBuffer) {
+        audioBase64 = replyAudioBuffer.toString('base64');
+      }
+    } catch (ttsErr) {
+      console.warn('[Quaz AI Voice API] TTS generation skipped:', ttsErr.message);
+    }
+
     res.json({
       success: true,
       reply,
+      audioBase64,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -81,6 +108,30 @@ router.post('/voice', express.json({ limit: '25mb' }), async (req, res) => {
       success: false,
       error: error.message || 'حدث خطأ أثناء معالجة التسجيل الصوتي',
     });
+  }
+});
+
+/**
+ * POST /api/quaz-ai/tts
+ * On-demand Egyptian Neural Speech synthesis
+ */
+router.post('/tts', async (req, res) => {
+  try {
+    const { text, voice } = req.body;
+    if (!text) {
+      return res.status(400).json({ error: 'النص مطلوب' });
+    }
+    const audioBuffer = await tts.synthesizeEgyptianSpeech(text, voice || 'ar-EG-ShakirNeural');
+    if (!audioBuffer) {
+      return res.status(500).json({ error: 'فشل إنشاء الصوت' });
+    }
+    res.json({
+      success: true,
+      audioBase64: audioBuffer.toString('base64'),
+    });
+  } catch (error) {
+    console.error('[Quaz AI TTS Route] Error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
