@@ -19,17 +19,18 @@ const telegram = require('./quaz-ai.telegram');
  */
 router.post('/chat', async (req, res) => {
   try {
-    const { message, history } = req.body;
+    const { message, history, branchId } = req.body;
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ error: 'الرسالة مطلوبة' });
     }
 
     // Extract authenticated user context & branch role
+    const effectiveBranchId = Number(branchId) || Number(req.user?.branch_id) || 1;
     const userContext = {
       id: req.user?.id,
       username: req.user?.username || req.user?.full_name,
       role: req.user?.role || 'user',
-      branchId: req.user?.branch_id,
+      branchId: effectiveBranchId,
       isAdmin: req.user?.role === 'admin',
     };
 

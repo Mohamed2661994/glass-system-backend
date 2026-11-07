@@ -24,7 +24,9 @@ function formatMoney(amount) {
 async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
   const targetDate = date ? String(date).trim() : getCairoToday();
   const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
-  const branchFilter = (!isAdmin && userContext?.branchId) ? Number(userContext.branchId) : (Number(branchId) || null);
+  const isExplicitAll = (branchId === 'all' || branchId === 'both' || branchId === 0) && isAdmin;
+  const callerBranch = Number(userContext?.branchId) || 1;
+  const branchFilter = isExplicitAll ? null : (Number(branchId) || callerBranch);
 
   try {
     // 1. Cash In for date
@@ -120,16 +122,17 @@ async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
       }
     });
 
-    // If non-admin branch employee: strictly return their branch numbers only!
-    if (!isAdmin && branchFilter) {
+    // Return strictly the caller's branch data (default for both Admin and Employees):
+    if (branchFilter) {
       const myBranch = branchMap[branchFilter] || {
-        branchName: `فرع ${branchFilter}`,
+        branchName: branchFilter === 1 ? 'فرع المعرض (القطاعي)' : (branchFilter === 2 ? 'فرع المخزن الرئيسي' : `فرع ${branchFilter}`),
         totalCashIn: 0,
         totalCashOut: 0,
         netBalance: 0,
       };
       return {
         date: targetDate,
+        branchId: branchFilter,
         branchName: myBranch.branchName,
         totalCashIn: formatMoney(myBranch.totalCashIn),
         totalCashOut: formatMoney(myBranch.totalCashOut),
@@ -196,7 +199,9 @@ async function getSalesAndProfits({ date, startDate, endDate, branchId, userCont
   const start = startDate ? String(startDate).trim() : targetDate;
   const end = endDate ? String(endDate).trim() : targetDate;
   const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
-  const branchFilter = (!isAdmin && userContext?.branchId) ? Number(userContext.branchId) : (Number(branchId) || null);
+  const isExplicitAll = (branchId === 'all' || branchId === 'both' || branchId === 0) && isAdmin;
+  const callerBranch = Number(userContext?.branchId) || 1;
+  const branchFilter = isExplicitAll ? null : (Number(branchId) || callerBranch);
 
   try {
     let query = `
@@ -615,8 +620,9 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
   const searchTerm = cleanedSearch || rawSearch;
 
   const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
-  const userBranch = userContext?.branchId ? Number(userContext.branchId) : null;
-  const effectiveBranch = (!isAdmin && userBranch) ? userBranch : (Number(branchId) || null);
+  const isExplicitAll = (branchId === 'all' || branchId === 'both' || branchId === 0) && isAdmin;
+  const callerBranch = Number(userContext?.branchId) || 1;
+  const effectiveBranch = isExplicitAll ? null : (Number(branchId) || callerBranch);
 
   try {
     const cleanTerm = searchTerm.split(/\s+/).filter(Boolean).join('%');
@@ -700,21 +706,30 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
           wholesalePrice: formatMoney(r.wholesale_price),
         };
 
-        if (isAdmin) {
-          item.purchasePrice = formatMoney(r.purchase_price);
+        if (effectiveBranch === 1) {
+          // Caller is in Showroom (Branch 1)
+          item.currentBranchName = 'فرع المعرض';
+          item.stockInShowroom = Number(r.showroom_stock);
+          item.warehouseAvailability = Number(r.warehouse_stock) > 0 ? `متوفر في المخزن الرئيسي (${r.warehouse_stock} قطعة للتحويل)` : 'غير متوفر بالمخزن الرئيسي';
+          if (isAdmin) {
+            item.purchasePrice = formatMoney(r.purchase_price);
+          }
+        } else if (effectiveBranch === 2) {
+          // Caller is in Main Warehouse (Branch 2)
+          item.currentBranchName = 'فرع المخزن الرئيسي';
+          item.stockInWarehouse = Number(r.warehouse_stock);
+          if (isAdmin) {
+            item.purchasePrice = formatMoney(r.purchase_price);
+          }
+        } else {
+          // User explicitly asked for all/both branches
           item.stockByBranch = {
             showroomBranch1: Number(r.showroom_stock),
             warehouseBranch2: Number(r.warehouse_stock),
           };
-        } else if (effectiveBranch === 1) {
-          // Showroom user
-          item.stockInShowroom = Number(r.showroom_stock);
-          item.warehouseAvailability = Number(r.warehouse_stock) > 0 ? `متوفر في المخزن الرئيسي (${r.warehouse_stock} قطعة للتحويل)` : 'غير متوفر بالمخزن';
-        } else if (effectiveBranch === 2) {
-          // Warehouse user
-          item.stockInWarehouse = Number(r.warehouse_stock);
-        } else {
-          item.currentStock = Number(r.showroom_stock);
+          if (isAdmin) {
+            item.purchasePrice = formatMoney(r.purchase_price);
+          }
         }
 
         return item;
