@@ -20,6 +20,7 @@ function formatMoney(amount) {
 
 /**
  * 1. Cash Drawer & Treasuries Summary (حركة الخزينة والدرج)
+ * متطابقة بالقرش مع شاشة اليومية ومطابقة رصيد الخزنة الفعلي المتاح
  */
 async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
   const targetDate = date ? String(date).trim() : getCairoToday();
@@ -29,47 +30,69 @@ async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
   const branchFilter = isExplicitAll ? null : (Number(branchId) || callerBranch);
 
   try {
-    // 1. Cash In for date
-    let inQuery = `
-      SELECT 
-        ci.branch_id,
-        b.name as branch_name,
-        COALESCE(SUM(ci.amount), 0) as total_in,
-        COUNT(*) as transactions_count
-      FROM cash_in ci
-      LEFT JOIN branches b ON b.id = ci.branch_id
-      WHERE ci.transaction_date = $1
-    `;
-    const inParams = [targetDate];
-    if (branchFilter) {
-      inQuery += ` AND ci.branch_id = $2`;
-      inParams.push(branchFilter);
-    }
-    inQuery += ` GROUP BY ci.branch_id, b.name`;
-    const inRes = await pool.query(inQuery, inParams);
+    let branchQuery = `
+      SELECT
+        b.id AS branch_id,
+        b.name AS branch_name,
+        COALESCE(
+          (SELECT SUM(
+             CASE 
+               WHEN ci.source_type = 'invoice' THEN COALESCE(ci.paid_amount, 0)
+               ELSE COALESCE(ci.amount, 0)
+             END
+           )
+           FROM cash_in ci
+           WHERE ci.branch_id = b.id 
+             AND ci.transaction_date < $1::date
+             AND (ci.notes IS NULL OR ci.notes NOT LIKE '%{{discount_diff}}%')
+          ), 0
+        ) -
+        COALESCE(
+          (SELECT SUM(co.amount)
+           FROM cash_out co
+           WHERE co.branch_id = b.id 
+             AND co.transaction_date < $1::date
+          ), 0
+        ) AS opening_balance,
 
-    // 2. Cash Out (Expenses & Payments) for date
-    let outQuery = `
-      SELECT 
-        co.branch_id,
-        b.name as branch_name,
-        COALESCE(SUM(co.amount), 0) as total_out,
-        COUNT(*) as transactions_count
-      FROM cash_out co
-      LEFT JOIN branches b ON b.id = co.branch_id
-      WHERE co.transaction_date = $1
-    `;
-    const outParams = [targetDate];
-    if (branchFilter) {
-      outQuery += ` AND co.branch_id = $2`;
-      outParams.push(branchFilter);
-    }
-    outQuery += ` GROUP BY co.branch_id, b.name`;
-    const outRes = await pool.query(outQuery, outParams);
+        COALESCE(
+          (SELECT SUM(
+             CASE 
+               WHEN ci.source_type = 'invoice' THEN COALESCE(ci.paid_amount, 0)
+               ELSE COALESCE(ci.amount, 0)
+             END
+           )
+           FROM cash_in ci
+           WHERE ci.branch_id = b.id 
+             AND ci.transaction_date = $1::date
+             AND (ci.notes IS NULL OR ci.notes NOT LIKE '%{{discount_diff}}%')
+          ), 0
+        ) AS today_cash_in,
 
-    // 3. Recent 5 cash movements today
+        COALESCE(
+          (SELECT SUM(co.amount)
+           FROM cash_out co
+           WHERE co.branch_id = b.id 
+             AND co.transaction_date = $1::date
+          ), 0
+        ) AS today_cash_out,
+
+        (SELECT COUNT(*) FROM cash_in ci WHERE ci.branch_id = b.id AND ci.transaction_date = $1::date) AS today_in_count,
+        (SELECT COUNT(*) FROM cash_out co WHERE co.branch_id = b.id AND co.transaction_date = $1::date) AS today_out_count
+      FROM branches b
+    `;
+    const branchQueryParams = [targetDate];
+    if (branchFilter) {
+      branchQuery += ` WHERE b.id = $2`;
+      branchQueryParams.push(branchFilter);
+    }
+    branchQuery += ` ORDER BY b.id ASC`;
+
+    const branchRes = await pool.query(branchQuery, branchQueryParams);
+
+    // Recent cash movements for context
     let recentInQuery = `
-      SELECT ci.id, ci.amount, ci.customer_name, ci.source_type, ci.notes, b.name as branch_name, ci.created_at
+      SELECT ci.id, ci.amount, ci.paid_amount, ci.customer_name, ci.source_type, ci.notes, b.name as branch_name, ci.created_at
       FROM cash_in ci
       LEFT JOIN branches b ON b.id = ci.branch_id
       WHERE ci.transaction_date = $1
@@ -96,50 +119,31 @@ async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
     recentOutQuery += ` ORDER BY co.id DESC LIMIT 5`;
     const recentOut = await pool.query(recentOutQuery, recentOutParams);
 
-    // Consolidate per branch
-    const branchMap = {};
-    inRes.rows.forEach(r => {
-      branchMap[r.branch_id] = {
-        branchId: r.branch_id,
-        branchName: r.branch_name || `فرع ${r.branch_id}`,
-        totalCashIn: Number(r.total_in),
-        totalCashOut: 0,
-        netBalance: Number(r.total_in),
-      };
-    });
-    outRes.rows.forEach(r => {
-      if (!branchMap[r.branch_id]) {
-        branchMap[r.branch_id] = {
-          branchId: r.branch_id,
-          branchName: r.branch_name || `فرع ${r.branch_id}`,
-          totalCashIn: 0,
-          totalCashOut: Number(r.total_out),
-          netBalance: -Number(r.total_out),
-        };
-      } else {
-        branchMap[r.branch_id].totalCashOut = Number(r.total_out);
-        branchMap[r.branch_id].netBalance -= Number(r.total_out);
-      }
-    });
-
-    // Return strictly the caller's branch data (default for both Admin and Employees):
+    // Return single branch report (matching /cash/summary screen to the penny)
     if (branchFilter) {
-      const myBranch = branchMap[branchFilter] || {
-        branchName: branchFilter === 1 ? 'فرع المعرض (القطاعي)' : (branchFilter === 2 ? 'فرع المخزن الرئيسي' : `فرع ${branchFilter}`),
-        totalCashIn: 0,
-        totalCashOut: 0,
-        netBalance: 0,
-      };
+      const row = branchRes.rows[0] || {};
+      const opening = Number(row.opening_balance) || 0;
+      const todayIn = Number(row.today_cash_in) || 0;
+      const totalIn = opening + todayIn;
+      const todayOut = Number(row.today_cash_out) || 0;
+      const currentTreasuryBalance = totalIn - todayOut;
+      const todayNetFlow = todayIn - todayOut;
+
       return {
         date: targetDate,
         branchId: branchFilter,
-        branchName: myBranch.branchName,
-        totalCashIn: formatMoney(myBranch.totalCashIn),
-        totalCashOut: formatMoney(myBranch.totalCashOut),
-        netDrawerBalance: formatMoney(myBranch.netBalance),
+        branchName: row.branch_name || (branchFilter === 1 ? 'فرع المعرض (القطاعي)' : (branchFilter === 2 ? 'فرع المخزن الرئيسي' : `فرع ${branchFilter}`)),
+        currentTreasuryBalance: formatMoney(currentTreasuryBalance), // رصيد الخزنة الفعلي المتاح حالياً (المطابق لكارت رصيد الخزنة)
+        totalTreasuryIn: formatMoney(totalIn),                      // إجمالي الوارد بالخزينة (شامل المرحل السابق)
+        todayCashIn: formatMoney(todayIn),                          // كاش مقبوض اليوم بالدرج
+        totalCashOut: formatMoney(todayOut),                        // إجمالي المنصرف اليوم
+        openingBalance: formatMoney(opening),                       // الرصيد المرحل السابق
+        todayNetCashFlow: formatMoney(todayNetFlow),                // صافي حركة نقدية اليوم بمفردها
+        todayInTransactionsCount: Number(row.today_in_count) || 0,
+        todayOutTransactionsCount: Number(row.today_out_count) || 0,
         recentIncoming: recentIn.rows.map(r => ({
           id: r.id,
-          amount: formatMoney(r.amount),
+          amount: formatMoney(r.source_type === 'invoice' ? r.paid_amount : r.amount),
           customer: r.customer_name || 'غير محدد',
           notes: r.notes || r.source_type,
         })),
@@ -152,38 +156,43 @@ async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
       };
     }
 
-    let overallIn = 0;
-    let overallOut = 0;
-    Object.values(branchMap).forEach(b => {
-      overallIn += b.totalCashIn;
-      overallOut += b.totalCashOut;
+    // Consolidated for all branches (when Admin explicitly asks for both)
+    const branchesData = branchRes.rows.map(row => {
+      const opening = Number(row.opening_balance) || 0;
+      const todayIn = Number(row.today_cash_in) || 0;
+      const totalIn = opening + todayIn;
+      const todayOut = Number(row.today_cash_out) || 0;
+      const currentTreasuryBalance = totalIn - todayOut;
+      const todayNetFlow = todayIn - todayOut;
+
+      return {
+        branchId: row.branch_id,
+        branchName: row.branch_name,
+        currentTreasuryBalance: formatMoney(currentTreasuryBalance),
+        totalTreasuryIn: formatMoney(totalIn),
+        todayCashIn: formatMoney(todayIn),
+        totalCashOut: formatMoney(todayOut),
+        openingBalance: formatMoney(opening),
+        todayNetCashFlow: formatMoney(todayNetFlow),
+      };
+    });
+
+    let overallTreasuryBalance = 0;
+    let overallTreasuryIn = 0;
+    let overallCashOut = 0;
+    branchesData.forEach(b => {
+      overallTreasuryBalance += (parseFloat(b.currentTreasuryBalance.replace(/[^\d.-]/g, '')) || 0);
+      overallTreasuryIn += (parseFloat(b.totalTreasuryIn.replace(/[^\d.-]/g, '')) || 0);
+      overallCashOut += (parseFloat(b.totalCashOut.replace(/[^\d.-]/g, '')) || 0);
     });
 
     return {
       date: targetDate,
-      overallTotalCashIn: formatMoney(overallIn),
-      overallTotalCashOut: formatMoney(overallOut),
-      overallNetDrawerBalance: formatMoney(overallIn - overallOut),
-      branches: Object.values(branchMap).map(b => ({
-        branch: b.branchName,
-        cashIn: formatMoney(b.totalCashIn),
-        cashOut: formatMoney(b.totalCashOut),
-        netDrawer: formatMoney(b.netBalance),
-      })),
-      recentIncoming: recentIn.rows.map(r => ({
-        id: r.id,
-        amount: formatMoney(r.amount),
-        customer: r.customer_name || 'غير محدد',
-        branch: r.branch_name,
-        notes: r.notes || r.source_type,
-      })),
-      recentOutgoing: recentOut.rows.map(r => ({
-        id: r.id,
-        amount: formatMoney(r.amount),
-        recipient: r.name || 'غير محدد',
-        reason: r.reason || r.notes || r.entry_type,
-        branch: r.branch_name,
-      })),
+      isConsolidatedAllBranches: true,
+      overallTreasuryBalance: formatMoney(overallTreasuryBalance),
+      overallTreasuryIn: formatMoney(overallTreasuryIn),
+      overallCashOut: formatMoney(overallCashOut),
+      branches: branchesData,
     };
   } catch (error) {
     console.error('[Quaz AI Tool] Error getCashAndTreasurySummary:', error);
