@@ -162,6 +162,7 @@ const PUBLIC_PATHS = [
   "/integrations",
   "/chat/media",
   "/api/inter-branch/webhook",
+  "/api/quaz-ai/telegram/webhook",
 ];
 const jwt_auth = require("jsonwebtoken");
 const JWT_SECRET = process.env.JWT_SECRET || "glass_system_super_secret_2026";
@@ -14513,6 +14514,12 @@ runStartupMigrations().finally(() => {
     stockWatchdogService.initStartupAudit(io);
     if (typeof pool.startContinuousStandbyBackup === "function") {
       pool.startContinuousStandbyBackup();
+    }
+    try {
+      const { initQuazAi } = require("./quaz-ai");
+      initQuazAi(app);
+    } catch (aiErr) {
+      console.error("[Quaz AI] Failed to initialize:", aiErr.message);
     }
   });
 });
