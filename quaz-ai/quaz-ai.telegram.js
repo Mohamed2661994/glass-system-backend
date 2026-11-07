@@ -158,14 +158,17 @@ async function handleTelegramMessage(message) {
   // Show "typing..." status while processing
   await sendChatAction(chatId, 'typing');
 
-  // Case 1: Voice Note Message
-  if (message.voice) {
+  // Case 1: Voice Note or Audio Message
+  const audioMsg = message.voice || message.audio;
+  if (audioMsg) {
     try {
       await sendChatAction(chatId, 'record_voice');
-      const fileInfo = await telegramApi('getFile', { file_id: message.voice.file_id });
+      const fileInfo = await telegramApi('getFile', { file_id: audioMsg.file_id });
       if (fileInfo && fileInfo.file_path) {
         const audioBuffer = await downloadTelegramFile(fileInfo.file_path);
-        const reply = await engine.processVoicePrompt(audioBuffer, 'audio/ogg');
+        const mimeType = audioMsg.mime_type || (message.voice ? 'audio/ogg' : 'audio/mp3');
+        const caption = message.caption ? `ملاحظة إضافية مع الصوت: ${message.caption}` : '';
+        const reply = await engine.processVoicePrompt(audioBuffer, mimeType, caption);
         await sendTelegramMessage(chatId, reply);
         return;
       }

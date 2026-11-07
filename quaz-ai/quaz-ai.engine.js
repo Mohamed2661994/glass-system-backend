@@ -300,9 +300,9 @@ async function processUserPrompt(promptText, history = []) {
 
 /**
  * Multimodal Voice Prompt Handler
- * Accepts audio buffer (base64) from Telegram voice note and transcribes/processes in 1 step!
+ * Accepts audio buffer (base64) from Telegram voice note or Web app and processes in 1 step!
  */
-async function processVoicePrompt(audioBuffer, mimeType = 'audio/ogg') {
+async function processVoicePrompt(audioBuffer, mimeType = 'audio/ogg', additionalContext = '') {
   const base64Audio = audioBuffer.toString('base64');
 
   const payload = {
@@ -316,7 +316,7 @@ async function processVoicePrompt(audioBuffer, mimeType = 'audio/ogg') {
           },
         },
         {
-          text: 'استمع لهذه الرسالة الصوتية من صاحب العمل، وافهم سؤاله وأجب عليه بدقة كـ Quaz AI مستخدماً الأدوات المتاحة إن لزم الأمر.',
+          text: `استمع بدقة لهذه الرسالة الصوتية من صاحب العمل (المهندس خالد)، وافهم سؤاله واستفساراته وأجب عليه بذكاء بالعامية المصرية الراقية كـ Quaz AI مستخدماً الأدوات البرمجية المتاحة (Function Calling) للاستعلام الحي من قاعدة بيانات House of Glass إن لزم الأمر.${additionalContext ? ' ' + additionalContext : ''}`,
         },
       ],
     }],

@@ -40,6 +40,33 @@ router.post('/chat', async (req, res) => {
 });
 
 /**
+ * POST /api/quaz-ai/voice
+ * Multimodal Web Voice Endpoint (Audio Base64)
+ */
+router.post('/voice', express.json({ limit: '25mb' }), async (req, res) => {
+  try {
+    const { audio, mimeType } = req.body;
+    if (!audio) {
+      return res.status(400).json({ error: 'ملف الصوت مطلوب' });
+    }
+
+    const audioBuffer = Buffer.from(audio, 'base64');
+    const reply = await engine.processVoicePrompt(audioBuffer, mimeType || 'audio/webm');
+    res.json({
+      success: true,
+      reply,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[Quaz AI Voice API] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'حدث خطأ أثناء معالجة التسجيل الصوتي',
+    });
+  }
+});
+
+/**
  * POST /api/quaz-ai/telegram/webhook
  * Instant Telegram Webhook receiver
  */
