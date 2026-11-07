@@ -204,9 +204,25 @@ async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
  * 2. Sales and Profit Metrics (حركة المبيعات وصافي الأرباح)
  */
 async function getSalesAndProfits({ date, startDate, endDate, branchId, userContext } = {}) {
-  const targetDate = date ? String(date).trim() : getCairoToday();
-  const start = startDate ? String(startDate).trim() : targetDate;
-  const end = endDate ? String(endDate).trim() : targetDate;
+  const cairoToday = getCairoToday();
+
+  // Guard against LLM hallucinating past years (e.g. 2025 or 2024) for today's queries
+  let cleanDate = date ? String(date).trim() : null;
+  if (cleanDate && (cleanDate.startsWith('2025') || cleanDate.startsWith('2024') || cleanDate === 'today')) {
+    cleanDate = cairoToday;
+  }
+  let cleanStart = startDate ? String(startDate).trim() : null;
+  if (cleanStart && (cleanStart.startsWith('2025') || cleanStart.startsWith('2024') || cleanStart === 'today')) {
+    cleanStart = cairoToday;
+  }
+  let cleanEnd = endDate ? String(endDate).trim() : null;
+  if (cleanEnd && (cleanEnd.startsWith('2025') || cleanEnd.startsWith('2024') || cleanEnd === 'today')) {
+    cleanEnd = cairoToday;
+  }
+
+  const targetDate = cleanDate || (cleanStart ? null : cairoToday);
+  const start = cleanStart || targetDate;
+  const end = cleanEnd || targetDate;
   const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
   const isExplicitAll = (branchId === 'all' || branchId === 'both' || branchId === 0) && isAdmin;
   const callerBranch = Number(userContext?.branchId) || 1;
@@ -615,6 +631,32 @@ async function getExecutiveDailyOverview({ userContext } = {}) {
   };
 }
 
+function generateWordVariants(word) {
+  const variants = new Set([word]);
+  // 1. هيكسا <-> هكسا
+  if (word.includes('ي')) {
+    variants.add(word.replace(/ي/g, ''));
+  }
+  if (word.includes('هك')) {
+    variants.add(word.replace('هك', 'هيك'));
+  }
+  // 2. ه <-> ة
+  if (word.endsWith('ه')) variants.add(word.slice(0, -1) + 'ة');
+  if (word.endsWith('ة')) variants.add(word.slice(0, -1) + 'ه');
+  // 3. ا <-> أ / إ
+  if (word.startsWith('ا')) {
+    variants.add('أ' + word.slice(1));
+    variants.add('إ' + word.slice(1));
+  } else if (word.startsWith('أ') || word.startsWith('إ')) {
+    variants.add('ا' + word.slice(1));
+  }
+  // 4. ي <-> ى at the end
+  if (word.endsWith('ي')) variants.add(word.slice(0, -1) + 'ى');
+  if (word.endsWith('ى')) variants.add(word.slice(0, -1) + 'ي');
+
+  return Array.from(variants);
+}
+
 function cleanProductSearchTerm(raw) {
   if (!raw || typeof raw !== 'string') return '';
   let words = raw.trim().split(/\s+/).filter(Boolean);
@@ -626,15 +668,18 @@ function cleanProductSearchTerm(raw) {
   });
 
   // Strip query stop words from the beginning
-  const stopWords = new Set(['رصيد', 'سعر', 'كام', 'عايز', 'قولي', 'شوفلي', 'ابحث', 'عن', 'هاتلي', 'صنف', 'منتج', 'اعرف', 'فيه', 'من', 'اسأل']);
+  const stopWords = new Set(['رصيد', 'سعر', 'كام', 'عايز', 'قولي', 'شوفلي', 'ابحث', 'عن', 'هاتلي', 'صنف', 'منتج', 'اعرف', 'فيه', 'من', 'اسأل', 'موجود']);
   while (words.length > 1 && stopWords.has(words[0])) {
     words.shift();
   }
 
-  // Phonetic fixes for glass products (e.g. بعد -> وعد)
+  // Phonetic fixes for glass products (e.g. بعد -> وعد, هيكسا -> هكسا)
   for (let i = 0; i < words.length; i++) {
     if (words[i] === 'بعد') {
       words[i] = 'وعد';
+    }
+    if (words[i] === 'هيكسا' || words[i] === 'هكسه' || words[i] === 'هيكسه') {
+      words[i] = 'هكسا';
     }
   }
 
@@ -659,8 +704,25 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
   const effectiveBranch = isExplicitAll ? null : (Number(branchId) || callerBranch);
 
   try {
-    const cleanTerm = searchTerm.split(/\s+/).filter(Boolean).join('%');
-    const pattern = `%${cleanTerm}%`;
+    const words = searchTerm.split(/\s+/).filter(Boolean);
+    const wordClauses = [];
+    const params = [];
+    let pIdx = 1;
+
+    for (const w of words) {
+      const variants = generateWordVariants(w);
+      const subClauses = variants.map(v => {
+        params.push(`%${v}%`);
+        return `p.name ILIKE $${pIdx++}`;
+      });
+      wordClauses.push(`(${subClauses.join(' OR ')})`);
+    }
+
+    // Also match barcode or manufacturer with raw search
+    params.push(`%${rawSearch}%`);
+    const barcodeParamIdx = pIdx++;
+    params.push(`%${rawSearch}%`);
+    const mfgParamIdx = pIdx++;
 
     const sql = `
       SELECT 
@@ -679,21 +741,32 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
       LEFT JOIN stock s ON s.product_id = p.id
       WHERE p.is_active IS NOT FALSE
         AND (
-          p.name ILIKE $1 
-          OR p.barcode ILIKE $2 
-          OR p.manufacturer ILIKE $1
+          (${wordClauses.join(' AND ')})
+          OR p.barcode ILIKE $${barcodeParamIdx}
+          OR p.manufacturer ILIKE $${mfgParamIdx}
         )
       GROUP BY p.id, p.name, p.barcode, p.manufacturer, p.retail_package, p.wholesale_package, p.retail_price, p.wholesale_price, p.purchase_price
       ORDER BY total_stock DESC
       LIMIT 8
     `;
 
-    let res = await pool.query(sql, [pattern, `%${searchTerm}%`]);
+    let res = await pool.query(sql, params);
 
-    // Fallback: if multi-word search produced 0 rows, try individual key words
-    if (res.rows.length === 0 && searchTerm.includes(' ')) {
-      const words = searchTerm.split(/\s+/).filter(w => w.length > 2);
-      if (words.length > 0) {
+    // Fallback: if multi-word strict AND produced 0 rows, try individual key words (> 2 chars)
+    if (res.rows.length === 0 && words.length > 1) {
+      const fallbackParams = [];
+      let fbIdx = 1;
+      const orClauses = [];
+      for (const w of words) {
+        if (w.length > 2) {
+          const variants = generateWordVariants(w);
+          for (const v of variants) {
+            fallbackParams.push(`%${v}%`);
+            orClauses.push(`p.name ILIKE $${fbIdx++}`);
+          }
+        }
+      }
+      if (orClauses.length > 0) {
         const fallbackSql = `
           SELECT 
             p.id,
@@ -710,12 +783,12 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
           FROM products p
           LEFT JOIN stock s ON s.product_id = p.id
           WHERE p.is_active IS NOT FALSE
-            AND (${words.map((_, i) => `p.name ILIKE $${i + 1}`).join(' OR ')})
+            AND (${orClauses.join(' OR ')})
           GROUP BY p.id, p.name, p.barcode, p.manufacturer, p.retail_package, p.wholesale_package, p.retail_price, p.wholesale_price, p.purchase_price
           ORDER BY total_stock DESC
           LIMIT 8
         `;
-        res = await pool.query(fallbackSql, words.map(w => `%${w}%`));
+        res = await pool.query(fallbackSql, fallbackParams);
       }
     }
 

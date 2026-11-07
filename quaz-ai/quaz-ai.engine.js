@@ -11,12 +11,17 @@ const https = require('https');
 const config = require('./quaz-ai.config');
 const tools = require('./quaz-ai.tools');
 
+function getCairoToday() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Cairo' });
+}
+
 function getSystemInstruction(userContext = { isAdmin: true, branchId: 1 }) {
   const isTelegram = Boolean(userContext?.isTelegram);
   const branchId = Number(userContext?.branchId) || 1;
   const branchName = branchId === 1 ? 'فرع المعرض (القطاعي)' : (branchId === 2 ? 'فرع المخزن الرئيسي' : `فرع ${branchId}`);
   const userName = userContext?.username || 'يا فندم';
   const isAdmin = Boolean(userContext?.isAdmin);
+  const cairoToday = getCairoToday();
 
   let adminSpecific = '';
   if (isAdmin) {
@@ -27,8 +32,10 @@ function getSystemInstruction(userContext = { isAdmin: true, branchId: 1 }) {
 
   let branchRule = '';
   if (isTelegram) {
-    branchRule = `أنت بتتكلم مع المهندس خالد على تطبيق تليجرام.
-- لو سأل سؤال عام عن المبيعات أو الخزينة أو الأرباح من غير ما يحدد فرع معين: اسأله فوراً بالعامية المصرية قبل أي حاجة: «يا بشمهندس خالد، تحب أعرض لحضرتك أرقام فرع المعرض، ولا المخزن الرئيسي، ولا نستعرض الاتنين سوا؟».
+    branchRule = `أنت بتتكلم مع المهندس خالد (صاحب ومؤسس الشركة) على تطبيق تليجرام.
+- لو سأل عن المبيعات أو الأرباح أو الخزينة (سؤال عام زي: أرباح اليوم كام / مبيعات النهاردة إيه):
+  * استدعِ أداة getSalesAndProfits فوراً لتاريخ اليوم [${cairoToday}] لفرع المعرض، واعرض له قصة المبيعات والأرباح الحقيقية، ثم اسأله بود مصري: «تحب نبص كمان على أرقام فرع المخزن الرئيسي يا باشا؟».
+  * ⚠️ احرص دايماً على استدعاء الأدوات البرمجية الفعلية ولا تجاوب من رأسك أبداً!
 - لو حدد فرع (المعرض أو المخزن): اعرض أرقام الفرع المطلوب بس.
 - لو طلب كل الفروع: اعرض المعرض والمخزن سوا.`;
   } else {
@@ -69,6 +76,12 @@ function getSystemInstruction(userContext = { isAdmin: true, branchId: 1 }) {
   }
 
   return `أنت «Quaz AI» (كواز)، المساعد والمدير التنفيذي والمحاسبي الذكي لنظام «House of Glass» (معرض ومخازن آل عاشور عدس للأدوات المنزلية والزجاجيات).
+
+📅 تاريخ اليوم الفعلي في جمهورية مصر العربية (توقيت القاهرة): [${cairoToday}]!
+🚨 تنبيه حاسم وصارم: عندما يسأل المستخدم عن "اليوم"، "النهاردة"، "حركة اليوم"، "مبيعات اليوم"، "أرباح اليوم":
+- تاريخ اليوم الفعلي هو دائماً وأبداً: [${cairoToday}]!
+- 🚫 ممنوع نهائياً أن تفترض أو تمرر أي تاريخ قديم مثل 2024 أو 2025! مرر دائماً ${cairoToday} في معاملات التاريخ date / startDate / endDate للأدوات أو اترك التاريخ فارغاً لتتولى الأدوات جلبه تلقائياً!
+- 🚫 ممنوع نهائياً أن تجاوب من رأسك أو تكرر معلومات قديمة بدون استدعاء الأداة البرمجية المخصصة (getSalesAndProfits, getCashAndTreasurySummary, searchProductStock)!
 
 ${adminSpecific}
 ${branchRule}

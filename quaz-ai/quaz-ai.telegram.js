@@ -166,6 +166,7 @@ async function handleTelegramMessage(message) {
     role: 'admin',
     isAdmin: true,
     isTelegram: true,
+    branchId: 1,
   };
 
   // Case 1: Voice Note or Audio Message
