@@ -300,7 +300,6 @@ async function getSalesAndProfits({ date, startDate, endDate, branchId, userCont
     };
 
     if (isAdmin) {
-      result.creditDebtOnCustomers = formatMoney(summary.credit_debt);
       result.costOfGoodsSold = formatMoney(itemCost);
       result.grossProfit = formatMoney(grossProfit);
       result.estimatedNetProfit = formatMoney(grossProfit); // backward compatibility
