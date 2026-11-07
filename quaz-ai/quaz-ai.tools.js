@@ -576,14 +576,43 @@ async function getExecutiveDailyOverview({ userContext } = {}) {
   };
 }
 
+function cleanProductSearchTerm(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let words = raw.trim().split(/\s+/).filter(Boolean);
+
+  // Replace voice dictation acoustic typos
+  words = words.map(w => {
+    if (w === 'رشيد' || w === 'رشد') return 'رصيد';
+    return w;
+  });
+
+  // Strip query stop words from the beginning
+  const stopWords = new Set(['رصيد', 'سعر', 'كام', 'عايز', 'قولي', 'شوفلي', 'ابحث', 'عن', 'هاتلي', 'صنف', 'منتج', 'اعرف', 'فيه', 'من', 'اسأل']);
+  while (words.length > 1 && stopWords.has(words[0])) {
+    words.shift();
+  }
+
+  // Phonetic fixes for glass products (e.g. بعد -> وعد)
+  for (let i = 0; i < words.length; i++) {
+    if (words[i] === 'بعد') {
+      words[i] = 'وعد';
+    }
+  }
+
+  return words.join(' ');
+}
+
 /**
  * 8. Search Product Stock & Inventory Details (استعلام وبحث رصيد صنف محدد بالفروع)
  */
 async function searchProductStock({ query, barcode, branchId, userContext } = {}) {
-  const searchTerm = (barcode || query || '').trim();
-  if (!searchTerm) {
+  const rawSearch = (barcode || query || '').trim();
+  if (!rawSearch) {
     return { error: 'برجاء كتابة اسم الصنف أو الباركود للاستعلام عن رصيده.' };
   }
+
+  const cleanedSearch = cleanProductSearchTerm(rawSearch);
+  const searchTerm = cleanedSearch || rawSearch;
 
   const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
   const userBranch = userContext?.branchId ? Number(userContext.branchId) : null;
@@ -619,7 +648,37 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
       LIMIT 8
     `;
 
-    const res = await pool.query(sql, [pattern, `%${searchTerm}%`]);
+    let res = await pool.query(sql, [pattern, `%${searchTerm}%`]);
+
+    // Fallback: if multi-word search produced 0 rows, try individual key words
+    if (res.rows.length === 0 && searchTerm.includes(' ')) {
+      const words = searchTerm.split(/\s+/).filter(w => w.length > 2);
+      if (words.length > 0) {
+        const fallbackSql = `
+          SELECT 
+            p.id,
+            p.name,
+            p.barcode,
+            p.manufacturer,
+            COALESCE(p.retail_package, p.wholesale_package, 'قطعة') as package_type,
+            COALESCE(p.retail_price, 0) as retail_price,
+            COALESCE(p.wholesale_price, 0) as wholesale_price,
+            COALESCE(p.purchase_price, 0) as purchase_price,
+            COALESCE(SUM(s.quantity), 0) as total_stock,
+            COALESCE(SUM(CASE WHEN s.warehouse_id = 1 THEN s.quantity ELSE 0 END), 0) as showroom_stock,
+            COALESCE(SUM(CASE WHEN s.warehouse_id = 2 THEN s.quantity ELSE 0 END), 0) as warehouse_stock
+          FROM products p
+          LEFT JOIN stock s ON s.product_id = p.id
+          WHERE p.is_active IS NOT FALSE
+            AND (${words.map((_, i) => `p.name ILIKE $${i + 1}`).join(' OR ')})
+          GROUP BY p.id, p.name, p.barcode, p.manufacturer, p.retail_package, p.wholesale_package, p.retail_price, p.wholesale_price, p.purchase_price
+          ORDER BY total_stock DESC
+          LIMIT 8
+        `;
+        res = await pool.query(fallbackSql, words.map(w => `%${w}%`));
+      }
+    }
+
     if (res.rows.length === 0) {
       return {
         message: `لم يتم العثور على أي صنف يطابق "${searchTerm}" في النظام. برجاء التأكد من اسم الصنف أو الباركود.`,
@@ -643,7 +702,6 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
 
         if (isAdmin) {
           item.purchasePrice = formatMoney(r.purchase_price);
-          item.totalStockAllBranches = Number(r.total_stock);
           item.stockByBranch = {
             showroomBranch1: Number(r.showroom_stock),
             warehouseBranch2: Number(r.warehouse_stock),
@@ -655,9 +713,8 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
         } else if (effectiveBranch === 2) {
           // Warehouse user
           item.stockInWarehouse = Number(r.warehouse_stock);
-          item.stockInShowroom = Number(r.showroom_stock);
         } else {
-          item.currentStock = Number(r.total_stock);
+          item.currentStock = Number(r.showroom_stock);
         }
 
         return item;
