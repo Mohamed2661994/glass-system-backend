@@ -98,10 +98,10 @@ const TOOL_DECLARATIONS = [
   },
 ];
 
-function postToGemini(payload) {
+function executeSingleGeminiCall(payload, targetModel) {
   return new Promise((resolve, reject) => {
     const postData = JSON.stringify(payload);
-    const model = config.geminiModel || 'gemini-3.5-flash-lite';
+    const model = targetModel || config.geminiModel || 'gemini-3.5-flash-lite';
     const apiKey = config.geminiApiKey;
 
     const req = https.request({
@@ -113,7 +113,7 @@ function postToGemini(payload) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData),
       },
-      timeout: 15000,
+      timeout: 20000,
     }, (res) => {
       let body = '';
       res.on('data', chunk => body += chunk);
@@ -123,7 +123,10 @@ function postToGemini(payload) {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             resolve(parsed);
           } else {
-            reject(new Error(parsed.error?.message || `Gemini Error HTTP ${res.statusCode}: ${body}`));
+            const errMsg = parsed.error?.message || `Gemini Error HTTP ${res.statusCode}: ${body}`;
+            const err = new Error(errMsg);
+            err.statusCode = res.statusCode;
+            reject(err);
           }
         } catch (e) {
           reject(new Error(`Failed to parse Gemini response: ${e.message}`));
@@ -133,13 +136,40 @@ function postToGemini(payload) {
 
     req.on('timeout', () => {
       req.destroy();
-      reject(new Error('Gemini API request timed out after 15s'));
+      reject(new Error('Gemini API request timed out after 20s'));
     });
 
     req.on('error', (err) => reject(err));
     req.write(postData);
     req.end();
   });
+}
+
+async function postToGemini(payload) {
+  const modelsToTry = [config.geminiModel || 'gemini-3.5-flash-lite', 'gemini-flash-lite-latest'];
+  let lastError = null;
+
+  for (const model of modelsToTry) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await executeSingleGeminiCall(payload, model);
+      } catch (err) {
+        lastError = err;
+        const isTemporary = err.statusCode === 503 || 
+                            err.statusCode === 429 || 
+                            /high demand|rate limit|resource exhausted|temporary/i.test(err.message);
+        
+        if (isTemporary && attempt < 2) {
+          // Wait 800ms before retry
+          await new Promise(r => setTimeout(r, 800));
+          continue;
+        }
+        break; // try fallback model
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 /**
@@ -349,3 +379,4 @@ module.exports = {
   processVoicePrompt,
   executeTool,
 };
+
