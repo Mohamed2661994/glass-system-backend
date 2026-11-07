@@ -590,37 +590,36 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
   const effectiveBranch = (!isAdmin && userBranch) ? userBranch : (Number(branchId) || null);
 
   try {
+    const cleanTerm = searchTerm.split(/\s+/).filter(Boolean).join('%');
+    const pattern = `%${cleanTerm}%`;
+
     const sql = `
       SELECT 
         p.id,
         p.name,
         p.barcode,
         p.manufacturer,
-        p.model,
-        p.color,
         COALESCE(p.retail_package, p.wholesale_package, 'قطعة') as package_type,
         COALESCE(p.retail_price, 0) as retail_price,
         COALESCE(p.wholesale_price, 0) as wholesale_price,
         COALESCE(p.purchase_price, 0) as purchase_price,
         COALESCE(SUM(s.quantity), 0) as total_stock,
-        COALESCE(SUM(CASE WHEN s.branch_id = 1 THEN s.quantity ELSE 0 END), 0) as showroom_stock,
-        COALESCE(SUM(CASE WHEN s.branch_id = 2 THEN s.quantity ELSE 0 END), 0) as warehouse_stock,
-        COALESCE(SUM(CASE WHEN s.branch_id = 3 THEN s.quantity ELSE 0 END), 0) as branch3_stock
+        COALESCE(SUM(CASE WHEN s.warehouse_id = 1 THEN s.quantity ELSE 0 END), 0) as showroom_stock,
+        COALESCE(SUM(CASE WHEN s.warehouse_id = 2 THEN s.quantity ELSE 0 END), 0) as warehouse_stock
       FROM products p
       LEFT JOIN stock s ON s.product_id = p.id
       WHERE p.is_active IS NOT FALSE
         AND (
           p.name ILIKE $1 
-          OR p.barcode ILIKE $1 
-          OR p.manufacturer ILIKE $1 
-          OR p.model ILIKE $1
+          OR p.barcode ILIKE $2 
+          OR p.manufacturer ILIKE $1
         )
-      GROUP BY p.id, p.name, p.barcode, p.manufacturer, p.model, p.color, p.retail_package, p.wholesale_package, p.retail_price, p.wholesale_price, p.purchase_price
+      GROUP BY p.id, p.name, p.barcode, p.manufacturer, p.retail_package, p.wholesale_package, p.retail_price, p.wholesale_price, p.purchase_price
       ORDER BY total_stock DESC
       LIMIT 8
     `;
 
-    const res = await pool.query(sql, [`%${searchTerm}%`]);
+    const res = await pool.query(sql, [pattern, `%${searchTerm}%`]);
     if (res.rows.length === 0) {
       return {
         message: `لم يتم العثور على أي صنف يطابق "${searchTerm}" في النظام. برجاء التأكد من اسم الصنف أو الباركود.`,
@@ -648,7 +647,6 @@ async function searchProductStock({ query, barcode, branchId, userContext } = {}
           item.stockByBranch = {
             showroomBranch1: Number(r.showroom_stock),
             warehouseBranch2: Number(r.warehouse_stock),
-            branch3: Number(r.branch3_stock),
           };
         } else if (effectiveBranch === 1) {
           // Showroom user
