@@ -21,9 +21,10 @@ function formatMoney(amount) {
 /**
  * 1. Cash Drawer & Treasuries Summary (حركة الخزينة والدرج)
  */
-async function getCashAndTreasurySummary({ date, branchId } = {}) {
+async function getCashAndTreasurySummary({ date, branchId, userContext } = {}) {
   const targetDate = date ? String(date).trim() : getCairoToday();
-  const branchFilter = Number(branchId) || null;
+  const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
+  const branchFilter = (!isAdmin && userContext?.branchId) ? Number(userContext.branchId) : (Number(branchId) || null);
 
   try {
     // 1. Cash In for date
@@ -70,18 +71,28 @@ async function getCashAndTreasurySummary({ date, branchId } = {}) {
       FROM cash_in ci
       LEFT JOIN branches b ON b.id = ci.branch_id
       WHERE ci.transaction_date = $1
-      ORDER BY ci.id DESC LIMIT 5
     `;
-    const recentIn = await pool.query(recentInQuery, [targetDate]);
+    const recentInParams = [targetDate];
+    if (branchFilter) {
+      recentInQuery += ` AND ci.branch_id = $2`;
+      recentInParams.push(branchFilter);
+    }
+    recentInQuery += ` ORDER BY ci.id DESC LIMIT 5`;
+    const recentIn = await pool.query(recentInQuery, recentInParams);
 
     let recentOutQuery = `
       SELECT co.id, co.amount, co.name, co.reason, co.entry_type, co.notes, b.name as branch_name, co.created_at
       FROM cash_out co
       LEFT JOIN branches b ON b.id = co.branch_id
       WHERE co.transaction_date = $1
-      ORDER BY co.id DESC LIMIT 5
     `;
-    const recentOut = await pool.query(recentOutQuery, [targetDate]);
+    const recentOutParams = [targetDate];
+    if (branchFilter) {
+      recentOutQuery += ` AND co.branch_id = $2`;
+      recentOutParams.push(branchFilter);
+    }
+    recentOutQuery += ` ORDER BY co.id DESC LIMIT 5`;
+    const recentOut = await pool.query(recentOutQuery, recentOutParams);
 
     // Consolidate per branch
     const branchMap = {};
@@ -108,6 +119,35 @@ async function getCashAndTreasurySummary({ date, branchId } = {}) {
         branchMap[r.branch_id].netBalance -= Number(r.total_out);
       }
     });
+
+    // If non-admin branch employee: strictly return their branch numbers only!
+    if (!isAdmin && branchFilter) {
+      const myBranch = branchMap[branchFilter] || {
+        branchName: `فرع ${branchFilter}`,
+        totalCashIn: 0,
+        totalCashOut: 0,
+        netBalance: 0,
+      };
+      return {
+        date: targetDate,
+        branchName: myBranch.branchName,
+        totalCashIn: formatMoney(myBranch.totalCashIn),
+        totalCashOut: formatMoney(myBranch.totalCashOut),
+        netDrawerBalance: formatMoney(myBranch.netBalance),
+        recentIncoming: recentIn.rows.map(r => ({
+          id: r.id,
+          amount: formatMoney(r.amount),
+          customer: r.customer_name || 'غير محدد',
+          notes: r.notes || r.source_type,
+        })),
+        recentOutgoing: recentOut.rows.map(r => ({
+          id: r.id,
+          amount: formatMoney(r.amount),
+          recipient: r.name || 'غير محدد',
+          reason: r.reason || r.notes || r.entry_type,
+        })),
+      };
+    }
 
     let overallIn = 0;
     let overallOut = 0;
@@ -151,11 +191,12 @@ async function getCashAndTreasurySummary({ date, branchId } = {}) {
 /**
  * 2. Sales and Profit Metrics (حركة المبيعات وصافي الأرباح)
  */
-async function getSalesAndProfits({ date, startDate, endDate, branchId } = {}) {
+async function getSalesAndProfits({ date, startDate, endDate, branchId, userContext } = {}) {
   const targetDate = date ? String(date).trim() : getCairoToday();
   const start = startDate ? String(startDate).trim() : targetDate;
   const end = endDate ? String(endDate).trim() : targetDate;
-  const branchFilter = Number(branchId) || null;
+  const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
+  const branchFilter = (!isAdmin && userContext?.branchId) ? Number(userContext.branchId) : (Number(branchId) || null);
 
   try {
     let query = `
@@ -211,26 +252,34 @@ async function getSalesAndProfits({ date, startDate, endDate, branchId } = {}) {
       WHERE inv.movement_type = 'sale'
         AND inv.is_void IS NOT TRUE
         AND inv.invoice_date BETWEEN $1 AND $2
-      GROUP BY p.id, p.name
-      ORDER BY total_qty DESC
-      LIMIT 5
     `;
-    const topRes = await pool.query(topQuery, [start, end]);
+    const topParams = [start, end];
+    if (branchFilter) {
+      topQuery += ` AND inv.branch_id = $3`;
+      topParams.push(branchFilter);
+    }
+    topQuery += ` GROUP BY p.id, p.name ORDER BY total_qty DESC LIMIT 5`;
+    const topRes = await pool.query(topQuery, topParams);
 
-    return {
+    const result = {
       period: start === end ? `تاريخ ${start}` : `الفترة من ${start} إلى ${end}`,
       totalInvoicesCount: Number(summary.total_invoices || 0),
       grossSales: formatMoney(summary.gross_sales),
       collectedCash: formatMoney(summary.collected_cash),
-      creditDebtOnCustomers: formatMoney(summary.credit_debt),
-      estimatedNetProfit: formatMoney(netProfit),
-      profitMarginPercent: profitMargin,
       topSellingProducts: topRes.rows.map(r => ({
         product: r.product_name,
         soldQuantity: Number(r.total_qty),
         revenue: formatMoney(r.total_revenue),
       })),
     };
+
+    if (isAdmin) {
+      result.creditDebtOnCustomers = formatMoney(summary.credit_debt);
+      result.estimatedNetProfit = formatMoney(netProfit);
+      result.profitMarginPercent = profitMargin;
+    }
+
+    return result;
   } catch (error) {
     console.error('[Quaz AI Tool] Error getSalesAndProfits:', error);
     return { error: `فشل استعلام المبيعات والأرباح: ${error.message}` };
@@ -369,7 +418,12 @@ async function getLowStockAlerts({ threshold = 5, limit = 15 } = {}) {
 /**
  * 5. Payroll, Advances & Employee Ledger (الرواتب والسلفيات)
  */
-async function getPayrollSummary({ employeeName } = {}) {
+async function getPayrollSummary({ employeeName, userContext } = {}) {
+  const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
+  if (!isAdmin) {
+    return { error: '⛔ عذراً! كشف رواتب وسلفيات العمال خاص بالإدارة العليا فقط وغير مصرح بالاطلاع عليه.' };
+  }
+
   try {
     let query = `
       SELECT 
@@ -422,7 +476,12 @@ async function getPayrollSummary({ employeeName } = {}) {
 /**
  * 6. External Debts and Suppliers Summary (الديون ومستحقات الموردين)
  */
-async function getDebtsSummary({ creditorName } = {}) {
+async function getDebtsSummary({ creditorName, userContext } = {}) {
+  const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
+  if (!isAdmin) {
+    return { error: '⛔ عذراً! كشف المديونيات وحسابات الموردين خاص بالإدارة العليا فقط وغير مصرح بالاطلاع عليه.' };
+  }
+
   try {
     let query = `
       SELECT 
@@ -479,11 +538,16 @@ async function getDebtsSummary({ creditorName } = {}) {
 /**
  * 7. Executive General Overview (نظرة تنفيذية شاملة وموجزة)
  */
-async function getExecutiveDailyOverview() {
+async function getExecutiveDailyOverview({ userContext } = {}) {
+  const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
+  if (!isAdmin) {
+    return { error: '⛔ عذراً! النظرة التنفيذية الشاملة خاصة بالإدارة العليا فقط.' };
+  }
+
   const [cash, sales, debts, stagnant] = await Promise.all([
-    getCashAndTreasurySummary(),
-    getSalesAndProfits(),
-    getDebtsSummary(),
+    getCashAndTreasurySummary({ userContext }),
+    getSalesAndProfits({ userContext }),
+    getDebtsSummary({ userContext }),
     getStagnantStock({ limit: 5 }),
   ]);
 
@@ -512,6 +576,101 @@ async function getExecutiveDailyOverview() {
   };
 }
 
+/**
+ * 8. Search Product Stock & Inventory Details (استعلام وبحث رصيد صنف محدد بالفروع)
+ */
+async function searchProductStock({ query, barcode, branchId, userContext } = {}) {
+  const searchTerm = (barcode || query || '').trim();
+  if (!searchTerm) {
+    return { error: 'برجاء كتابة اسم الصنف أو الباركود للاستعلام عن رصيده.' };
+  }
+
+  const isAdmin = userContext ? Boolean(userContext.isAdmin) : true;
+  const userBranch = userContext?.branchId ? Number(userContext.branchId) : null;
+  const effectiveBranch = (!isAdmin && userBranch) ? userBranch : (Number(branchId) || null);
+
+  try {
+    const sql = `
+      SELECT 
+        p.id,
+        p.name,
+        p.barcode,
+        p.manufacturer,
+        p.model,
+        p.color,
+        COALESCE(p.retail_package, p.wholesale_package, 'قطعة') as package_type,
+        COALESCE(p.retail_price, 0) as retail_price,
+        COALESCE(p.wholesale_price, 0) as wholesale_price,
+        COALESCE(p.purchase_price, 0) as purchase_price,
+        COALESCE(SUM(s.quantity), 0) as total_stock,
+        COALESCE(SUM(CASE WHEN s.branch_id = 1 THEN s.quantity ELSE 0 END), 0) as showroom_stock,
+        COALESCE(SUM(CASE WHEN s.branch_id = 2 THEN s.quantity ELSE 0 END), 0) as warehouse_stock,
+        COALESCE(SUM(CASE WHEN s.branch_id = 3 THEN s.quantity ELSE 0 END), 0) as branch3_stock
+      FROM products p
+      LEFT JOIN stock s ON s.product_id = p.id
+      WHERE p.is_active IS NOT FALSE
+        AND (
+          p.name ILIKE $1 
+          OR p.barcode ILIKE $1 
+          OR p.manufacturer ILIKE $1 
+          OR p.model ILIKE $1
+        )
+      GROUP BY p.id, p.name, p.barcode, p.manufacturer, p.model, p.color, p.retail_package, p.wholesale_package, p.retail_price, p.wholesale_price, p.purchase_price
+      ORDER BY total_stock DESC
+      LIMIT 8
+    `;
+
+    const res = await pool.query(sql, [`%${searchTerm}%`]);
+    if (res.rows.length === 0) {
+      return {
+        message: `لم يتم العثور على أي صنف يطابق "${searchTerm}" في النظام. برجاء التأكد من اسم الصنف أو الباركود.`,
+        productsFound: [],
+      };
+    }
+
+    return {
+      searchTerm,
+      matchedProductsCount: res.rows.length,
+      products: res.rows.map(r => {
+        const item = {
+          id: r.id,
+          name: r.name,
+          barcode: r.barcode || '-',
+          manufacturer: r.manufacturer || 'عام',
+          package: r.package_type,
+          retailPrice: formatMoney(r.retail_price),
+          wholesalePrice: formatMoney(r.wholesale_price),
+        };
+
+        if (isAdmin) {
+          item.purchasePrice = formatMoney(r.purchase_price);
+          item.totalStockAllBranches = Number(r.total_stock);
+          item.stockByBranch = {
+            showroomBranch1: Number(r.showroom_stock),
+            warehouseBranch2: Number(r.warehouse_stock),
+            branch3: Number(r.branch3_stock),
+          };
+        } else if (effectiveBranch === 1) {
+          // Showroom user
+          item.stockInShowroom = Number(r.showroom_stock);
+          item.warehouseAvailability = Number(r.warehouse_stock) > 0 ? `متوفر في المخزن الرئيسي (${r.warehouse_stock} قطعة للتحويل)` : 'غير متوفر بالمخزن';
+        } else if (effectiveBranch === 2) {
+          // Warehouse user
+          item.stockInWarehouse = Number(r.warehouse_stock);
+          item.stockInShowroom = Number(r.showroom_stock);
+        } else {
+          item.currentStock = Number(r.total_stock);
+        }
+
+        return item;
+      }),
+    };
+  } catch (error) {
+    console.error('[Quaz AI Tool] searchProductStock error:', error);
+    return { error: `فشل استعلام رصيد الصنف: ${error.message}` };
+  }
+}
+
 module.exports = {
   getCashAndTreasurySummary,
   getSalesAndProfits,
@@ -520,5 +679,6 @@ module.exports = {
   getPayrollSummary,
   getDebtsSummary,
   getExecutiveDailyOverview,
+  searchProductStock,
   getCairoToday,
 };

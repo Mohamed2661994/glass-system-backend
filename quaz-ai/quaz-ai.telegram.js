@@ -15,6 +15,7 @@ const TELEGRAM_KEYBOARD = {
   keyboard: [
     [{ text: '💰 نقدية الخزينة اليوم' }, { text: '📊 مبيعات وأرباح اليوم' }],
     [{ text: '🔥 راكد المخزن للعروض' }, { text: '⚠️ نواقص المخزن الحرجة' }],
+    [{ text: '🏬 تفاصيل المعرض' }, { text: '📦 تفاصيل المخزن' }, { text: '🏢 الاثنين معاً' }],
     [{ text: '👥 سلفيات ورواتب العمال' }, { text: '📋 كشف ديون الموردين' }],
   ],
   resize_keyboard: true,
@@ -158,6 +159,15 @@ async function handleTelegramMessage(message) {
   // Show "typing..." status while processing
   await sendChatAction(chatId, 'typing');
 
+  // Telegram is strictly authenticated for the Master Admin (المهندس خالد)
+  const userContext = {
+    id: 1,
+    username: 'المهندس خالد',
+    role: 'admin',
+    isAdmin: true,
+    isTelegram: true,
+  };
+
   // Case 1: Voice Note or Audio Message
   const audioMsg = message.voice || message.audio;
   if (audioMsg) {
@@ -168,7 +178,7 @@ async function handleTelegramMessage(message) {
         const audioBuffer = await downloadTelegramFile(fileInfo.file_path);
         const mimeType = audioMsg.mime_type || (message.voice ? 'audio/ogg' : 'audio/mp3');
         const caption = message.caption ? `ملاحظة إضافية مع الصوت: ${message.caption}` : '';
-        const reply = await engine.processVoicePrompt(audioBuffer, mimeType, caption);
+        const reply = await engine.processVoicePrompt(audioBuffer, mimeType, caption, userContext);
         await sendTelegramMessage(chatId, reply);
         return;
       }
@@ -192,6 +202,12 @@ async function handleTelegramMessage(message) {
       promptToProcess = 'اعرض لي عينة من الأصناف الراكدة التي لها رصيد فعلي بالمخزن ورأس المال المجمد واقترح لي عروض عليها';
     } else if (text === '⚠️ نواقص المخزن الحرجة') {
       promptToProcess = 'اعرض لي الأصناف التي نفذت من المخزن أو رصيدها حرج أقل من 5 قطع';
+    } else if (text === '🏬 تفاصيل المعرض') {
+      promptToProcess = 'اعرض لي تقرير مفصل عن حركة فرع المعرض فقط (الخزينة والدرج والمبيعات والرصيد)';
+    } else if (text === '📦 تفاصيل المخزن') {
+      promptToProcess = 'اعرض لي تقرير مفصل عن حركة فرع المخزن الرئيسي فقط (الخزينة وحركة البضاعة والراكد)';
+    } else if (text === '🏢 الاثنين معاً') {
+      promptToProcess = 'اعرض لي مقارنة شاملة ومجمعة لفرع المعرض والمخزن الرئيسي معاً لإجمالي حركة الشركة';
     } else if (text === '👥 سلفيات ورواتب العمال') {
       promptToProcess = 'اعرض لي كشف رواتب وسلفيات العمال النشطين في الفروع';
     } else if (text === '📋 كشف ديون الموردين') {
@@ -199,7 +215,7 @@ async function handleTelegramMessage(message) {
     }
 
     try {
-      const responseText = await engine.processUserPrompt(promptToProcess);
+      const responseText = await engine.processUserPrompt(promptToProcess, [], userContext);
       await sendTelegramMessage(chatId, responseText);
     } catch (err) {
       console.error('[Quaz AI Telegram] Processing error:', err);

@@ -24,7 +24,16 @@ router.post('/chat', async (req, res) => {
       return res.status(400).json({ error: 'الرسالة مطلوبة' });
     }
 
-    const reply = await engine.processUserPrompt(message, history || []);
+    // Extract authenticated user context & branch role
+    const userContext = {
+      id: req.user?.id,
+      username: req.user?.username || req.user?.full_name,
+      role: req.user?.role || 'user',
+      branchId: req.user?.branch_id,
+      isAdmin: req.user?.role === 'admin',
+    };
+
+    const reply = await engine.processUserPrompt(message, history || [], userContext);
     res.json({
       success: true,
       reply,
@@ -50,8 +59,16 @@ router.post('/voice', express.json({ limit: '25mb' }), async (req, res) => {
       return res.status(400).json({ error: 'ملف الصوت مطلوب' });
     }
 
+    const userContext = {
+      id: req.user?.id,
+      username: req.user?.username || req.user?.full_name,
+      role: req.user?.role || 'user',
+      branchId: req.user?.branch_id,
+      isAdmin: req.user?.role === 'admin',
+    };
+
     const audioBuffer = Buffer.from(audio, 'base64');
-    const reply = await engine.processVoicePrompt(audioBuffer, mimeType || 'audio/webm');
+    const reply = await engine.processVoicePrompt(audioBuffer, mimeType || 'audio/webm', '', userContext);
     res.json({
       success: true,
       reply,
