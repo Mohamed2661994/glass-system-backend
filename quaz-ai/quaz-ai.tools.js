@@ -222,28 +222,49 @@ async function getSalesAndProfits({ date, startDate, endDate, branchId, userCont
     }
     const invRes = await pool.query(query, params);
     const summary = invRes.rows[0] || {};
+    const actualSales = Number(summary.gross_sales || 0);
 
-    // Estimated profit from invoice items
-    let profitQuery = `
+    // Cost of goods sold (COGS / رأس المال) identical to analytical report formula
+    let cogsQuery = `
       SELECT 
-        COALESCE(SUM(ii.price * ii.quantity), 0) as total_sales_items,
-        COALESCE(SUM(ii.cost_price * ii.quantity), 0) as total_cost_items
+        COALESCE(SUM(
+          CASE WHEN COALESCE(ii.is_return, false)
+            THEN -(COALESCE(ii.quantity, 0) * COALESCE(ii.cost_price, p.retail_purchase_price, p.purchase_price, 0))
+          ELSE COALESCE(ii.quantity, 0) * COALESCE(ii.cost_price, p.retail_purchase_price, p.purchase_price, 0) END
+        ), 0) as total_cost_items
       FROM invoice_items ii
       JOIN invoices inv ON inv.id = ii.invoice_id
+      JOIN products p ON p.id = ii.product_id
       WHERE inv.movement_type = 'sale'
         AND inv.is_void IS NOT TRUE
         AND inv.invoice_date BETWEEN $1 AND $2
     `;
-    const profitParams = [start, end];
+    const cogsParams = [start, end];
     if (branchFilter) {
-      profitQuery += ` AND inv.branch_id = $3`;
-      profitParams.push(branchFilter);
+      cogsQuery += ` AND inv.branch_id = $3`;
+      cogsParams.push(branchFilter);
     }
-    const profitRes = await pool.query(profitQuery, profitParams);
-    const itemSales = Number(profitRes.rows[0]?.total_sales_items || 0);
-    const itemCost = Number(profitRes.rows[0]?.total_cost_items || 0);
-    const netProfit = itemSales - itemCost;
-    const profitMargin = itemSales > 0 ? ((netProfit / itemSales) * 100).toFixed(1) + '%' : '0%';
+    const cogsRes = await pool.query(cogsQuery, cogsParams);
+    const itemCost = Number(cogsRes.rows[0]?.total_cost_items || 0);
+    const grossProfit = actualSales - itemCost;
+    const profitMargin = actualSales > 0 ? ((grossProfit / actualSales) * 100).toFixed(2) + '%' : '0%';
+
+    // Operating expenses from cash_out (entry_type = 'expense')
+    let expQuery = `
+      SELECT COALESCE(SUM(amount), 0) as total_expenses
+      FROM cash_out
+      WHERE transaction_date BETWEEN $1 AND $2
+        AND entry_type = 'expense'
+    `;
+    const expParams = [start, end];
+    if (branchFilter) {
+      expQuery += ` AND branch_id = $3`;
+      expParams.push(branchFilter);
+    }
+    const expRes = await pool.query(expQuery, expParams);
+    const totalExpenses = Number(expRes.rows[0]?.total_expenses || 0);
+    const netProfitAfterExpenses = grossProfit - totalExpenses;
+    const netMarginAfterExpenses = actualSales > 0 ? ((netProfitAfterExpenses / actualSales) * 100).toFixed(2) + '%' : '0%';
 
     // Top 5 selling items
     let topQuery = `
@@ -269,7 +290,7 @@ async function getSalesAndProfits({ date, startDate, endDate, branchId, userCont
     const result = {
       period: start === end ? `تاريخ ${start}` : `الفترة من ${start} إلى ${end}`,
       totalInvoicesCount: Number(summary.total_invoices || 0),
-      grossSales: formatMoney(summary.gross_sales),
+      grossSales: formatMoney(actualSales),
       collectedCash: formatMoney(summary.collected_cash),
       topSellingProducts: topRes.rows.map(r => ({
         product: r.product_name,
@@ -280,8 +301,13 @@ async function getSalesAndProfits({ date, startDate, endDate, branchId, userCont
 
     if (isAdmin) {
       result.creditDebtOnCustomers = formatMoney(summary.credit_debt);
-      result.estimatedNetProfit = formatMoney(netProfit);
+      result.costOfGoodsSold = formatMoney(itemCost);
+      result.grossProfit = formatMoney(grossProfit);
+      result.estimatedNetProfit = formatMoney(grossProfit); // backward compatibility
       result.profitMarginPercent = profitMargin;
+      result.operatingExpenses = formatMoney(totalExpenses);
+      result.netProfitAfterExpenses = formatMoney(netProfitAfterExpenses);
+      result.netMarginAfterExpenses = netMarginAfterExpenses;
     }
 
     return result;
