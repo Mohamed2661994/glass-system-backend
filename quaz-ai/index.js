@@ -37,21 +37,11 @@ router.post('/chat', async (req, res) => {
 
     const reply = await engine.processUserPrompt(message, history || [], userContext);
 
-    // Generate natural Egyptian Neural Voice audio in parallel
-    let audioBase64 = null;
-    try {
-      const audioBuffer = await tts.synthesizeEgyptianSpeech(reply);
-      if (audioBuffer) {
-        audioBase64 = audioBuffer.toString('base64');
-      }
-    } catch (ttsErr) {
-      console.warn('[Quaz AI Web API] TTS generation skipped:', ttsErr.message);
-    }
-
+    // Ultra-fast decoupled response (< 2s): return text immediately without blocking on TTS
     res.json({
       success: true,
       reply,
-      audioBase64,
+      audioBase64: null,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
