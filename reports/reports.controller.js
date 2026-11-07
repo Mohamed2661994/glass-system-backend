@@ -2042,6 +2042,7 @@ exports.getWarehouseAccount = async (req, res) => {
         ci.amount
       FROM cash_in ci
       WHERE ci.source_type = 'warehouse_settlement'
+        AND ci.branch_id = 1
         ${refundsDateCond}
       ORDER BY ci.transaction_date ASC, ci.id ASC
       `,
@@ -3314,6 +3315,9 @@ exports.getManufacturerAnalytics = async (req, res) => {
           break;
         case "stagnant":
           allProductRows = allProductRows.filter((r) => r.sold_quantity === 0);
+          break;
+        case "stagnant_in_stock":
+          allProductRows = allProductRows.filter((r) => r.sold_quantity === 0 && r.current_stock_qty > 0);
           break;
         case "profitable":
           allProductRows = allProductRows.filter((r) => r.net_profit > 0);

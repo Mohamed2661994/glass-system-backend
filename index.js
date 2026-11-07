@@ -10074,6 +10074,62 @@ app.post("/cash/out", authMiddleware, async (req, res) => {
       }
     }
 
+    // 🏢 Automatic Inter-Branch Settlement Posting:
+    // When Showroom (Branch 1) records cash_out with "warehouse_settlement",
+    // automatically and immediately create matching cash_in in Warehouse (Branch 2).
+    if (safeEntryType === "warehouse_settlement") {
+      try {
+        const targetBranchId = Number(branch_id) === 1 ? 2 : 1;
+        const targetCustomerName = Number(branch_id) === 1 ? "فرع المعرض" : "فرع المخزن";
+        const autoDesc = `وارد من ${targetCustomerName} (سداد للمخزن) - إذن صرف رقم #${permissionNumber}`;
+        const autoNotes = notes ? `${notes} (مرتبط بإذن صرف #${permissionNumber})` : `مرتبط بإذن صرف رقم #${permissionNumber}`;
+
+        const autoInRes = await pool.query(
+          `
+          INSERT INTO cash_in
+          (
+            branch_id,
+            transaction_date,
+            source_type,
+            customer_name,
+            description,
+            amount,
+            paid_amount,
+            remaining_amount,
+            notes,
+            cash_out_id
+          )
+          VALUES ($1, $2, 'showroom_settlement', $3, $4, $5, $6, 0, $7, $8)
+          RETURNING id
+          `,
+          [
+            targetBranchId,
+            date,
+            targetCustomerName,
+            autoDesc,
+            Number(amount),
+            Number(amount),
+            autoNotes,
+            cashOutId,
+          ]
+        );
+
+        const broadcast = req.app?.get("broadcastRealtime");
+        if (typeof broadcast === "function") {
+          broadcast("data:cash", {
+            action: "cash_in_created",
+            id: autoInRes.rows[0]?.id,
+            branch_id: targetBranchId,
+            source_type: "showroom_settlement",
+            amount: Number(amount),
+            ts: Date.now(),
+          });
+        }
+      } catch (autoErr) {
+        console.error("Error auto-creating matching cash_in for warehouse settlement:", autoErr);
+      }
+    }
+
     res.json({
       success: true,
       id: cashOutId,
@@ -10165,6 +10221,89 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
       } catch (dErr) {
         console.error("Error re-linking cash_out to debt payment:", dErr);
       }
+    }
+
+    // 🏢 Synchronize linked cash_in for warehouse settlement
+    try {
+      const permNum = result.rows[0]?.permission_number || id;
+      const targetBranchId = Number(branch_id) === 1 ? 2 : 1;
+      const targetCustomerName = Number(branch_id) === 1 ? "فرع المعرض" : "فرع المخزن";
+      const autoDesc = `وارد من ${targetCustomerName} (سداد للمخزن) - إذن صرف رقم #${permNum}`;
+      const autoNotes = notes ? `${notes} (مرتبط بإذن صرف #${permNum})` : `مرتبط بإذن صرف رقم #${permNum}`;
+
+      if (safeEntryType === "warehouse_settlement") {
+        const existingIn = await pool.query(`SELECT id FROM cash_in WHERE cash_out_id = $1`, [id]);
+        if (existingIn.rows.length > 0) {
+          await pool.query(
+            `
+            UPDATE cash_in
+            SET
+              branch_id = $1,
+              transaction_date = $2,
+              amount = $3,
+              paid_amount = $3,
+              remaining_amount = 0,
+              customer_name = $4,
+              description = $5,
+              notes = $6
+            WHERE cash_out_id = $7
+            `,
+            [targetBranchId, date, Number(amount), targetCustomerName, autoDesc, autoNotes, id]
+          );
+        } else {
+          await pool.query(
+            `
+            INSERT INTO cash_in
+            (
+              branch_id,
+              transaction_date,
+              source_type,
+              customer_name,
+              description,
+              amount,
+              paid_amount,
+              remaining_amount,
+              notes,
+              cash_out_id
+            )
+            VALUES ($1, $2, 'showroom_settlement', $3, $4, $5, $6, 0, $7, $8)
+            `,
+            [targetBranchId, date, targetCustomerName, autoDesc, Number(amount), Number(amount), autoNotes, id]
+          );
+        }
+
+        const broadcast = req.app?.get("broadcastRealtime");
+        if (typeof broadcast === "function") {
+          broadcast("data:cash", {
+            action: "cash_in_updated",
+            cash_out_id: Number(id),
+            branch_id: targetBranchId,
+            source_type: "showroom_settlement",
+            amount: Number(amount),
+            ts: Date.now(),
+          });
+        }
+      } else {
+        // If entry_type was changed away from warehouse_settlement, delete linked cash_in
+        const deletedIn = await pool.query(
+          `DELETE FROM cash_in WHERE cash_out_id = $1 RETURNING id, branch_id`,
+          [id]
+        );
+        if (deletedIn.rows.length > 0) {
+          const broadcast = req.app?.get("broadcastRealtime");
+          if (typeof broadcast === "function") {
+            broadcast("data:cash", {
+              action: "cash_in_deleted",
+              id: deletedIn.rows[0].id,
+              cash_out_id: Number(id),
+              branch_id: deletedIn.rows[0].branch_id,
+              ts: Date.now(),
+            });
+          }
+        }
+      }
+    } catch (syncErr) {
+      console.error("Error syncing linked cash_in on cash_out update:", syncErr);
     }
 
     res.json({
@@ -10434,6 +10573,12 @@ app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
       [id, branch_id],
     );
 
+    // 2.5 Delete any linked cash_in (e.g. showroom settlement in warehouse)
+    const linkedCashIn = await client.query(
+      `DELETE FROM cash_in WHERE cash_out_id = $1 RETURNING id, branch_id`,
+      [id],
+    );
+
     // 3. Delete the cash_out record
     const result = await client.query(
       `DELETE FROM cash_out WHERE id=$1 AND branch_id=$2 RETURNING id`,
@@ -10455,6 +10600,16 @@ app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
       broadcast("data:cash", { action: "cash_out_deleted", id, branch_id, ts: Date.now() });
       if (linkedPayroll.rows.length > 0) {
         broadcast("data:payroll", { action: "payroll_reverted", branch_id, ts: Date.now() });
+      }
+      if (linkedCashIn.rows.length > 0) {
+        linkedCashIn.rows.forEach((r) => {
+          broadcast("data:cash", {
+            action: "cash_in_deleted",
+            id: r.id,
+            branch_id: r.branch_id,
+            ts: Date.now(),
+          });
+        });
       }
     }
 
@@ -10654,6 +10809,7 @@ app.get("/cash-in", authMiddleware, async (req, res) => {
         to_char(ci.transaction_date, 'YYYY-MM-DD') AS transaction_date,
         ci.source_type,
         ci.invoice_id,
+        ci.cash_out_id,
         ci.created_at,
         inv.invoice_source,
         inv.external_order_id
@@ -10701,12 +10857,19 @@ app.delete("/cash-in/:id", authMiddleware, async (req, res) => {
     await client.query("BEGIN");
 
     const checkRes = await client.query(
-      `SELECT id FROM cash_in WHERE id = $1 AND branch_id = $2`,
+      `SELECT id, source_type, cash_out_id FROM cash_in WHERE id = $1 AND branch_id = $2`,
       [id, branch_id],
     );
 
     if (!checkRes.rows.length) {
       return res.status(404).json({ error: "القيد غير موجود" });
+    }
+
+    if (checkRes.rows[0].cash_out_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "هذا الوارد مرتبط تلقائياً بإذن صرف سداد من فرع المعرض. لإلغائه يرجى حذف إذن الصرف الأصلي من المعرض."
+      });
     }
 
     await client.query(`DELETE FROM cash_in WHERE id = $1 AND branch_id = $2`, [
@@ -10743,7 +10906,7 @@ app.put("/cash-in/:id", authMiddleware, async (req, res) => {
 
     const checkRes = await client.query(
       `
-      SELECT id, source_type
+      SELECT id, source_type, cash_out_id
       FROM cash_in
       WHERE id = $1 AND branch_id = $2
       `,
@@ -10752,6 +10915,13 @@ app.put("/cash-in/:id", authMiddleware, async (req, res) => {
 
     if (!checkRes.rows.length) {
       return res.status(403).json({ error: "غير مسموح بالتعديل" });
+    }
+
+    if (checkRes.rows[0].cash_out_id) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "هذا الوارد مرتبط تلقائياً بإذن صرف سداد من فرع المعرض. لتعديل قيمته يرجى تعديل إذن الصرف الأصلي من المعرض."
+      });
     }
 
     const sourceType = checkRes.rows[0].source_type;
@@ -10823,6 +10993,7 @@ app.get("/cash-in/:id", authMiddleware, async (req, res) => {
         to_char(ci.transaction_date, 'YYYY-MM-DD') AS transaction_date,
         ci.source_type,
         ci.invoice_id,
+        ci.cash_out_id,
         ci.created_at,
         inv.invoice_source,
         inv.external_order_id
@@ -14311,6 +14482,13 @@ async function runStartupMigrations() {
         CREATE INDEX IF NOT EXISTS idx_payroll_att_branch_date ON payroll_attendance(branch_id, attendance_date);
         CREATE INDEX IF NOT EXISTS idx_payroll_rec_emp ON payroll_records(employee_id, payment_status);
         CREATE INDEX IF NOT EXISTS idx_payroll_adv_emp ON payroll_advances(employee_id, status);
+      `,
+    },
+    {
+      name: "cash_in.cash_out_id.link",
+      sql: `
+        ALTER TABLE cash_in ADD COLUMN IF NOT EXISTS cash_out_id INTEGER;
+        CREATE INDEX IF NOT EXISTS idx_cash_in_cash_out_id ON cash_in(cash_out_id);
       `,
     },
   ];
