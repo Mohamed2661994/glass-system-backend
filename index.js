@@ -1799,6 +1799,21 @@ pool
         ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id)
     `,
     );
+
+    // جدول اعتماد الموردين حسب الفرع (معزول لكل فرع)
+    await runStartupSqlOnAllPools(
+      "supplier_branch_verifications table ready",
+      `
+      CREATE TABLE IF NOT EXISTS supplier_branch_verifications (
+        branch_id INTEGER NOT NULL,
+        supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+        is_verified BOOLEAN NOT NULL DEFAULT true,
+        verified_by INTEGER,
+        verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (branch_id, supplier_id)
+      )
+    `,
+    );
   } catch (e) {
     console.error("❌ suppliers migration error:", e.message);
   }
@@ -3648,31 +3663,121 @@ function normalizePartyWhitespace(value) {
     .replace(/\s+/g, " ");
 }
 
-async function resolveSupplierForInvoice(client, rawName, supplierPhone) {
+function normalizeArabicSupplierText(value) {
+  return normalizePartyWhitespace(value)
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    .replace(/[أإآٱ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ة/g, "ه");
+}
+
+function escapeSqlLike(value) {
+  return String(value || "").replace(/[\\%_]/g, "\\$&");
+}
+
+const SUPPLIER_NAME_NORM_SQL =
+  "translate(regexp_replace(BTRIM(s.name), '\\s+', ' ', 'g'), 'أإآٱىة', 'اااايه')";
+
+let supplierVerificationsTablePromise = null;
+function ensureSupplierVerificationsTable() {
+  if (!supplierVerificationsTablePromise) {
+    supplierVerificationsTablePromise = pool
+      .query(
+        `
+        CREATE TABLE IF NOT EXISTS supplier_branch_verifications (
+          branch_id INTEGER NOT NULL,
+          supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+          is_verified BOOLEAN NOT NULL DEFAULT true,
+          verified_by INTEGER,
+          verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (branch_id, supplier_id)
+        )
+        `,
+      )
+      .catch((err) => {
+        supplierVerificationsTablePromise = null;
+        throw err;
+      });
+  }
+  return supplierVerificationsTablePromise;
+}
+
+async function resolveSupplierForInvoice(
+  client,
+  rawName,
+  supplierPhone,
+  preferredSupplierId = null,
+  branchId = null,
+) {
   const cleanName = normalizePartyWhitespace(rawName);
   if (!cleanName) {
     return { id: null, name: null };
   }
 
-  const existingSupplier = await client.query(
-    `
-    SELECT id, name
-    FROM suppliers
-    WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1
-    ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END, id ASC
-    LIMIT 1
-    `,
-    [cleanName],
-  );
-
   let sId = null;
   let resolvedName = cleanName;
+  const preferredId = Number(preferredSupplierId || 0);
+  const normInputName = normalizeArabicSupplierText(cleanName);
 
-  if (existingSupplier.rows.length > 0) {
-    sId = existingSupplier.rows[0].id;
-    resolvedName =
-      normalizePartyWhitespace(existingSupplier.rows[0].name) || cleanName;
-  } else {
+  if (Number.isInteger(preferredId) && preferredId > 0) {
+    const preferredRes = await client.query(
+      `SELECT id, name FROM suppliers WHERE id = $1 LIMIT 1`,
+      [preferredId],
+    );
+    if (
+      preferredRes.rows.length > 0 &&
+      normalizeArabicSupplierText(preferredRes.rows[0].name) === normInputName
+    ) {
+      sId = preferredRes.rows[0].id;
+      resolvedName =
+        normalizePartyWhitespace(preferredRes.rows[0].name) || cleanName;
+    }
+  }
+
+  if (!sId) {
+    const existingSupplier = await client.query(
+      `
+      SELECT id, name
+      FROM suppliers
+      WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1
+      ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END, id ASC
+      LIMIT 1
+      `,
+      [cleanName],
+    );
+
+    if (existingSupplier.rows.length > 0) {
+      sId = existingSupplier.rows[0].id;
+      resolvedName =
+        normalizePartyWhitespace(existingSupplier.rows[0].name) || cleanName;
+    }
+  }
+
+  if (!sId && Number(branchId) === 2 && normInputName) {
+    await ensureSupplierVerificationsTable();
+    const verifiedFallback = await client.query(
+      `
+      SELECT s.id, s.name
+      FROM suppliers s
+      INNER JOIN supplier_branch_verifications sbv
+        ON sbv.supplier_id = s.id
+       AND sbv.branch_id = 2
+       AND sbv.is_verified = true
+      WHERE ${SUPPLIER_NAME_NORM_SQL} = $1
+      ORDER BY s.id ASC
+      LIMIT 1
+      `,
+      [normInputName],
+    );
+
+    if (verifiedFallback.rows.length > 0) {
+      sId = verifiedFallback.rows[0].id;
+      resolvedName =
+        normalizePartyWhitespace(verifiedFallback.rows[0].name) || cleanName;
+    }
+  }
+
+  if (!sId) {
     const newSupplier = await client.query(
       `INSERT INTO suppliers (name) VALUES ($1) RETURNING id, name`,
       [cleanName],
@@ -3694,22 +3799,128 @@ async function resolveSupplierForInvoice(client, rawName, supplierPhone) {
 // Search suppliers by name or phone
 app.get("/suppliers/search", async (req, res) => {
   try {
-    const { name } = req.query;
-    if (!name || name.length < 2) return res.json([]);
+    const rawTerm = req.query.name ?? req.query.q ?? "";
+    const cleanTerm = normalizePartyWhitespace(rawTerm);
+    const requestedBranch = Number(
+      req.query.branch_id || req.query.warehouse_id || req.user?.branch_id || 0,
+    );
+    const verifiedOnly =
+      String(req.query.verified_only || "").toLowerCase() === "true";
+
+    await ensureSupplierVerificationsTable();
+
+    const phoneSubquery = `(SELECT phone FROM supplier_phones WHERE supplier_id = s.id ORDER BY id ASC LIMIT 1)`;
+
+    if (requestedBranch === 2) {
+      if (!cleanTerm) {
+        const result = await pool.query(
+          `
+          SELECT s.id,
+                 s.name,
+                 ${phoneSubquery} AS phone,
+                 true AS is_verified,
+                 sbv.verified_at
+          FROM suppliers s
+          INNER JOIN supplier_branch_verifications sbv
+            ON sbv.supplier_id = s.id
+           AND sbv.branch_id = 2
+           AND sbv.is_verified = true
+          ORDER BY s.name ASC
+          LIMIT 50
+          `,
+        );
+        return res.json(result.rows);
+      }
+
+      const normTerm = normalizeArabicSupplierText(cleanTerm);
+      const tokens = normTerm ? normTerm.split(/\s+/).filter(Boolean) : [];
+      const escapedNormTerm = escapeSqlLike(normTerm);
+      const escapedRawTerm = escapeSqlLike(cleanTerm);
+
+      const params = [
+        `%${escapedNormTerm}%`, // $1: normalized name substring
+        `%${escapedRawTerm}%`,  // $2: raw phone substring
+        normTerm,               // $3: normalized exact match
+        `${escapedNormTerm}%`,  // $4: normalized prefix match
+      ];
+
+      let multiTokenClause = "FALSE";
+      if (tokens.length > 1) {
+        const tokenConds = tokens.map((tok) => {
+          params.push(`%${escapeSqlLike(tok)}%`);
+          return `${SUPPLIER_NAME_NORM_SQL} ILIKE $${params.length} ESCAPE '\\'`;
+        });
+        multiTokenClause = `(${tokenConds.join(" AND ")})`;
+      }
+
+      const branchPoolClause = verifiedOnly
+        ? `COALESCE(sbv.is_verified, false) = true`
+        : `(
+            COALESCE(sbv.is_verified, false) = true
+            OR EXISTS (
+              SELECT 1 FROM invoices i
+              WHERE i.supplier_id = s.id
+                AND i.branch_id = 2
+                AND i.is_void IS NOT TRUE
+            )
+            OR EXISTS (
+              SELECT 1 FROM cash_out co
+              WHERE co.supplier_id = s.id
+                AND co.branch_id = 2
+            )
+          )`;
+
+      const result = await pool.query(
+        `
+        SELECT s.id,
+               s.name,
+               ${phoneSubquery} AS phone,
+               COALESCE(sbv.is_verified, false) AS is_verified,
+               sbv.verified_at
+        FROM suppliers s
+        LEFT JOIN supplier_branch_verifications sbv
+          ON sbv.supplier_id = s.id AND sbv.branch_id = 2
+        WHERE ${branchPoolClause}
+          AND (
+            ${SUPPLIER_NAME_NORM_SQL} ILIKE $1 ESCAPE '\\'
+            OR ${multiTokenClause}
+            OR EXISTS (
+              SELECT 1 FROM supplier_phones sp
+              WHERE sp.supplier_id = s.id AND sp.phone ILIKE $2 ESCAPE '\\'
+            )
+          )
+        ORDER BY CASE WHEN COALESCE(sbv.is_verified, false) THEN 0 ELSE 1 END,
+                 CASE
+                   WHEN ${SUPPLIER_NAME_NORM_SQL} = $3 THEN 0
+                   WHEN ${SUPPLIER_NAME_NORM_SQL} ILIKE $4 ESCAPE '\\' THEN 1
+                   ELSE 2
+                 END,
+                 s.name ASC
+        LIMIT 30
+        `,
+        params,
+      );
+
+      return res.json(result.rows);
+    }
+
+    // Legacy search behavior for Branch 1 / non-Branch-2 callers
+    if (!cleanTerm || cleanTerm.length < 2) return res.json([]);
 
     const result = await pool.query(
       `
-      SELECT DISTINCT s.id, s.name,
-             (SELECT phone FROM supplier_phones
-              WHERE supplier_id = s.id
-              ORDER BY id ASC LIMIT 1) AS phone
+      SELECT DISTINCT s.id,
+             s.name,
+             ${phoneSubquery} AS phone,
+             false AS is_verified,
+             NULL::timestamptz AS verified_at
       FROM suppliers s
       LEFT JOIN supplier_phones sp ON sp.supplier_id = s.id
       WHERE s.name ILIKE $1 OR sp.phone ILIKE $1
       ORDER BY s.name
       LIMIT 10
       `,
-      [`%${name}%`],
+      [`%${cleanTerm}%`],
     );
 
     res.json(result.rows);
@@ -3723,8 +3934,63 @@ app.get("/suppliers/search", async (req, res) => {
 app.get("/suppliers", async (req, res) => {
   try {
     const { search } = req.query;
+    const requestedBranch = Number(
+      req.query.branch_id || req.query.warehouse_id || req.user?.branch_id || 0,
+    );
+    const verifiedOnly =
+      String(req.query.verified_only || "").toLowerCase() === "true";
+
+    await ensureSupplierVerificationsTable();
+
+    if (requestedBranch === 2) {
+      let query = `
+        SELECT s.id,
+               s.name,
+               COALESCE(sbv.is_verified, false) AS is_verified,
+               sbv.verified_at,
+               COALESCE(
+                 json_agg(json_build_object('id', sp.id, 'phone', sp.phone))
+                 FILTER (WHERE sp.id IS NOT NULL), '[]'
+               ) AS phones
+        FROM suppliers s
+        LEFT JOIN supplier_phones sp ON sp.supplier_id = s.id
+        LEFT JOIN supplier_branch_verifications sbv
+          ON sbv.supplier_id = s.id AND sbv.branch_id = 2
+      `;
+      const conditions = [];
+      const params = [];
+
+      if (verifiedOnly) {
+        conditions.push(`COALESCE(sbv.is_verified, false) = true`);
+      }
+
+      const cleanSearch = normalizePartyWhitespace(search || "");
+      if (cleanSearch.length >= 1) {
+        const normSearch = normalizeArabicSupplierText(cleanSearch);
+        params.push(`%${escapeSqlLike(normSearch)}%`);
+        const normIdx = params.length;
+        params.push(cleanSearch);
+        const exactIdx = params.length;
+        params.push(`%${escapeSqlLike(cleanSearch)}%`);
+        const rawLikeIdx = params.length;
+        conditions.push(
+          `(${SUPPLIER_NAME_NORM_SQL} ILIKE $${normIdx} ESCAPE '\\' OR s.id::text = $${exactIdx} OR EXISTS (SELECT 1 FROM supplier_phones sp2 WHERE sp2.supplier_id = s.id AND sp2.phone ILIKE $${rawLikeIdx} ESCAPE '\\'))`,
+        );
+      }
+
+      if (conditions.length > 0) {
+        query += ` WHERE ${conditions.join(" AND ")}`;
+      }
+      query += ` GROUP BY s.id, sbv.is_verified, sbv.verified_at ORDER BY CASE WHEN COALESCE(sbv.is_verified, false) THEN 0 ELSE 1 END, s.name ASC`;
+      const result = await pool.query(query, params);
+      return res.json(result.rows);
+    }
+
     let query = `
-      SELECT s.id, s.name,
+      SELECT s.id,
+             s.name,
+             false AS is_verified,
+             NULL::timestamptz AS verified_at,
              COALESCE(
                json_agg(json_build_object('id', sp.id, 'phone', sp.phone))
                FILTER (WHERE sp.id IS NOT NULL), '[]'
@@ -3750,8 +4016,23 @@ app.get("/suppliers", async (req, res) => {
 app.get("/suppliers/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const requestedBranch = Number(
+      req.query.branch_id || req.query.warehouse_id || req.user?.branch_id || 0,
+    );
+    await ensureSupplierVerificationsTable();
+
     const supplierRes = await pool.query(
-      `SELECT id, name FROM suppliers WHERE id = $1`,
+      requestedBranch === 2
+        ? `
+          SELECT s.id, s.name,
+                 COALESCE(sbv.is_verified, false) AS is_verified,
+                 sbv.verified_at
+          FROM suppliers s
+          LEFT JOIN supplier_branch_verifications sbv
+            ON sbv.supplier_id = s.id AND sbv.branch_id = 2
+          WHERE s.id = $1
+          `
+        : `SELECT id, name, false AS is_verified, NULL::timestamptz AS verified_at FROM suppliers WHERE id = $1`,
       [id],
     );
     if (!supplierRes.rows.length)
@@ -3766,6 +4047,76 @@ app.get("/suppliers/:id", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Toggle supplier verification for Main Warehouse (branch_id = 2 ONLY, admin ONLY)
+app.patch("/suppliers/:id/verification", authMiddleware, async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({
+        error: "غير مصرح - يتطلب صلاحيات الإدارة (Admin)",
+      });
+    }
+
+    const branchId = Number(req.body?.branch_id ?? user.branch_id ?? 0);
+    if (branchId !== 2) {
+      return res.status(403).json({
+        error: "اعتماد الموردين متاح لفرع المخزن الرئيسي فقط (branch_id = 2)",
+      });
+    }
+
+    const supplierId = Number(req.params.id);
+    if (!Number.isInteger(supplierId) || supplierId <= 0) {
+      return res.status(400).json({ error: "معرف المورد غير صحيح" });
+    }
+
+    await ensureSupplierVerificationsTable();
+
+    const supRes = await pool.query(
+      `SELECT id, name FROM suppliers WHERE id = $1`,
+      [supplierId],
+    );
+    if (!supRes.rows.length) {
+      return res.status(404).json({ error: "المورد غير موجود" });
+    }
+
+    const nextVerified = req.body?.is_verified !== false;
+
+    const upsertRes = await pool.query(
+      `
+      INSERT INTO supplier_branch_verifications
+        (branch_id, supplier_id, is_verified, verified_by, verified_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (branch_id, supplier_id) DO UPDATE
+      SET is_verified = EXCLUDED.is_verified,
+          verified_by = EXCLUDED.verified_by,
+          verified_at = NOW()
+      RETURNING branch_id, supplier_id, is_verified, verified_at
+      `,
+      [2, supplierId, nextVerified, user.id || null],
+    );
+
+    const io = req.app.get("io");
+    if (io) {
+      io.emit("data:suppliers", {
+        action: "update",
+        supplier_id: supplierId,
+        branch_id: 2,
+        is_verified: nextVerified,
+      });
+    }
+
+    res.json({
+      success: true,
+      supplier_id: supplierId,
+      name: supRes.rows[0].name,
+      ...upsertRes.rows[0],
+    });
+  } catch (err) {
+    console.error("SUPPLIER VERIFICATION ERROR:", err);
+    res.status(500).json({ error: "فشل تحديث حالة اعتماد المورد" });
   }
 });
 
@@ -4443,7 +4794,13 @@ app.post("/invoices", authMiddleware, async (req, res) => {
         if (movement_type !== "purchase" || !supplier_name) {
           return { id: null, name: null };
         }
-        return resolveSupplierForInvoice(client, supplier_name, supplier_phone);
+        return resolveSupplierForInvoice(
+          client,
+          supplier_name,
+          supplier_phone,
+          req.body.supplier_id || null,
+          Number(branch_id) || 2,
+        );
       })(),
     ]);
     const supplierId = supplierResolution.id;
@@ -6082,6 +6439,8 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
         client,
         supplier_name,
         supplier_phone,
+        req.body.supplier_id || null,
+        2,
       );
       supplierId = supplierResolution.id;
       resolvedSupplierName = supplierResolution.name;
