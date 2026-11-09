@@ -10,6 +10,98 @@ async function ensureInvoiceItemsCostPriceColumn() {
   return;
 }
 
+let supplierAdjustmentsTableReadyPromise = null;
+async function ensureSupplierAdjustmentsTable() {
+  if (!supplierAdjustmentsTableReadyPromise) {
+    supplierAdjustmentsTableReadyPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS supplier_adjustments (
+          id SERIAL PRIMARY KEY,
+          branch_id INTEGER NOT NULL,
+          supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+          amount NUMERIC(14, 2) NOT NULL,
+          adjustment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          settlement_type VARCHAR(50) NOT NULL DEFAULT 'balance_settlement',
+          previous_balance_snapshot NUMERIC(14, 2),
+          target_balance NUMERIC(14, 2),
+          notes TEXT,
+          created_by INTEGER,
+          created_by_name VARCHAR(255),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_supplier_adjustments_branch_sup
+          ON supplier_adjustments (branch_id, supplier_id);
+      `);
+    })().catch((err) => {
+      supplierAdjustmentsTableReadyPromise = null;
+      throw err;
+    });
+  }
+  return supplierAdjustmentsTableReadyPromise;
+}
+
+async function computeSupplierBranchBalance(clientOrPool, supplierId, branchId) {
+  await ensureSupplierAdjustmentsTable();
+  const invWhere = branchId
+    ? `supplier_id = $1 AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = $2`
+    : `supplier_id = $1 AND movement_type = 'purchase' AND is_void IS NOT TRUE`;
+  const payWhere = branchId
+    ? `supplier_id = $1 AND entry_type = 'supplier_payment' AND branch_id = $2`
+    : `supplier_id = $1 AND entry_type = 'supplier_payment'`;
+  const adjWhere = branchId
+    ? `supplier_id = $1 AND branch_id = $2`
+    : `supplier_id = $1`;
+  const params = branchId ? [supplierId, branchId] : [supplierId];
+
+  const [invRes, payRes, adjRes, openRes] = await Promise.all([
+    clientOrPool.query(
+      `SELECT COALESCE(SUM(total), 0) AS total_purchases, COALESCE(SUM(paid_amount), 0) AS total_paid_invoices
+       FROM invoices WHERE ${invWhere}`,
+      params,
+    ),
+    clientOrPool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_payments
+       FROM cash_out WHERE ${payWhere}`,
+      params,
+    ),
+    clientOrPool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_adjustments
+       FROM supplier_adjustments WHERE ${adjWhere}`,
+      params,
+    ),
+    clientOrPool.query(
+      `SELECT COALESCE(previous_balance, 0) AS opening_balance
+       FROM invoices WHERE ${invWhere}
+       ORDER BY invoice_date ASC, id ASC LIMIT 1`,
+      params,
+    ),
+  ]);
+
+  const opening_balance = Number(openRes.rows[0]?.opening_balance || 0);
+  const total_purchases = Number(invRes.rows[0]?.total_purchases || 0);
+  const total_paid_invoices = Number(invRes.rows[0]?.total_paid_invoices || 0);
+  const total_payments = Number(payRes.rows[0]?.total_payments || 0);
+  const total_adjustments = Number(adjRes.rows[0]?.total_adjustments || 0);
+  const balance_due =
+    Math.round(
+      (opening_balance +
+        total_purchases -
+        total_paid_invoices -
+        total_payments +
+        total_adjustments) *
+        100,
+    ) / 100;
+
+  return {
+    opening_balance,
+    total_purchases,
+    total_paid_invoices,
+    total_payments,
+    total_adjustments,
+    balance_due,
+  };
+}
+
 /* ===============================
    📦 تقرير جرد المخزن الشامل
    وارد + منصرف + رصيد حالي
@@ -1638,6 +1730,7 @@ exports.getCustomerDebtDetails = async (req, res) => {
 
 exports.getSupplierBalances = async (req, res) => {
   try {
+    await ensureSupplierAdjustmentsTable();
     const { supplier_name, warehouse_id } = req.query;
 
     let conditions = [];
@@ -1646,6 +1739,7 @@ exports.getSupplierBalances = async (req, res) => {
       "entry_type = 'supplier_payment'",
       "supplier_id IS NOT NULL",
     ];
+    let adjConditions = ["supplier_id IS NOT NULL"];
     let cteConditions = [
       "movement_type = 'purchase'",
       "is_void IS NOT TRUE",
@@ -1663,11 +1757,13 @@ exports.getSupplierBalances = async (req, res) => {
       const p = `$${idx++}`;
       invConditions.push(`branch_id = ${p}`);
       payConditions.push(`branch_id = ${p}`);
+      adjConditions.push(`branch_id = ${p}`);
       cteConditions.push(`branch_id = ${p}`);
       // Only show suppliers that have activity in this branch
       conditions.push(
         `(EXISTS (SELECT 1 FROM invoices WHERE supplier_id = s.id AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = ${p})
-          OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND branch_id = ${p}))`,
+          OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND branch_id = ${p})
+          OR EXISTS (SELECT 1 FROM supplier_adjustments WHERE supplier_id = s.id AND branch_id = ${p}))`,
       );
       values.push(warehouse_id);
     }
@@ -1676,6 +1772,7 @@ exports.getSupplierBalances = async (req, res) => {
       conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const invWhere = invConditions.join(" AND ");
     const payWhere = payConditions.join(" AND ");
+    const adjWhere = adjConditions.join(" AND ");
     const cteWhere = cteConditions.join(" AND ");
 
     const result = await pool.query(
@@ -1694,11 +1791,13 @@ exports.getSupplierBalances = async (req, res) => {
         COALESCE(inv.total_purchases, 0) AS total_purchases,
         COALESCE(inv.total_paid_invoices, 0) AS total_paid_invoices,
         COALESCE(pay.total_payments, 0) AS total_payments,
+        COALESCE(adj.total_adjustments, 0) AS total_adjustments,
         COALESCE(o.opening_balance, 0) AS opening_balance,
         COALESCE(o.opening_balance, 0)
           + COALESCE(inv.total_purchases, 0)
           - COALESCE(inv.total_paid_invoices, 0)
           - COALESCE(pay.total_payments, 0)
+          + COALESCE(adj.total_adjustments, 0)
         AS balance_due,
         inv.last_invoice_date
       FROM suppliers s
@@ -1720,6 +1819,14 @@ exports.getSupplierBalances = async (req, res) => {
         WHERE ${payWhere}
         GROUP BY supplier_id
       ) pay ON pay.supplier_id = s.id
+      LEFT JOIN (
+        SELECT
+          supplier_id,
+          SUM(amount) AS total_adjustments
+        FROM supplier_adjustments
+        WHERE ${adjWhere}
+        GROUP BY supplier_id
+      ) adj ON adj.supplier_id = s.id
       LEFT JOIN opening o ON o.supplier_id = s.id
       ${whereClause}
       ORDER BY balance_due DESC, s.name ASC
@@ -1933,6 +2040,7 @@ exports.setWarehouseAccountOpening = async (req, res) => {
 
 exports.getSupplierDebtDetails = async (req, res) => {
   try {
+    await ensureSupplierAdjustmentsTable();
     const { supplier_id, from, to, warehouse_id } = req.query;
 
     if (!supplier_id) {
@@ -1944,65 +2052,97 @@ exports.getSupplierDebtDetails = async (req, res) => {
       "i.movement_type = 'purchase'",
       "i.is_void IS NOT TRUE",
     ];
-    let paymentExtra = "";
+    let paymentConditions = [
+      "co.supplier_id = $1",
+      "co.entry_type = 'supplier_payment'",
+    ];
+    let adjustmentConditions = ["sa.supplier_id = $1"];
     let values = [supplier_id];
     let idx = 2;
 
     if (warehouse_id) {
-      invoiceConditions.push(`i.branch_id = $${idx}`);
-      paymentExtra += ` AND co.branch_id = $${idx}`;
+      const p = `$${idx++}`;
+      invoiceConditions.push(`i.branch_id = ${p}`);
+      paymentConditions.push(`co.branch_id = ${p}`);
+      adjustmentConditions.push(`sa.branch_id = ${p}`);
       values.push(warehouse_id);
-      idx++;
     }
 
     if (from) {
-      invoiceConditions.push(`i.invoice_date >= $${idx++}`);
+      const p = `$${idx++}`;
+      invoiceConditions.push(`i.invoice_date >= ${p}`);
+      paymentConditions.push(`co.transaction_date >= ${p}`);
+      adjustmentConditions.push(`sa.adjustment_date >= ${p}`);
       values.push(from);
     }
     if (to) {
-      invoiceConditions.push(`i.invoice_date <= $${idx++}`);
+      const p = `$${idx++}`;
+      invoiceConditions.push(`i.invoice_date <= ${p}`);
+      paymentConditions.push(`co.transaction_date <= ${p}`);
+      adjustmentConditions.push(`sa.adjustment_date <= ${p}`);
       values.push(to);
     }
 
     const invoiceWhere = `WHERE ${invoiceConditions.join(" AND ")}`;
+    const paymentWhere = `WHERE ${paymentConditions.join(" AND ")}`;
+    const adjustmentWhere = `WHERE ${adjustmentConditions.join(" AND ")}`;
 
     const result = await pool.query(
       `
-      -- فواتير مشتريات
-      SELECT
-        'invoice' AS record_type,
-        i.id AS record_id,
-        i.invoice_date AS record_date,
-        i.total,
-        i.paid_amount,
-        i.remaining_amount,
-        COALESCE(i.previous_balance, 0) AS previous_balance,
-        NULL AS notes,
-        NULL AS permission_number
-      FROM invoices i
-      ${invoiceWhere}
+      SELECT * FROM (
+        -- فواتير مشتريات
+        SELECT
+          'invoice' AS record_type,
+          i.id AS record_id,
+          i.invoice_date AS record_date,
+          i.total,
+          i.paid_amount,
+          i.remaining_amount,
+          COALESCE(i.previous_balance, 0) AS previous_balance,
+          NULL AS notes,
+          NULL AS permission_number,
+          0::numeric AS adjustment_amount
+        FROM invoices i
+        ${invoiceWhere}
 
-      UNION ALL
+        UNION ALL
 
-      -- دفعات المورد
-      SELECT
-        'payment' AS record_type,
-        co.id AS record_id,
-        co.transaction_date AS record_date,
-        0 AS total,
-        co.amount AS paid_amount,
-        0 AS remaining_amount,
-        0 AS previous_balance,
-        co.notes,
-        co.permission_number
-      FROM cash_out co
-      WHERE co.supplier_id = $1
-        AND co.entry_type = 'supplier_payment'
-      ${paymentExtra}
-      ${from ? `AND co.transaction_date >= '${from}'` : ""}
-      ${to ? `AND co.transaction_date <= '${to}'` : ""}
+        -- دفعات المورد
+        SELECT
+          'payment' AS record_type,
+          co.id AS record_id,
+          co.transaction_date AS record_date,
+          0 AS total,
+          co.amount AS paid_amount,
+          0 AS remaining_amount,
+          0 AS previous_balance,
+          co.notes,
+          co.permission_number,
+          0::numeric AS adjustment_amount
+        FROM cash_out co
+        ${paymentWhere}
 
-      ORDER BY record_date ASC, record_id ASC
+        UNION ALL
+
+        -- تسويات وأرصدة المورد (لكل فرع)
+        SELECT
+          'adjustment' AS record_type,
+          sa.id AS record_id,
+          sa.adjustment_date AS record_date,
+          CASE WHEN sa.amount > 0 THEN sa.amount ELSE 0 END AS total,
+          CASE WHEN sa.amount < 0 THEN ABS(sa.amount) ELSE 0 END AS paid_amount,
+          0 AS remaining_amount,
+          0 AS previous_balance,
+          sa.notes,
+          'تسوية #' || sa.id::text AS permission_number,
+          sa.amount AS adjustment_amount
+        FROM supplier_adjustments sa
+        ${adjustmentWhere}
+      ) ledger
+      ORDER BY
+        ledger.record_date ASC,
+        CASE ledger.record_type WHEN 'invoice' THEN 1 WHEN 'payment' THEN 2 ELSE 3 END ASC,
+        ledger.record_id ASC
       `,
       values,
     );
@@ -2010,6 +2150,151 @@ exports.getSupplierDebtDetails = async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error("SUPPLIER DEBT DETAILS ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  }
+};
+
+exports.settleSupplierBalance = async (req, res) => {
+  const user = req.user;
+  if (!user || user.role !== "admin") {
+    return res.status(403).json({
+      error: "غير مصرح - يتطلب صلاحيات الإدارة (Admin)",
+    });
+  }
+
+  const branchId = Number(req.body?.branch_id ?? user.branch_id);
+  // Strictly isolated to Main Warehouse branch (branch_id = 2) ONLY
+  if (branchId !== 2) {
+    return res.status(403).json({
+      error:
+        "تسوية أرصدة الموردين مفعلة لفرع المخزن الرئيسي فقط (branch_id = 2) ولا تؤثر على المعرض",
+    });
+  }
+
+  const supplierId = Number(req.body?.supplier_id);
+  const targetBalance = Number(req.body?.target_balance);
+  const rawDate = req.body?.adjustment_date ? String(req.body.adjustment_date).trim() : "";
+  const adjustmentDate =
+    rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+      ? rawDate
+      : new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Cairo" });
+  const customNotes = req.body?.notes ? String(req.body.notes).trim() : "";
+
+  if (!Number.isInteger(supplierId) || supplierId <= 0) {
+    return res.status(400).json({ error: "معرف المورد غير صحيح" });
+  }
+  if (!Number.isFinite(targetBalance)) {
+    return res.status(400).json({ error: "الرصيد الفعلي المستهدف غير صحيح" });
+  }
+
+  let client;
+  try {
+    await ensureSupplierAdjustmentsTable();
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const supRes = await client.query(
+      `SELECT id, name FROM suppliers WHERE id = $1`,
+      [supplierId],
+    );
+    if (!supRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "المورد غير موجود" });
+    }
+
+    const current = await computeSupplierBranchBalance(client, supplierId, 2);
+    const roundedTarget = Math.round(targetBalance * 100) / 100;
+    const delta = Math.round((roundedTarget - current.balance_due) * 100) / 100;
+
+    if (delta === 0) {
+      await client.query("COMMIT");
+      return res.json({
+        success: true,
+        unchanged: true,
+        branch_id: 2,
+        supplier_id: supplierId,
+        supplier_name: supRes.rows[0].name,
+        previous_balance: current.balance_due,
+        target_balance: roundedTarget,
+        delta: 0,
+        new_balance: roundedTarget,
+      });
+    }
+
+    const defaultNote = `تسوية رصيد المورد الفعلي (فرع المخزن الرئيسي) إلى ${roundedTarget.toLocaleString("en-US")} ج.م`;
+    const insRes = await client.query(
+      `
+      INSERT INTO supplier_adjustments
+        (branch_id, supplier_id, amount, adjustment_date, settlement_type, previous_balance_snapshot, target_balance, notes, created_by, created_by_name)
+      VALUES
+        ($1, $2, $3, $4::date, 'balance_settlement', $5, $6, $7, $8, $9)
+      RETURNING *
+      `,
+      [
+        2,
+        supplierId,
+        delta,
+        adjustmentDate,
+        current.balance_due,
+        roundedTarget,
+        customNotes || defaultNote,
+        Number(user.id) || null,
+        user.full_name || user.username || null,
+      ],
+    );
+
+    const updated = await computeSupplierBranchBalance(client, supplierId, 2);
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      branch_id: 2,
+      supplier_id: supplierId,
+      supplier_name: supRes.rows[0].name,
+      adjustment: insRes.rows[0],
+      previous_balance: current.balance_due,
+      delta,
+      new_balance: updated.balance_due,
+    });
+  } catch (err) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+    }
+    console.error("SETTLE SUPPLIER BALANCE ERROR:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+exports.deleteSupplierAdjustment = async (req, res) => {
+  const user = req.user;
+  if (!user || user.role !== "admin") {
+    return res.status(403).json({
+      error: "غير مصرح - يتطلب صلاحيات الإدارة (Admin)",
+    });
+  }
+
+  const adjustmentId = Number(req.params.id);
+  if (!Number.isInteger(adjustmentId) || adjustmentId <= 0) {
+    return res.status(400).json({ error: "معرف التسوية غير صحيح" });
+  }
+
+  try {
+    await ensureSupplierAdjustmentsTable();
+    // Strictly only allow deleting Branch 2 adjustments
+    const delRes = await pool.query(
+      `DELETE FROM supplier_adjustments WHERE id = $1 AND branch_id = 2 RETURNING *`,
+      [adjustmentId],
+    );
+    if (!delRes.rows.length) {
+      return res.status(404).json({ error: "التسوية غير موجودة في فرع المخزن الرئيسي" });
+    }
+    res.json({ success: true, deleted: delRes.rows[0] });
+  } catch (err) {
+    console.error("DELETE SUPPLIER ADJUSTMENT ERROR:", err);
     res.status(500).json({ error: "Server error", details: err.message });
   }
 };

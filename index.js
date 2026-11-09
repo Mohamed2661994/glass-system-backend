@@ -1328,6 +1328,11 @@ app.use((req, res, next) => {
         else if (p.includes("/cash")) channel = "data:cash";
         else if (p.includes("/inter-branch")) channel = "data:inter-branch";
         else if (
+          p.includes("/supplier-balances") ||
+          p.includes("/supplier-adjustments")
+        )
+          channel = "data:suppliers";
+        else if (
           p.includes("/stock-transfer") ||
           p.includes("/stock") ||
           p.includes("/transfer") ||
@@ -3791,34 +3796,71 @@ app.delete("/suppliers/:id/phones/:phoneId", async (req, res) => {
   }
 });
 
-// Get supplier balance (total debt from purchase invoices minus supplier payments)
+// Get supplier balance (total debt from purchase invoices minus supplier payments + branch adjustments)
 app.get("/suppliers/:id/balance", async (req, res) => {
   try {
     const { id } = req.params;
-    // إجمالي المديونية من فواتير المشتريات
-    const invoiceResult = await pool.query(
+    const rawBranch = req.query.warehouse_id || req.query.branch_id;
+    const branchId = rawBranch ? Number(rawBranch) : null;
+    const params = branchId ? [id, branchId] : [id];
+    const branchCond = branchId ? " AND branch_id = $2" : "";
+
+    const openResult = await pool.query(
       `
-      SELECT COALESCE(SUM(remaining_amount), 0) AS debt
+      SELECT COALESCE(previous_balance, 0) AS opening_balance
       FROM invoices
       WHERE supplier_id = $1
         AND movement_type = 'purchase'
         AND is_void IS NOT TRUE
+        ${branchCond}
+      ORDER BY invoice_date ASC, id ASC
+      LIMIT 1
       `,
-      [id],
+      params,
     );
-    // إجمالي المدفوع كدفعات مورد
+    const invoiceResult = await pool.query(
+      `
+      SELECT COALESCE(SUM(total), 0) AS total_purchases,
+             COALESCE(SUM(paid_amount), 0) AS total_paid_invoices
+      FROM invoices
+      WHERE supplier_id = $1
+        AND movement_type = 'purchase'
+        AND is_void IS NOT TRUE
+        ${branchCond}
+      `,
+      params,
+    );
     const paymentResult = await pool.query(
       `
       SELECT COALESCE(SUM(amount), 0) AS paid
       FROM cash_out
       WHERE supplier_id = $1
         AND entry_type = 'supplier_payment'
+        ${branchCond}
       `,
-      [id],
+      params,
     );
-    const debt = Number(invoiceResult.rows[0].debt);
-    const paid = Number(paymentResult.rows[0].paid);
-    res.json({ balance: debt - paid, debt, paid });
+    let adjustments = 0;
+    try {
+      const adjResult = await pool.query(
+        `
+        SELECT COALESCE(SUM(amount), 0) AS total_adjustments
+        FROM supplier_adjustments
+        WHERE supplier_id = $1
+          ${branchCond}
+        `,
+        params,
+      );
+      adjustments = Number(adjResult.rows[0]?.total_adjustments || 0);
+    } catch {}
+
+    const opening = Number(openResult.rows[0]?.opening_balance || 0);
+    const totalPurchases = Number(invoiceResult.rows[0]?.total_purchases || 0);
+    const paidInvoices = Number(invoiceResult.rows[0]?.total_paid_invoices || 0);
+    const paidCash = Number(paymentResult.rows[0]?.paid || 0);
+    const debt = opening + totalPurchases - paidInvoices;
+    const balance = debt - paidCash + adjustments;
+    res.json({ balance, debt, paid: paidInvoices + paidCash, adjustments });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
