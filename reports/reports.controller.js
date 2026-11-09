@@ -1,5 +1,9 @@
 const pool = require("../db");
 const stockWatchdogService = require("../services/stockWatchdog.service");
+const {
+  getLowStockReorderSummary,
+  getLowStockReorderList,
+} = require("../services/lowStockReorder.service");
 
 async function ensureInvoiceItemsCostPriceColumn() {
   // Column cost_price already exists in schema - avoid unnecessary DDL locks/permission errors
@@ -414,100 +418,8 @@ exports.getLowStock = async (req, res) => {
 ================================ */
 exports.getLowStockReorderCount = async (req, res) => {
   try {
-    const result = await pool.query(`
-      WITH ws_stock AS (
-        SELECT 
-          COALESCE(p2.retail_master_product_id, p2.id) AS product_id,
-          SUM(s2.quantity) AS max_ws_qty
-        FROM stock s2
-        JOIN products p2 ON p2.id = s2.product_id
-        JOIN warehouses w2 ON w2.id = s2.warehouse_id
-        WHERE w2.name = 'المخزن الرئيسي'
-        GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
-      ),
-      retail_family_stock AS (
-        SELECT 
-          COALESCE(p3.retail_master_product_id, p3.id) AS product_id,
-          SUM(s3.quantity) AS retail_qty
-        FROM stock s3
-        JOIN products p3 ON p3.id = s3.product_id
-        JOIN warehouses w3 ON w3.id = s3.warehouse_id
-        WHERE w3.name = 'مخزن المعرض'
-        GROUP BY COALESCE(p3.retail_master_product_id, p3.id)
-      ),
-      computed_items AS (
-        SELECT
-          p.id AS product_id,
-          COALESCE(rfs.retail_qty, s.quantity, 0) AS current_stock,
-          CASE
-            WHEN p.wholesale_package ~ 'كرتونة\\s*[0-9]+\\s*طقم' THEN
-              (SUBSTRING(p.wholesale_package FROM 'كرتونة\\s*([0-9]+)\\s*طقم'))::integer
-            WHEN (
-              (CASE 
-                WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
-                WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
-                ELSE 0
-              END) > 0
-              AND
-              COALESCE(
-                NULLIF((SUBSTRING(p.retail_package FROM '([0-9]+)\\s*(?:علبة|شيالة|طقم|كيس|قطعة)')), '')::integer,
-                NULLIF((SUBSTRING(p.retail_package FROM '(?:علبة|شيالة|طقم|كيس)\\s*([0-9]+)')), '')::integer,
-                1
-              ) > 0
-            ) THEN
-              GREATEST(1, ROUND(
-                (CASE 
-                  WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
-                  WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
-                  ELSE 0
-                END)::numeric
-                /
-                COALESCE(
-                  NULLIF((SUBSTRING(p.retail_package FROM '([0-9]+)\\s*(?:علبة|شيالة|طقم|كيس|قطعة)')), '')::integer,
-                  NULLIF((SUBSTRING(p.retail_package FROM '(?:علبة|شيالة|طقم|كيس)\\s*([0-9]+)')), '')::integer,
-                  1
-                )::numeric
-              )::integer)
-            ELSE 1
-          END AS carton_capacity
-        FROM stock s
-        JOIN products p ON p.id = s.product_id
-        JOIN warehouses w ON w.id = s.warehouse_id
-        LEFT JOIN ws_stock ws ON ws.product_id = p.id
-        LEFT JOIN retail_family_stock rfs ON rfs.product_id = p.id
-        WHERE w.name = 'مخزن المعرض'
-          AND COALESCE(rfs.retail_qty, s.quantity, 0) >= 0
-          AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
-          AND p.is_active = true
-          AND p.retail_master_product_id IS NULL
-          AND (COALESCE(rfs.retail_qty, s.quantity, 0) > 0 OR COALESCE(ws.max_ws_qty, 0) > 0)
-      )
-      SELECT
-        COUNT(*) AS total_count,
-        COUNT(*) FILTER (WHERE current_stock = 0) AS zero_count,
-        COUNT(*) FILTER (WHERE current_stock > 0 AND (
-          (carton_capacity > 1 AND (current_stock::numeric / carton_capacity::numeric) <= 0.25)
-          OR (carton_capacity <= 4 AND current_stock <= 1)
-        )) AS critical_count,
-        COUNT(*) FILTER (WHERE current_stock > 0 AND NOT (
-          (carton_capacity > 1 AND (current_stock::numeric / carton_capacity::numeric) <= 0.25)
-          OR (carton_capacity <= 4 AND current_stock <= 1)
-        )) AS warning_count
-      FROM computed_items
-      WHERE (
-        (carton_capacity > 1 AND current_stock <= GREATEST(1, ROUND(carton_capacity * 0.5)))
-        OR
-        (carton_capacity <= 1 AND current_stock <= 2)
-      );
-    `);
-
-    res.json({
-      success: true,
-      totalCount: Number(result.rows[0]?.total_count || 0),
-      zeroCount: Number(result.rows[0]?.zero_count || 0),
-      criticalCount: Number(result.rows[0]?.critical_count || 0),
-      warningCount: Number(result.rows[0]?.warning_count || 0),
-    });
+    const summary = await getLowStockReorderSummary(pool);
+    res.json(summary);
   } catch (err) {
     console.error("LOW STOCK REORDER COUNT ERROR:", err);
     res.status(500).json({ error: "Server error" });
@@ -519,144 +431,7 @@ exports.getLowStockReorderCount = async (req, res) => {
 ================================ */
 exports.getLowStockReorderItems = async (req, res) => {
   try {
-    const result = await pool.query(`
-      WITH ws_stock AS (
-        SELECT 
-          COALESCE(p2.retail_master_product_id, p2.id) AS product_id,
-          SUM(s2.quantity) AS ws_qty
-        FROM stock s2
-        JOIN products p2 ON p2.id = s2.product_id
-        JOIN warehouses w2 ON w2.id = s2.warehouse_id
-        WHERE w2.name = 'المخزن الرئيسي'
-        GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
-      ),
-      retail_family_stock AS (
-        SELECT 
-          COALESCE(p3.retail_master_product_id, p3.id) AS product_id,
-          SUM(s3.quantity) AS retail_qty
-        FROM stock s3
-        JOIN products p3 ON p3.id = s3.product_id
-        JOIN warehouses w3 ON w3.id = s3.warehouse_id
-        WHERE w3.name = 'مخزن المعرض'
-        GROUP BY COALESCE(p3.retail_master_product_id, p3.id)
-      ),
-      computed_items AS (
-        SELECT
-          p.id AS product_id,
-          p.name AS product_name,
-          p.manufacturer AS manufacturer_name,
-          w.name AS warehouse_name,
-          COALESCE(rfs.retail_qty, s.quantity, 0) AS current_stock,
-          s.variant_id,
-          p.wholesale_package,
-          p.retail_package,
-          COALESCE(ws.ws_qty, 0) AS wholesale_stock,
-          CASE
-            WHEN p.wholesale_package ~ 'كرتونة\\s*[0-9]+\\s*طقم' THEN
-              (SUBSTRING(p.wholesale_package FROM 'كرتونة\\s*([0-9]+)\\s*طقم'))::integer
-            WHEN (
-              (CASE 
-                WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
-                WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
-                ELSE 0
-              END) > 0
-              AND
-              COALESCE(
-                NULLIF((SUBSTRING(p.retail_package FROM '([0-9]+)\\s*(?:علبة|شيالة|طقم|كيس|قطعة)')), '')::integer,
-                NULLIF((SUBSTRING(p.retail_package FROM '(?:علبة|شيالة|طقم|كيس)\\s*([0-9]+)')), '')::integer,
-                1
-              ) > 0
-            ) THEN
-              GREATEST(1, ROUND(
-                (CASE 
-                  WHEN p.wholesale_package ~ '[0-9]+(?:\\.[0-9]+)?\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+(?:\\.[0-9]+)?)\\s*دستة'))::numeric * 12
-                  WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
-                  ELSE 0
-                END)::numeric
-                /
-                COALESCE(
-                  NULLIF((SUBSTRING(p.retail_package FROM '([0-9]+)\\s*(?:علبة|شيالة|طقم|كيس|قطعة)')), '')::integer,
-                  NULLIF((SUBSTRING(p.retail_package FROM '(?:علبة|شيالة|طقم|كيس)\\s*([0-9]+)')), '')::integer,
-                  1
-                )::numeric
-              )::integer)
-            ELSE 1
-          END AS carton_capacity
-        FROM stock s
-        JOIN products p ON p.id = s.product_id
-        JOIN warehouses w ON w.id = s.warehouse_id
-        LEFT JOIN ws_stock ws ON ws.product_id = p.id
-        LEFT JOIN retail_family_stock rfs ON rfs.product_id = p.id
-        WHERE w.name = 'مخزن المعرض'
-          AND COALESCE(rfs.retail_qty, s.quantity, 0) >= 0
-          AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
-          AND p.is_active = true
-          AND p.retail_master_product_id IS NULL
-          AND (COALESCE(rfs.retail_qty, s.quantity, 0) > 0 OR COALESCE(ws.ws_qty, 0) > 0)
-      )
-      SELECT
-        product_id,
-        product_name,
-        manufacturer_name,
-        warehouse_name,
-        current_stock,
-        variant_id,
-        wholesale_package,
-        retail_package,
-        wholesale_stock,
-        carton_capacity,
-        ROUND((current_stock::numeric / GREATEST(1, carton_capacity)::numeric) * 100) AS stock_pct,
-        CASE
-          WHEN current_stock = 0 THEN 'zero'
-          WHEN (carton_capacity > 1 AND (current_stock::numeric / carton_capacity::numeric) <= 0.25) OR (carton_capacity <= 4 AND current_stock <= 1) THEN 'critical_25'
-          ELSE 'warning_50'
-        END AS urgency_level
-      FROM computed_items
-      WHERE (
-        (carton_capacity > 1 AND current_stock <= GREATEST(1, ROUND(carton_capacity * 0.5)))
-        OR
-        (carton_capacity <= 1 AND current_stock <= 2)
-      )
-      ORDER BY 
-        CASE WHEN current_stock = 0 THEN 0 ELSE 1 END,
-        (current_stock::numeric / GREATEST(1, carton_capacity)::numeric) ASC,
-        current_stock ASC;
-    `);
-
-    // Get all variants to map variant_id → package names
-    const variantsRes = await pool.query(
-      `SELECT id, product_id, wholesale_package, retail_package FROM product_variants ORDER BY id`,
-    );
-    const variantsById = {};
-    for (const v of variantsRes.rows) {
-      variantsById[v.id] = v;
-    }
-
-    const rows = result.rows.map((row) => {
-      const vid = Number(row.variant_id) || 0;
-      let pkgLabel;
-      if (vid === 0) {
-        pkgLabel =
-          [row.wholesale_package, row.retail_package]
-            .filter(Boolean)
-            .join(" / ") || "-";
-      } else {
-        const v = variantsById[vid];
-        pkgLabel = v
-          ? [v.wholesale_package, v.retail_package].filter(Boolean).join(" / ")
-          : "-";
-      }
-      return {
-        ...row,
-        current_stock: Number(row.current_stock) || 0,
-        wholesale_stock: Number(row.wholesale_stock) || 0,
-        carton_capacity: Number(row.carton_capacity) || 1,
-        stock_pct: Number(row.stock_pct) || 0,
-        urgency_level: row.urgency_level || "warning_50",
-        package_name: pkgLabel,
-      };
-    });
-
+    const rows = await getLowStockReorderList(pool);
     res.json(rows);
   } catch (err) {
     console.error("LOW STOCK REORDER ITEMS ERROR:", err);

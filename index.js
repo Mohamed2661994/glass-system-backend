@@ -60,6 +60,10 @@ const {
 const {
   convertWholesaleToRetail,
 } = require("./services/wholesaleToRetailConverter");
+const {
+  getLowStockReorderSummary,
+  notifyShowroomNewWarehouseArrivals,
+} = require("./services/lowStockReorder.service");
 
 /* ── System Version (Format: v.yr.mon.X) ── */
 const SYSTEM_VERSION = "v.26.10.16";
@@ -1405,6 +1409,7 @@ app.use((req, res, next) => {
             channel === "data:invoices" ||
             channel === "data:cash" ||
             channel === "data:stock" ||
+            channel === "data:products" ||
             channel === "data:inter-branch"
           ) {
             invalidateDashboardStatsCache();
@@ -4637,6 +4642,29 @@ VALUES
     await client.query("COMMIT");
 
     if (
+      invoice_type === "wholesale" &&
+      movement_type === "purchase" &&
+      warehouseId === 2
+    ) {
+      const incomingProductIds = stockOps
+        .filter((op) => op.type === "increment" && Number(op.quantity) > 0)
+        .map((op) => op.productId);
+      if (incomingProductIds.length > 0) {
+        invalidateDashboardStatsCache();
+        setImmediate(() => {
+          notifyShowroomNewWarehouseArrivals({
+            pool,
+            productIds: incomingProductIds,
+            fromUserId: req.user?.id || null,
+            referenceId: invoiceId,
+            app: req.app,
+            sendPushToBranch,
+          });
+        });
+      }
+    }
+
+    if (
       movement_type === "sale" &&
       !is_return &&
       (customer_phone || req.body.customer_phone)
@@ -6101,6 +6129,30 @@ SET
     await client.query("COMMIT");
 
     if (
+      invoice_type === "wholesale" &&
+      movement_type === "purchase" &&
+      warehouseId === 2 &&
+      itemsChanged
+    ) {
+      const incomingProductIds = (stockDeltas || [])
+        .filter((d) => Number(d.delta) > 0)
+        .map((d) => d.productId);
+      if (incomingProductIds.length > 0) {
+        invalidateDashboardStatsCache();
+        setImmediate(() => {
+          notifyShowroomNewWarehouseArrivals({
+            pool,
+            productIds: incomingProductIds,
+            fromUserId: req.user?.id || null,
+            referenceId: invoiceId,
+            app: req.app,
+            sendPushToBranch,
+          });
+        });
+      }
+    }
+
+    if (
       movement_type === "sale" &&
       (customer_phone || req.body.customer_phone)
     ) {
@@ -7294,105 +7346,19 @@ async function fetchLowStockReorderCount() {
   if (cached) return cached;
 
   try {
-    const res = await pool.query(`
-      WITH ws_stock AS (
-        SELECT 
-          COALESCE(p2.retail_master_product_id, p2.id) AS product_id,
-          SUM(s2.quantity) AS max_ws_qty
-        FROM stock s2
-        JOIN products p2 ON p2.id = s2.product_id
-        JOIN warehouses w2 ON w2.id = s2.warehouse_id
-        WHERE w2.name = 'المخزن الرئيسي'
-        GROUP BY COALESCE(p2.retail_master_product_id, p2.id)
-      ),
-      retail_family_stock AS (
-        SELECT 
-          COALESCE(p3.retail_master_product_id, p3.id) AS product_id,
-          SUM(s3.quantity) AS retail_qty
-        FROM stock s3
-        JOIN products p3 ON p3.id = s3.product_id
-        JOIN warehouses w3 ON w3.id = s3.warehouse_id
-        WHERE w3.name = 'مخزن المعرض'
-        GROUP BY COALESCE(p3.retail_master_product_id, p3.id)
-      ),
-      computed_items AS (
-        SELECT
-          p.id AS product_id,
-          COALESCE(rfs.retail_qty, s.quantity, 0) AS current_stock,
-          CASE
-            WHEN p.wholesale_package ~ 'كرتونة\\s*[0-9]+\\s*طقم' THEN
-              (SUBSTRING(p.wholesale_package FROM 'كرتونة\\s*([0-9]+)\\s*طقم'))::integer
-            WHEN (
-              (CASE 
-                WHEN p.wholesale_package ~ '[0-9]+\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*دستة'))::integer * 12
-                WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
-                ELSE 0
-              END) > 0
-              AND
-              COALESCE(
-                NULLIF((SUBSTRING(p.retail_package FROM '([0-9]+)\\s*(?:علبة|شيالة|طقم|كيس|قطعة)')), '')::integer,
-                NULLIF((SUBSTRING(p.retail_package FROM '(?:علبة|شيالة|طقم|كيس)\\s*([0-9]+)')), '')::integer,
-                1
-              ) > 0
-            ) THEN
-              GREATEST(1, ROUND(
-                (CASE 
-                  WHEN p.wholesale_package ~ '[0-9]+\\s*دستة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*دستة'))::integer * 12
-                  WHEN p.wholesale_package ~ '[0-9]+\\s*قطعة' THEN (SUBSTRING(p.wholesale_package FROM '([0-9]+)\\s*قطعة'))::integer
-                  ELSE 0
-                END)::numeric
-                /
-                COALESCE(
-                  NULLIF((SUBSTRING(p.retail_package FROM '([0-9]+)\\s*(?:علبة|شيالة|طقم|كيس|قطعة)')), '')::integer,
-                  NULLIF((SUBSTRING(p.retail_package FROM '(?:علبة|شيالة|طقم|كيس)\\s*([0-9]+)')), '')::integer,
-                  1
-                )::numeric
-              )::integer)
-            ELSE 1
-          END AS carton_capacity
-        FROM stock s
-        JOIN products p ON p.id = s.product_id
-        JOIN warehouses w ON w.id = s.warehouse_id
-        LEFT JOIN ws_stock ws ON ws.product_id = p.id
-        LEFT JOIN retail_family_stock rfs ON rfs.product_id = p.id
-        WHERE w.name = 'مخزن المعرض'
-          AND COALESCE(rfs.retail_qty, s.quantity, 0) >= 0
-          AND p.wholesale_package IS NOT NULL AND p.wholesale_package != ''
-          AND p.is_active = true
-          AND p.retail_master_product_id IS NULL
-          AND (COALESCE(rfs.retail_qty, s.quantity, 0) > 0 OR COALESCE(ws.max_ws_qty, 0) > 0)
-      )
-      SELECT
-        COUNT(*) AS total_count,
-        COUNT(*) FILTER (WHERE current_stock = 0) AS zero_count,
-        COUNT(*) FILTER (WHERE current_stock > 0 AND (
-          (carton_capacity > 1 AND (current_stock::numeric / carton_capacity::numeric) <= 0.25)
-          OR (carton_capacity <= 4 AND current_stock <= 1)
-        )) AS critical_count,
-        COUNT(*) FILTER (WHERE current_stock > 0 AND NOT (
-          (carton_capacity > 1 AND (current_stock::numeric / carton_capacity::numeric) <= 0.25)
-          OR (carton_capacity <= 4 AND current_stock <= 1)
-        )) AS warning_count
-      FROM computed_items
-      WHERE (
-        (carton_capacity > 1 AND current_stock <= GREATEST(1, ROUND(carton_capacity * 0.5)))
-        OR
-        (carton_capacity <= 1 AND current_stock <= 2)
-      );
-    `);
-
-    const result = {
-      success: true,
-      totalCount: Number(res.rows[0]?.total_count || 0),
-      zeroCount: Number(res.rows[0]?.zero_count || 0),
-      criticalCount: Number(res.rows[0]?.critical_count || 0),
-      warningCount: Number(res.rows[0]?.warning_count || 0),
-    };
+    const result = await getLowStockReorderSummary(pool);
     setDashboardCache(cacheKey, result);
     return result;
   } catch (err) {
     console.error("Error fetching low stock reorder count:", err);
-    return { success: true, totalCount: 0, zeroCount: 0, criticalCount: 0, warningCount: 0 };
+    return {
+      success: true,
+      totalCount: 0,
+      newArrivalCount: 0,
+      zeroCount: 0,
+      criticalCount: 0,
+      warningCount: 0,
+    };
   }
 }
 
@@ -7518,7 +7484,7 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
          FROM notifications n
          LEFT JOIN users u ON u.id = n.from_user_id
          WHERE n.to_branch_id = $1
-           AND (u.branch_id != $1 OR u.branch_id IS NULL)
+           AND (n.type = 'new_warehouse_arrival' OR u.branch_id != $1 OR u.branch_id IS NULL)
          ORDER BY n.created_at DESC
          LIMIT 10`,
         [effectiveBranchId],
@@ -9618,6 +9584,21 @@ app.post("/stock/adjust", authMiddleware, async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    invalidateDashboardStatsCache();
+
+    if (whId === 2 && diff > 0) {
+      setImmediate(() => {
+        notifyShowroomNewWarehouseArrivals({
+          pool,
+          productIds: [prodId],
+          fromUserId: user.id || null,
+          referenceId: null,
+          app: req.app,
+          sendPushToBranch,
+        });
+      });
+    }
 
     // 3️⃣ إرسال إشعار لحظي عبر Socket.io لتحديث شاشات الكاشير والمخازن فورياً
     const io = req.app.get("io");
@@ -12945,9 +12926,9 @@ app.get("/notifications", authMiddleware, async (req, res) => {
     let query = `
       SELECT n.id, n.title, n.message, n.type, n.reference_id, n.is_read, n.created_at
       FROM notifications n
-      JOIN users u ON u.id = n.from_user_id
+      LEFT JOIN users u ON u.id = n.from_user_id
       WHERE n.to_branch_id = $1
-        AND (u.branch_id != $1 OR u.branch_id IS NULL)
+        AND (n.type = 'new_warehouse_arrival' OR u.branch_id != $1 OR u.branch_id IS NULL)
     `;
     const values = [branch_id];
 
@@ -12973,8 +12954,8 @@ app.get("/notifications/unread-count", authMiddleware, async (req, res) => {
     const branch_id = req.user.branch_id;
     const result = await pool.query(
       `SELECT COUNT(*) AS count FROM notifications n
-       JOIN users u ON u.id = n.from_user_id
-       WHERE n.to_branch_id = $1 AND n.is_read = false AND (u.branch_id != $1 OR u.branch_id IS NULL)`,
+       LEFT JOIN users u ON u.id = n.from_user_id
+       WHERE n.to_branch_id = $1 AND n.is_read = false AND (n.type = 'new_warehouse_arrival' OR u.branch_id != $1 OR u.branch_id IS NULL)`,
       [branch_id],
     );
     res.json({ success: true, count: parseInt(result.rows[0].count) });
@@ -13701,7 +13682,7 @@ async function sendPushToBranch(targetBranchId, title, body, data = {}) {
       const payload = JSON.stringify({
         title,
         body,
-        data: { ...data, url: "/" },
+        data: { url: "/", ...data },
       });
       for (const sub of subs.rows) {
         const pushSub = {
