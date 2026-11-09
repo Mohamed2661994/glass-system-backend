@@ -5690,7 +5690,7 @@ app.patch("/invoices/:id/list-visibility", authMiddleware, async (req, res) => {
 
   try {
     const currentUser = await loadCurrentUserAccess(req);
-    if (!isSuperAdmin(currentUser)) {
+    if (!isAdminUser(currentUser)) {
       return res.status(403).json({ error: "غير مصرح" });
     }
 
@@ -5700,20 +5700,23 @@ app.patch("/invoices/:id/list-visibility", authMiddleware, async (req, res) => {
     }
 
     const hideFromList = Boolean(req.body?.hidden_from_list);
-    const hiddenByName =
-      currentUser.full_name || currentUser.username || "Admin";
+    if (hideFromList) {
+      return res.status(403).json({
+        error: "تم تعطيل خاصية إخفاء الفواتير — لا يمكن إخفاء أي فاتورة",
+      });
+    }
 
     const result = await client.query(
       `
       UPDATE invoices
       SET
-        hidden_from_list = $2,
-        hidden_from_list_at = CASE WHEN $2 THEN NOW() ELSE NULL END,
-        hidden_from_list_by = CASE WHEN $2 THEN $3 ELSE NULL END
+        hidden_from_list = false,
+        hidden_from_list_at = NULL,
+        hidden_from_list_by = NULL
       WHERE id = $1
       RETURNING id, hidden_from_list, hidden_from_list_at, hidden_from_list_by
       `,
-      [invoiceId, hideFromList, hiddenByName],
+      [invoiceId],
     );
 
     if (!result.rows.length) {
@@ -6890,23 +6893,16 @@ app.get("/invoices", async (req, res) => {
     let values = [];
     let idx = 1;
 
-    const normalizedListVisibility = String(list_visibility || "visible")
+    const normalizedListVisibility = String(list_visibility || "all")
       .trim()
       .toLowerCase();
 
     if (normalizedListVisibility === "hidden") {
       const currentUser = await loadCurrentUserAccess(req);
-      if (!isSuperAdmin(currentUser)) {
+      if (!isAdminUser(currentUser)) {
         return res.status(403).json({ error: "غير مصرح" });
       }
       conditions.push(`COALESCE(hidden_from_list, false) = true`);
-    } else if (normalizedListVisibility === "all") {
-      const currentUser = await loadCurrentUserAccess(req);
-      if (!isSuperAdmin(currentUser)) {
-        return res.status(403).json({ error: "غير مصرح" });
-      }
-    } else {
-      conditions.push(`COALESCE(hidden_from_list, false) = false`);
     }
 
     if (invoice_id) {
@@ -7438,7 +7434,6 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
            external_order_id, whatsapp_status, notes, apply_items_discount
          FROM invoices
          WHERE invoice_type = $1
-           AND (COALESCE(hidden_from_list, false) = false)
            AND COALESCE(invoice_date, created_at) >= $2::date
            AND COALESCE(invoice_date, created_at) < ($2::date + INTERVAL '1 day')
          ORDER BY id DESC
@@ -7549,7 +7544,6 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
              WHERE invoice_type = 'wholesale'
                AND payment_status != 'paid'
                AND is_void IS NOT TRUE
-               AND (COALESCE(hidden_from_list, false) = false)
              ORDER BY id DESC
              LIMIT 50`,
           ).catch((err) => {
