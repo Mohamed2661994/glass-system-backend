@@ -3642,6 +3642,55 @@ app.delete("/customers/:id", async (req, res) => {
    Supplier Management Endpoints (الموردين)
    ========================================================= */
 
+function normalizePartyWhitespace(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+async function resolveSupplierForInvoice(client, rawName, supplierPhone) {
+  const cleanName = normalizePartyWhitespace(rawName);
+  if (!cleanName) {
+    return { id: null, name: null };
+  }
+
+  const existingSupplier = await client.query(
+    `
+    SELECT id, name
+    FROM suppliers
+    WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1
+    ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END, id ASC
+    LIMIT 1
+    `,
+    [cleanName],
+  );
+
+  let sId = null;
+  let resolvedName = cleanName;
+
+  if (existingSupplier.rows.length > 0) {
+    sId = existingSupplier.rows[0].id;
+    resolvedName =
+      normalizePartyWhitespace(existingSupplier.rows[0].name) || cleanName;
+  } else {
+    const newSupplier = await client.query(
+      `INSERT INTO suppliers (name) VALUES ($1) RETURNING id, name`,
+      [cleanName],
+    );
+    sId = newSupplier.rows[0].id;
+    resolvedName = newSupplier.rows[0].name || cleanName;
+  }
+
+  if (supplierPhone && sId) {
+    await client.query(
+      `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
+      [sId, supplierPhone],
+    );
+  }
+
+  return { id: sId, name: resolvedName };
+}
+
 // Search suppliers by name or phone
 app.get("/suppliers/search", async (req, res) => {
   try {
@@ -4356,7 +4405,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
 
     // 🚀 Parallel pre-fetch: duplicate check, customer resolution, supplier resolution, and normalized items
-    const [checkExisting, customerId, normalizedItems, supplierId] = await Promise.all([
+    const [checkExisting, customerId, normalizedItems, supplierResolution] = await Promise.all([
       client.query(
         "SELECT id FROM invoices WHERE customer_name = $1 AND total = $2 AND paid_amount = $3 AND created_at >= NOW() - INTERVAL '5 seconds'",
         [customer_name, total, paid_amount],
@@ -4391,30 +4440,14 @@ app.post("/invoices", authMiddleware, async (req, res) => {
       })(),
       normalizeInvoiceItemsForStorage(items, invoice_type, client),
       (async () => {
-        if (movement_type !== "purchase" || !supplier_name) return null;
-        let sId = null;
-        const existingSupplier = await client.query(
-          `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
-          [supplier_name],
-        );
-        if (existingSupplier.rows.length > 0) {
-          sId = existingSupplier.rows[0].id;
-        } else {
-          const newSupplier = await client.query(
-            `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
-            [supplier_name],
-          );
-          sId = newSupplier.rows[0].id;
+        if (movement_type !== "purchase" || !supplier_name) {
+          return { id: null, name: null };
         }
-        if (supplier_phone && sId) {
-          await client.query(
-            `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
-            [sId, supplier_phone],
-          );
-        }
-        return sId;
+        return resolveSupplierForInvoice(client, supplier_name, supplier_phone);
       })(),
     ]);
+    const supplierId = supplierResolution.id;
+    const resolvedSupplierName = supplierResolution.name;
 
     if (checkExisting.rows.length) {
       throw new Error("تم منع إنشاء فاتورة مكررة");
@@ -4476,7 +4509,7 @@ VALUES
         created_by || null,
         created_by_name || null,
         supplierId,
-        supplier_name || null,
+        resolvedSupplierName || null,
         supplier_phone || null,
         notes || null,
         cash_breakdown ? JSON.stringify(cash_breakdown) : null,
@@ -4825,7 +4858,7 @@ app.post("/invoices/retail", async (req, res) => {
     const warehouseId = getWarehouseIdByInvoiceType("retail");
 
     // 🚀 Parallel pre-fetch: resolve customer, supplier, and normalized items simultaneously
-    const [customerId, normalizedItems, supplierId] = await Promise.all([
+    const [customerId, normalizedItems, supplierResolution] = await Promise.all([
       (async () => {
         if (!customer_name) return null;
         let cId = null;
@@ -4856,30 +4889,14 @@ app.post("/invoices/retail", async (req, res) => {
       })(),
       normalizeInvoiceItemsForStorage(items, "retail", client),
       (async () => {
-        if (movement_type !== "purchase" || !supplier_name) return null;
-        let sId = null;
-        const existingSupplier = await client.query(
-          `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
-          [supplier_name],
-        );
-        if (existingSupplier.rows.length > 0) {
-          sId = existingSupplier.rows[0].id;
-        } else {
-          const newSupplier = await client.query(
-            `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
-            [supplier_name],
-          );
-          sId = newSupplier.rows[0].id;
+        if (movement_type !== "purchase" || !supplier_name) {
+          return { id: null, name: null };
         }
-        if (supplier_phone && sId) {
-          await client.query(
-            `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
-            [sId, supplier_phone],
-          );
-        }
-        return sId;
+        return resolveSupplierForInvoice(client, supplier_name, supplier_phone);
       })(),
     ]);
+    const supplierId = supplierResolution.id;
+    const resolvedSupplierName = supplierResolution.name;
 
     /* ================== إنشاء الفاتورة ================== */
     const invoiceRes = await client.query(
@@ -4934,7 +4951,7 @@ app.post("/invoices/retail", async (req, res) => {
         created_by || null,
         created_by_name || null,
         supplierId,
-        supplier_name || null,
+        resolvedSupplierName || null,
         supplier_phone || null,
         notes || null,
         cash_breakdown ? JSON.stringify(cash_breakdown) : null,
@@ -5369,26 +5386,15 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
 
     // ===== حل المورد لفواتير الشراء =====
     let supplierId = null;
+    let resolvedSupplierName = null;
     if (movement_type === "purchase" && supplier_name) {
-      const existingSupplier = await client.query(
-        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
-        [supplier_name],
+      const supplierResolution = await resolveSupplierForInvoice(
+        client,
+        supplier_name,
+        supplier_phone,
       );
-      if (existingSupplier.rows.length > 0) {
-        supplierId = existingSupplier.rows[0].id;
-      } else {
-        const newSupplier = await client.query(
-          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
-          [supplier_name],
-        );
-        supplierId = newSupplier.rows[0].id;
-      }
-      if (supplier_phone) {
-        await client.query(
-          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
-          [supplierId, supplier_phone],
-        );
-      }
+      supplierId = supplierResolution.id;
+      resolvedSupplierName = supplierResolution.name;
     }
 
     await client.query(
@@ -5435,7 +5441,7 @@ RETURNING invoice_revision
         updated_by_name || null,
         invoiceId,
         supplierId,
-        supplier_name || null,
+        resolvedSupplierName || null,
         supplier_phone || null,
         invoice_date || null,
         notes || null,
@@ -6070,26 +6076,15 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
        6️⃣ حل المورد لفواتير الشراء
     ================================= */
     let supplierId = null;
+    let resolvedSupplierName = null;
     if (movement_type === "purchase" && supplier_name) {
-      const existingSupplier = await client.query(
-        `SELECT id FROM suppliers WHERE name = $1 LIMIT 1`,
-        [supplier_name],
+      const supplierResolution = await resolveSupplierForInvoice(
+        client,
+        supplier_name,
+        supplier_phone,
       );
-      if (existingSupplier.rows.length > 0) {
-        supplierId = existingSupplier.rows[0].id;
-      } else {
-        const newSupplier = await client.query(
-          `INSERT INTO suppliers (name) VALUES ($1) RETURNING id`,
-          [supplier_name],
-        );
-        supplierId = newSupplier.rows[0].id;
-      }
-      if (supplier_phone) {
-        await client.query(
-          `INSERT INTO supplier_phones (supplier_id, phone) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING`,
-          [supplierId, supplier_phone],
-        );
-      }
+      supplierId = supplierResolution.id;
+      resolvedSupplierName = supplierResolution.name;
     }
 
     /* ================================
@@ -6141,7 +6136,7 @@ SET
         updated_by_name || null,
         invoiceId,
         supplierId,
-        supplier_name || null,
+        resolvedSupplierName || null,
         supplier_phone || null,
         invoice_date || null,
         notes || null,
