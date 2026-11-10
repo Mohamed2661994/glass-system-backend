@@ -138,6 +138,27 @@ async function ensureWarehouseRentsTables() {
   if (tablesReadyPromise) return tablesReadyPromise;
 
   tablesReadyPromise = (async () => {
+    const checkRes = await pool.query(`
+      SELECT
+        to_regclass('public.warehouse_rents') AS t1,
+        to_regclass('public.warehouse_rent_payments') AS t2,
+        to_regclass('public.warehouse_rent_adjustments') AS t3,
+        to_regclass('public.idx_notifications_reminder_key') AS idx,
+        (SELECT COUNT(*)::int FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'notifications'
+           AND column_name IN ('to_user_id', 'reminder_key', 'updated_at')) AS notif_cols
+    `);
+    const existing = checkRes.rows[0] || {};
+    if (
+      existing.t1 &&
+      existing.t2 &&
+      existing.t3 &&
+      existing.idx &&
+      Number(existing.notif_cols) === 3
+    ) {
+      return;
+    }
+
     const sql = `
       CREATE TABLE IF NOT EXISTS warehouse_rents (
         id SERIAL PRIMARY KEY,

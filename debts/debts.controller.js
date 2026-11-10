@@ -97,6 +97,19 @@ function saveLocalStore(store) {
 // Auto DDL Initialization
 // ==========================================
 async function initDebtsTables() {
+  try {
+    const checkRes = await pool.query(`
+      SELECT
+        to_regclass('public.external_debts') AS t1,
+        to_regclass('public.debt_installments') AS t2,
+        to_regclass('public.debt_installment_payments') AS t3
+    `);
+    const existing = checkRes.rows[0] || {};
+    if (existing.t1 && existing.t2 && existing.t3) {
+      return;
+    }
+  } catch (_) {}
+
   const sql = `
     CREATE TABLE IF NOT EXISTS external_debts (
       id SERIAL PRIMARY KEY,
@@ -746,14 +759,48 @@ exports.updateDebt = async (req, res) => {
 
 // 6. Delete Debt
 exports.deleteDebt = async (req, res) => {
-  const { id } = req.params;
-  try {
-    await pool.query(`DELETE FROM external_debts WHERE id = $1`, [id]);
-    return res.json({ success: true, message: "تم حذف المديونية وأقساطها بنجاح" });
-  } catch (err) {
+  const rawId = String(req.params.id || "").trim();
+  const debtId = Number(rawId);
+  if (!/^\d+$/.test(rawId) || !Number.isSafeInteger(debtId) || debtId <= 0) {
+    return res.status(400).json({ error: "معرف المديونية غير صالح" });
+  }
+
+  const client = await pool.connect().catch(() => null);
+
+  if (client) {
+    let txStarted = false;
+    try {
+      await client.query("BEGIN");
+      txStarted = true;
+
+      const delRes = await client.query(
+        `DELETE FROM external_debts WHERE id = $1 RETURNING id, title`,
+        [debtId]
+      );
+      if (delRes.rowCount === 0) {
+        await client.query("ROLLBACK");
+        txStarted = false;
+        return res.status(404).json({ error: "المديونية غير موجودة" });
+      }
+
+      await client.query("COMMIT");
+      txStarted = false;
+      return res.json({ success: true, message: "تم حذف المديونية وأقساطها بنجاح" });
+    } catch (err) {
+      if (txStarted) await client.query("ROLLBACK").catch(() => {});
+      console.error("deleteDebt error:", err);
+      return res.status(500).json({ error: "فشل حذف المديونية" });
+    } finally {
+      client.release();
+    }
+  } else {
     const store = getLocalStore();
-    store.debts = store.debts.filter(d => d.id !== Number(id));
-    store.installments = store.installments.filter(i => i.debt_id !== Number(id));
+    const exists = store.debts.some((d) => d.id === debtId);
+    if (!exists) {
+      return res.status(404).json({ error: "المديونية غير موجودة" });
+    }
+    store.debts = store.debts.filter((d) => d.id !== debtId);
+    store.installments = store.installments.filter((i) => i.debt_id !== debtId);
     saveLocalStore(store);
     return res.json({ success: true, message: "تم حذف المديونية وأقساطها بنجاح" });
   }
