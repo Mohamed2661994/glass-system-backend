@@ -1449,6 +1449,7 @@ app.use("/payroll", payrollRoutes);
 
 const debtsRoutes = require("./debts/debts.routes");
 const debtsController = require("./debts/debts.controller");
+const warehouseRentsController = require("./debts/warehouseRents.controller");
 app.use("/debts", debtsRoutes);
 app.use("/api/debts", debtsRoutes);
 
@@ -11195,6 +11196,17 @@ app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
       [id],
     );
 
+    // 2.6 Delete linked warehouse_rent_payments ONLY if cash_out belongs to current branch
+    const targetCashOutCheck = await client.query(
+      `SELECT id FROM cash_out WHERE id = $1 AND branch_id = $2 FOR UPDATE`,
+      [id, branch_id],
+    );
+    if (targetCashOutCheck.rows.length > 0) {
+      await client
+        .query(`DELETE FROM warehouse_rent_payments WHERE cash_out_id = $1`, [id])
+        .catch(() => {});
+    }
+
     // 3. Delete the cash_out record
     const result = await client.query(
       `DELETE FROM cash_out WHERE id=$1 AND branch_id=$2 RETURNING id`,
@@ -13998,22 +14010,29 @@ app.post("/auth/switch-branch", authMiddleware, async (req, res) => {
 app.get("/notifications", authMiddleware, async (req, res) => {
   try {
     const branch_id = req.user.branch_id;
+    const user_id = Number(req.user.id) || 0;
     const { unread_only } = req.query;
 
     let query = `
       SELECT n.id, n.title, n.message, n.type, n.reference_id, n.is_read, n.created_at
       FROM notifications n
       LEFT JOIN users u ON u.id = n.from_user_id
-      WHERE n.to_branch_id = $1
-        AND (n.type = 'new_warehouse_arrival' OR u.branch_id != $1 OR u.branch_id IS NULL)
+      WHERE (
+        n.to_user_id = $2
+        OR (
+          n.to_user_id IS NULL
+          AND n.to_branch_id = $1
+          AND (n.type = 'new_warehouse_arrival' OR u.branch_id != $1 OR u.branch_id IS NULL)
+        )
+      )
     `;
-    const values = [branch_id];
+    const values = [branch_id, user_id];
 
     if (unread_only === "true") {
-      query += ` AND is_read = false`;
+      query += ` AND n.is_read = false`;
     }
 
-    query += ` ORDER BY created_at DESC LIMIT 50`;
+    query += ` ORDER BY n.created_at DESC LIMIT 50`;
 
     const result = await pool.query(query, values);
     res.json({ success: true, data: result.rows });
@@ -14029,11 +14048,20 @@ app.get("/notifications", authMiddleware, async (req, res) => {
 app.get("/notifications/unread-count", authMiddleware, async (req, res) => {
   try {
     const branch_id = req.user.branch_id;
+    const user_id = Number(req.user.id) || 0;
     const result = await pool.query(
       `SELECT COUNT(*) AS count FROM notifications n
        LEFT JOIN users u ON u.id = n.from_user_id
-       WHERE n.to_branch_id = $1 AND n.is_read = false AND (n.type = 'new_warehouse_arrival' OR u.branch_id != $1 OR u.branch_id IS NULL)`,
-      [branch_id],
+       WHERE n.is_read = false
+         AND (
+           n.to_user_id = $2
+           OR (
+             n.to_user_id IS NULL
+             AND n.to_branch_id = $1
+             AND (n.type = 'new_warehouse_arrival' OR u.branch_id != $1 OR u.branch_id IS NULL)
+           )
+         )`,
+      [branch_id, user_id],
     );
     res.json({ success: true, count: parseInt(result.rows[0].count) });
   } catch (err) {
@@ -14047,9 +14075,12 @@ app.get("/notifications/unread-count", authMiddleware, async (req, res) => {
 ================================ */
 app.put("/notifications/read-all", authMiddleware, async (req, res) => {
   try {
+    const user_id = Number(req.user.id) || 0;
     await pool.query(
-      `UPDATE notifications SET is_read = true WHERE to_branch_id = $1 AND is_read = false`,
-      [req.user.branch_id],
+      `UPDATE notifications SET is_read = true
+       WHERE is_read = false
+         AND (to_user_id = $2 OR (to_user_id IS NULL AND to_branch_id = $1))`,
+      [req.user.branch_id, user_id],
     );
     res.json({ success: true });
   } catch (err) {
@@ -14063,9 +14094,11 @@ app.put("/notifications/read-all", authMiddleware, async (req, res) => {
 ================================ */
 app.put("/notifications/:id/read", authMiddleware, async (req, res) => {
   try {
+    const user_id = Number(req.user.id) || 0;
     await pool.query(
-      `UPDATE notifications SET is_read = true WHERE id = $1 AND to_branch_id = $2`,
-      [req.params.id, req.user.branch_id],
+      `UPDATE notifications SET is_read = true
+       WHERE id = $1 AND (to_user_id = $3 OR (to_user_id IS NULL AND to_branch_id = $2))`,
+      [req.params.id, req.user.branch_id, user_id],
     );
     res.json({ success: true });
   } catch (err) {
@@ -14782,7 +14815,7 @@ async function sendPushToBranch(targetBranchId, title, body, data = {}) {
   }
 }
 
-async function sendPushToUser(targetUserId, senderName, body, convId) {
+async function sendPushToUser(targetUserId, senderName, body, convId, extraData = {}) {
   try {
     const subs = await pool.query(
       "SELECT * FROM push_subscriptions WHERE user_id = $1",
@@ -14791,7 +14824,11 @@ async function sendPushToUser(targetUserId, senderName, body, convId) {
     const payload = JSON.stringify({
       title: senderName,
       body,
-      data: { conversation_id: convId, url: "/" },
+      data: {
+        url: extraData?.url || "/",
+        ...(convId != null ? { conversation_id: convId } : {}),
+        ...extraData,
+      },
     });
     for (const sub of subs.rows) {
       const pushSub = {
@@ -15190,6 +15227,7 @@ function broadcastRealtime(event, payload, room = null) {
 }
 
 app.set("broadcastRealtime", broadcastRealtime);
+app.set("sendPushToUser", sendPushToUser);
 
 // ===== Secure WebSocket JWT & Service Token Handshake Authentication =====
 const PRINT_SERVICE_SECRET = process.env.PRINT_SERVICE_SECRET || "glass_print_daemon_2026";
@@ -15573,6 +15611,17 @@ runStartupMigrations().finally(() => {
     if (typeof pool.startContinuousStandbyBackup === "function") {
       pool.startContinuousStandbyBackup();
     }
+    // 🔔 Warehouse Rents 3-day pre-due & annual increase reminder scheduler
+    setTimeout(() => {
+      warehouseRentsController
+        .syncWarehouseRentReminders({ broadcastRealtime, sendPushToUser })
+        .catch(() => {});
+    }, 8000);
+    setInterval(() => {
+      warehouseRentsController
+        .syncWarehouseRentReminders({ broadcastRealtime, sendPushToUser })
+        .catch(() => {});
+    }, 6 * 60 * 60 * 1000);
     try {
       const { initQuazAi } = require("./quaz-ai");
       initQuazAi(app);

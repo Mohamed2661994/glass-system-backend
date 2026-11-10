@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const controller = require("./debts.controller");
+const warehouseRentsController = require("./warehouseRents.controller");
 
 /**
  * Middleware: Strictly restrict Debts & Personal Liabilities access to Administrators
@@ -30,6 +31,17 @@ router.get("/summary", controller.getSummary);
 
 // 2. Upcoming & Overdue Installments Timeline
 router.get("/upcoming", controller.getUpcoming);
+
+// 2.5 Warehouse Rents Management (MUST be registered before /:id!)
+router.get("/rents/summary", warehouseRentsController.getSummary);
+router.delete("/rents/payments/:paymentId", warehouseRentsController.deleteRentPayment);
+router.get("/rents", warehouseRentsController.getRents);
+router.post("/rents", warehouseRentsController.createRent);
+router.get("/rents/:id", warehouseRentsController.getRentById);
+router.put("/rents/:id", warehouseRentsController.updateRent);
+router.delete("/rents/:id", warehouseRentsController.deleteRent);
+router.post("/rents/:id/pay", warehouseRentsController.payRent);
+router.post("/rents/:id/apply-increase", warehouseRentsController.applyAnnualIncrease);
 
 // 3. Debts CRUD
 router.get("/", controller.getDebts);
