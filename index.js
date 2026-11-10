@@ -1355,6 +1355,35 @@ app.use((req, res, next) => {
           ts: Date.now(),
         };
 
+        const shouldInvalidateProducts =
+          channel === "data:stock" ||
+          channel === "data:products" ||
+          channel === "data:invoices" ||
+          channel === "data:inter-branch" ||
+          p.includes("/adjustment") ||
+          p.includes("/replace") ||
+          p.includes("/stock-watchdog/reconcile");
+        const shouldInvalidateBalances =
+          channel === "data:invoices" ||
+          channel === "data:cash" ||
+          channel === "data:customers" ||
+          p.includes("/cash-in");
+        const shouldInvalidateDashboard =
+          shouldInvalidateProducts || channel === "data:cash";
+
+        // 1. Clear server RAM caches BEFORE emitting realtime events to avoid stale re-fetches
+        if (shouldInvalidateProducts) {
+          invalidateProductsCache();
+          invalidateProductStockCache();
+        }
+        if (shouldInvalidateDashboard) {
+          invalidateDashboardStatsCache();
+        }
+        if (shouldInvalidateBalances) {
+          invalidateCustomerBalancesCache();
+        }
+
+        // 2. Broadcast realtime updates
         if (typeof broadcast === "function") {
           broadcast(channel, payload);
           // Inter-branch transfers and invoices also change stock levels across branches
@@ -1366,33 +1395,12 @@ app.use((req, res, next) => {
             broadcast("data:cash-in", payload);
           }
           // Also broadcast specific cross-client invalidation if stock or product changed
-          if (
-            channel === "data:stock" ||
-            channel === "data:products" ||
-            channel === "data:invoices" ||
-            channel === "data:inter-branch" ||
-            p.includes("/adjustment") ||
-            p.includes("/replace")
-          ) {
-            invalidateProductsCache();
-            invalidateDashboardStatsCache();
-            invalidateProductStockCache();
+          if (shouldInvalidateProducts) {
             broadcast("product_updated", {
               invalidateProducts: true,
               path: p,
               ts: Date.now(),
             });
-          }
-          if (
-            channel === "data:invoices" ||
-            channel === "data:cash" ||
-            channel === "data:customers" ||
-            p.includes("/cash-in")
-          ) {
-            invalidateCustomerBalancesCache();
-          }
-          if (channel === "data:cash") {
-            invalidateDashboardStatsCache();
           }
         } else if (io) {
           io.emit(channel, payload);
@@ -1402,23 +1410,12 @@ app.use((req, res, next) => {
           if (p.includes("/cash-in")) {
             io.emit("data:cash-in", payload);
           }
-          if (
-            channel === "data:invoices" ||
-            channel === "data:cash" ||
-            channel === "data:customers" ||
-            p.includes("/cash-in")
-          ) {
-            invalidateCustomerBalancesCache();
-          }
-          if (
-            channel === "data:invoices" ||
-            channel === "data:cash" ||
-            channel === "data:stock" ||
-            channel === "data:products" ||
-            channel === "data:inter-branch"
-          ) {
-            invalidateDashboardStatsCache();
-            invalidateProductStockCache();
+          if (shouldInvalidateProducts) {
+            io.emit("product_updated", {
+              invalidateProducts: true,
+              path: p,
+              ts: Date.now(),
+            });
           }
         }
 
@@ -1931,7 +1928,9 @@ async function batchApplyStockChanges(client, { warehouseId, operations }) {
       }
     }
 
-    const incList = Array.from(aggregatedIncrements.values());
+    const incList = Array.from(aggregatedIncrements.values()).sort(
+      (a, b) => a.productId - b.productId || a.variantId - b.variantId,
+    );
     const valPlaceholders = [];
     const params = [];
     let pIdx = 1;
@@ -1962,7 +1961,9 @@ async function batchApplyStockChanges(client, { warehouseId, operations }) {
       }
     }
 
-    const decList = Array.from(aggregatedDecrements.values());
+    const decList = Array.from(aggregatedDecrements.values()).sort(
+      (a, b) => a.productId - b.productId || a.variantId - b.variantId,
+    );
     const valPlaceholders = [];
     const params = [warehouseId];
     let pIdx = 2;
@@ -3022,15 +3023,23 @@ function assertInvoiceRevisionMatches(currentRevision, incomingRevision) {
    ⚡ Ultra-Fast In-Memory Cache for /products
    ========================================================= */
 const productsMemoryCache = new Map();
+const forReplaceMemoryCache = new Map();
+const forReplaceInFlight = new Map();
 const PRODUCTS_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL
+let productsCacheEpoch = 0;
 
 function getProductsCacheKey(warehouseId, invoiceType, movementType) {
   return `${warehouseId || "null"}:${invoiceType || ""}:${movementType || ""}`;
 }
 
 function invalidateProductsCache() {
-  if (productsMemoryCache.size > 0) {
-    productsMemoryCache.clear();
+  productsCacheEpoch += 1;
+  const hadCached =
+    productsMemoryCache.size > 0 || forReplaceMemoryCache.size > 0;
+  productsMemoryCache.clear();
+  forReplaceMemoryCache.clear();
+  forReplaceInFlight.clear();
+  if (hadCached) {
     console.log("⚡ Products in-memory cache invalidated.");
   }
 }
@@ -3180,12 +3189,15 @@ function prewarmProductsCache() {
   setTimeout(async () => {
     try {
       console.log("🔥 Pre-warming products in-memory cache...");
+      const warmEpoch = productsCacheEpoch;
       const rows = await fetchProductsFromDb("retail", 1, "sale");
-      productsMemoryCache.set(getProductsCacheKey(1, "retail", "sale"), {
-        data: rows,
-        timestamp: Date.now(),
-        isFetching: false,
-      });
+      if (warmEpoch === productsCacheEpoch) {
+        productsMemoryCache.set(getProductsCacheKey(1, "retail", "sale"), {
+          data: rows,
+          timestamp: Date.now(),
+          isFetching: false,
+        });
+      }
       console.log(`🔥 Products cache pre-warmed (${rows.length} retail products loaded into RAM)!`);
     } catch (err) {
       console.error("Products cache pre-warm error:", err.message);
@@ -3218,13 +3230,18 @@ app.get("/products", async (req, res) => {
     if (cached && cached.data) {
       if (!cached.isFetching) {
         cached.isFetching = true;
+        const revalidateEpoch = productsCacheEpoch;
         fetchProductsFromDb(invoice_type, warehouseId, movement_type)
           .then((fresh) => {
-            productsMemoryCache.set(cacheKey, {
-              data: fresh,
-              timestamp: Date.now(),
-              isFetching: false,
-            });
+            if (revalidateEpoch === productsCacheEpoch) {
+              productsMemoryCache.set(cacheKey, {
+                data: fresh,
+                timestamp: Date.now(),
+                isFetching: false,
+              });
+            } else {
+              cached.isFetching = false;
+            }
           })
           .catch((e) => {
             console.error("Background products cache refresh error:", e.message);
@@ -3236,12 +3253,15 @@ app.get("/products", async (req, res) => {
     }
 
     // 3. Cold Fetch
+    const fetchEpoch = productsCacheEpoch;
     const rows = await fetchProductsFromDb(invoice_type, warehouseId, movement_type);
-    productsMemoryCache.set(cacheKey, {
-      data: rows,
-      timestamp: Date.now(),
-      isFetching: false,
-    });
+    if (fetchEpoch === productsCacheEpoch) {
+      productsMemoryCache.set(cacheKey, {
+        data: rows,
+        timestamp: Date.now(),
+        isFetching: false,
+      });
+    }
     res.setHeader("X-Cache", "MISS");
     res.json(rows);
   } catch (error) {
@@ -4650,12 +4670,32 @@ app.post(
       await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
       await client.query("COMMIT");
 
+      invalidateProductsCache();
+      invalidateDashboardStatsCache();
+      invalidateProductStockCache();
+
+      const broadcast = req.app.get("broadcastRealtime");
       const io = req.app.get("io");
-      if (io) {
-        io.emit("data:invoices", {
-          action: "create",
-          invoice_id: invoiceId,
-          source,
+      const onlinePayload = {
+        action: "create",
+        invoice_id: invoiceId,
+        source,
+      };
+      if (typeof broadcast === "function") {
+        broadcast("data:invoices", onlinePayload);
+        broadcast("data:stock", onlinePayload);
+        broadcast("product_updated", {
+          invalidateProducts: true,
+          path: req.originalUrl || req.url,
+          ts: Date.now(),
+        });
+      } else if (io) {
+        io.emit("data:invoices", onlinePayload);
+        io.emit("data:stock", onlinePayload);
+        io.emit("product_updated", {
+          invalidateProducts: true,
+          path: req.originalUrl || req.url,
+          ts: Date.now(),
         });
       }
 
@@ -7600,6 +7640,12 @@ function invalidateDashboardStatsCache() {
   _dashboardCache.delete("low_stock_reorder_count");
 }
 
+stockWatchdogService.setOnReconcileCallback(() => {
+  invalidateProductsCache();
+  invalidateDashboardStatsCache();
+  invalidateProductStockCache();
+});
+
 async function fetchDashboardStats(invoice_type) {
   const cacheKey = `dashboard_stats_${invoice_type}`;
   const cached = getDashboardCache(cacheKey, 30000);
@@ -9718,48 +9764,237 @@ app.get("/stock/quantity-all", async (req, res) => {
   }
 });
 
-app.get("/products/for-replace", async (req, res) => {
-  try {
-    const { branch_id } = req.query;
+function parseStrictQueryInt(raw) {
+  if (raw === undefined || raw === null) return null;
+  const s = String(Array.isArray(raw) ? raw[0] : raw).trim();
+  if (!/^\d+$/.test(s)) return null;
+  const n = Number(s);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 2147483647) return null;
+  return n;
+}
 
-    if (!branch_id) {
-      return res.status(400).json({ error: "branch_id مطلوب" });
-    }
-
-    // 👇 مخزن الجملة للفرع
-    const warehouse_id = await getWholesaleWarehouseByBranch(branch_id);
-
-    const result = await pool.query(
-      `
+async function fetchForReplaceProductsFromDb(branchId, requestedIds = null) {
+  const hasIds = Array.isArray(requestedIds) && requestedIds.length > 0;
+  const sql = hasIds
+    ? `
+      WITH target_wh AS (
+        SELECT id
+        FROM warehouses
+        WHERE branch_id = $1
+        ORDER BY id DESC
+        LIMIT 1
+      ),
+      filtered_stock AS (
+        SELECT st.product_id, SUM(st.quantity) AS qty
+        FROM stock st
+        CROSS JOIN target_wh tw
+        WHERE st.warehouse_id = tw.id
+          AND st.product_id = ANY($2::int[])
+        GROUP BY st.product_id
+      )
       SELECT
+        tw.id AS _target_wh_id,
         p.id,
         p.name,
         p.barcode,
         p.wholesale_package,
         p.retail_package,
         p.manufacturer,
-        p.purchase_price,
-        p.wholesale_price,
+        COALESCE(p.purchase_price, 0)::float8 AS purchase_price,
+        COALESCE(p.wholesale_price, 0)::float8 AS wholesale_price,
         COALESCE(m.discount_base, 'purchase') AS discount_base,
-        COALESCE(s.qty, 0) AS available_quantity
-      FROM products p
+        COALESCE(m.percentage, 0)::float8 AS percent,
+        COALESCE(s.qty, 0)::float8 AS available_quantity
+      FROM target_wh tw
+      LEFT JOIN products p
+        ON p.is_active = true
+       AND p.id = ANY($2::int[])
       LEFT JOIN manufacturers m ON m.name = p.manufacturer
-      LEFT JOIN (
-        SELECT product_id, SUM(quantity) AS qty
-        FROM stock
-        WHERE warehouse_id = $1
-        GROUP BY product_id
-      ) s ON s.product_id = p.id
-      WHERE p.is_active = true
+      LEFT JOIN filtered_stock s ON s.product_id = p.id
       ORDER BY p.name
-      `,
-      [warehouse_id],
-    );
+    `
+    : `
+      WITH target_wh AS (
+        SELECT id
+        FROM warehouses
+        WHERE branch_id = $1
+        ORDER BY id DESC
+        LIMIT 1
+      ),
+      filtered_stock AS (
+        SELECT st.product_id, SUM(st.quantity) AS qty
+        FROM stock st
+        CROSS JOIN target_wh tw
+        WHERE st.warehouse_id = tw.id
+        GROUP BY st.product_id
+      )
+      SELECT
+        tw.id AS _target_wh_id,
+        p.id,
+        p.name,
+        p.barcode,
+        p.wholesale_package,
+        p.retail_package,
+        p.manufacturer,
+        COALESCE(p.purchase_price, 0)::float8 AS purchase_price,
+        COALESCE(p.wholesale_price, 0)::float8 AS wholesale_price,
+        COALESCE(m.discount_base, 'purchase') AS discount_base,
+        COALESCE(m.percentage, 0)::float8 AS percent,
+        COALESCE(s.qty, 0)::float8 AS available_quantity
+      FROM target_wh tw
+      LEFT JOIN products p ON p.is_active = true
+      LEFT JOIN manufacturers m ON m.name = p.manufacturer
+      LEFT JOIN filtered_stock s ON s.product_id = p.id
+      ORDER BY p.name
+    `;
 
-    res.json(result.rows);
+  const params = hasIds ? [branchId, requestedIds] : [branchId];
+  const result = await pool.query(sql, params);
+
+  if (!result.rows.length) {
+    const err = new Error("لا يوجد مخزن للفرع");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const rows = [];
+  for (const row of result.rows) {
+    if (row.id === null || row.id === undefined) continue;
+    const { _target_wh_id, ...cleanRow } = row;
+    rows.push(cleanRow);
+  }
+  return rows;
+}
+
+app.get("/products/for-replace", async (req, res) => {
+  try {
+    const { branch_id, ids } = req.query;
+
+    if (
+      branch_id === undefined ||
+      branch_id === null ||
+      String(Array.isArray(branch_id) ? branch_id[0] : branch_id).trim() === ""
+    ) {
+      return res.status(400).json({ error: "branch_id مطلوب" });
+    }
+
+    const branchId = parseStrictQueryInt(branch_id);
+    if (!branchId) {
+      return res.status(400).json({ error: "branch_id غير صالح" });
+    }
+
+    // Targeted ?ids= mode (always live DB read, bypasses server RAM cache)
+    let requestedIds = null;
+    if (ids !== undefined) {
+      const rawList = Array.isArray(ids) ? ids : [ids];
+      const tokens = rawList
+        .flatMap((v) => String(v ?? "").split(","))
+        .map((s) => s.trim());
+
+      if (tokens.every((t) => t === "")) {
+        return res.json([]);
+      }
+      if (tokens.some((t) => t === "")) {
+        return res.status(400).json({ error: "قائمة الأصناف غير صالحة" });
+      }
+      if (tokens.length > 200) {
+        return res
+          .status(400)
+          .json({ error: "الحد الأقصى للأصناف المطلوبة 200" });
+      }
+
+      const idSet = new Set();
+      for (const token of tokens) {
+        if (!/^\d+$/.test(token)) {
+          return res.status(400).json({ error: "معرف صنف غير صالح" });
+        }
+        const n = Number(token);
+        if (!Number.isSafeInteger(n) || n < 1 || n > 2147483647) {
+          return res.status(400).json({ error: "معرف صنف غير صالح" });
+        }
+        idSet.add(n);
+      }
+
+      requestedIds = Array.from(idSet);
+      const rows = await fetchForReplaceProductsFromDb(branchId, requestedIds);
+      res.setHeader("X-Cache", "BYPASS");
+      return res.json(rows);
+    }
+
+    // Full catalog mode: epoch-guarded RAM cache + SWR + in-flight dedup
+    const cacheKey = String(branchId);
+    const cached = forReplaceMemoryCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && now - cached.timestamp < PRODUCTS_CACHE_TTL_MS) {
+      res.setHeader("X-Cache", "HIT");
+      return res.json(cached.data);
+    }
+
+    if (cached && cached.data) {
+      if (!cached.isFetching) {
+        cached.isFetching = true;
+        const revalidateEpoch = productsCacheEpoch;
+        fetchForReplaceProductsFromDb(branchId, null)
+          .then((fresh) => {
+            if (revalidateEpoch === productsCacheEpoch) {
+              forReplaceMemoryCache.set(cacheKey, {
+                data: fresh,
+                timestamp: Date.now(),
+                isFetching: false,
+              });
+            } else {
+              cached.isFetching = false;
+            }
+          })
+          .catch((e) => {
+            console.error("Background for-replace cache refresh error:", e.message);
+            cached.isFetching = false;
+          });
+      }
+      res.setHeader("X-Cache", "STALE");
+      return res.json(cached.data);
+    }
+
+    const fetchEpoch = productsCacheEpoch;
+    const existingFlight = forReplaceInFlight.get(cacheKey);
+    let flightPromise;
+
+    if (existingFlight && existingFlight.epoch === fetchEpoch) {
+      flightPromise = existingFlight.promise;
+    } else {
+      flightPromise = fetchForReplaceProductsFromDb(branchId, null).then(
+        (rows) => {
+          if (fetchEpoch === productsCacheEpoch) {
+            forReplaceMemoryCache.set(cacheKey, {
+              data: rows,
+              timestamp: Date.now(),
+              isFetching: false,
+            });
+          }
+          return rows;
+        },
+      );
+      const flightEntry = { epoch: fetchEpoch, promise: flightPromise };
+      forReplaceInFlight.set(cacheKey, flightEntry);
+      flightPromise
+        .finally(() => {
+          if (forReplaceInFlight.get(cacheKey) === flightEntry) {
+            forReplaceInFlight.delete(cacheKey);
+          }
+        })
+        .catch(() => {});
+    }
+
+    const rows = await flightPromise;
+    res.setHeader("X-Cache", "MISS");
+    res.json(rows);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    if (err && err.statusCode === 400) {
+      return res.status(400).json({ error: err.message });
+    }
+    console.error("FOR-REPLACE ERROR:", err);
+    res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
 
@@ -11405,102 +11640,247 @@ app.get("/cash-in/:id", authMiddleware, async (req, res) => {
   }
 });
 
+function parseTransferPositiveInt(raw, max = 2147483647) {
+  if (typeof raw === "number") {
+    return Number.isSafeInteger(raw) && raw >= 1 && raw <= max ? raw : null;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const n = Number(trimmed);
+    return Number.isSafeInteger(n) && n >= 1 && n <= max ? n : null;
+  }
+  return null;
+}
+
+function parseTransferNonNegativeInt(raw, max = 2147483647) {
+  if (raw === undefined || raw === null || raw === "") return 0;
+  if (typeof raw === "number") {
+    return Number.isSafeInteger(raw) && raw >= 0 && raw <= max ? raw : null;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed === "") return 0;
+    if (!/^\d+$/.test(trimmed)) return null;
+    const n = Number(trimmed);
+    return Number.isSafeInteger(n) && n >= 0 && n <= max ? n : null;
+  }
+  return null;
+}
+
+function normalizeTransferFinalPrice(raw) {
+  if (raw === undefined || raw === null || raw === "") return 0;
+  if (typeof raw === "boolean" || typeof raw === "object") return null;
+  if (typeof raw === "string" && raw.trim() === "") return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 999999999.99) return null;
+  return Math.round(n * 100) / 100;
+}
+
+function normalizeTransferText(raw, maxLen = 1000) {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (typeof raw !== "string") return { ok: false, value: null };
+  const trimmed = raw.trim();
+  if (trimmed.length > maxLen) return { ok: false, value: null };
+  return { ok: true, value: trimmed === "" ? null : trimmed };
+}
+
+function createTransferDomainError(message) {
+  const err = new Error(message);
+  err.isTransferDomainError = true;
+  return err;
+}
+
 app.post("/stock/wholesale-to-retail/preview", async (req, res) => {
   try {
-    const { from_branch_id, to_branch_id, items } = req.body;
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const { from_branch_id, to_branch_id, items } = body;
 
     if (
-      !from_branch_id ||
-      !to_branch_id ||
-      !items ||
+      from_branch_id === undefined ||
+      from_branch_id === null ||
+      from_branch_id === "" ||
+      to_branch_id === undefined ||
+      to_branch_id === null ||
+      to_branch_id === "" ||
       !Array.isArray(items) ||
       items.length === 0
     ) {
       return res.status(400).json({ error: "بيانات ناقصة" });
     }
 
-    // ✅ مخزن الجملة (المصدر)
+    if (items.length > 500) {
+      return res
+        .status(400)
+        .json({ error: "الحد الأقصى لعناصر المعاينة 500 صنف" });
+    }
+
+    const fromBranchId = parseTransferPositiveInt(from_branch_id);
+    const toBranchId = parseTransferPositiveInt(to_branch_id);
+    if (fromBranchId !== 2 || toBranchId !== 1) {
+      return res.status(400).json({
+        error: "المسار مخصص للتحويل من مخزن الجملة (2) إلى المعرض (1) فقط",
+      });
+    }
+
+    // مخزن الجملة (المصدر)
     const wholesaleWarehouseId = getWarehouseIdByInvoiceType("wholesale");
 
+    // Pre-parse every row safely; only valid positive INT4 IDs reach PostgreSQL
+    const parsedRows = items.map((item) => {
+      const isObj =
+        Boolean(item) && typeof item === "object" && !Array.isArray(item);
+      const productId = isObj
+        ? parseTransferPositiveInt(item.product_id)
+        : null;
+      const quantity = isObj
+        ? parseTransferPositiveInt(item.quantity, 1000000)
+        : null;
+      const variantId = isObj
+        ? parseTransferNonNegativeInt(item.variant_id)
+        : null;
+      return {
+        raw: item,
+        isObj,
+        productId,
+        quantity,
+        variantId,
+      };
+    });
+
+    const uniqueProductIds = Array.from(
+      new Set(
+        parsedRows
+          .map((r) => r.productId)
+          .filter((id) => Number.isInteger(id) && id > 0),
+      ),
+    );
+    const uniqueVariantIds = Array.from(
+      new Set(
+        parsedRows
+          .map((r) => r.variantId)
+          .filter((vid) => Number.isInteger(vid) && vid > 0),
+      ),
+    );
+
+    const productMap = new Map();
+    const variantMap = new Map();
+    const stockMap = new Map();
+
+    // 1 single CTE query for all requested products, variants, and wholesale stock
+    if (uniqueProductIds.length > 0) {
+      const batchRes = await pool.query(
+        `
+        WITH req_products AS (
+          SELECT id, name, manufacturer, wholesale_package, retail_package
+          FROM products
+          WHERE id = ANY($1::int[]) AND is_active = true
+        ),
+        req_variants AS (
+          SELECT id, product_id, wholesale_package, retail_package
+          FROM product_variants
+          WHERE id = ANY($2::int[])
+        ),
+        req_stock AS (
+          SELECT
+            s.product_id,
+            COALESCE(s.variant_id, 0) AS variant_id,
+            COALESCE(s.quantity, 0)::int AS quantity
+          FROM stock s
+          WHERE s.warehouse_id = $3
+            AND s.product_id = ANY($1::int[])
+        )
+        SELECT
+          (SELECT COALESCE(json_agg(row_to_json(rp)), '[]'::json) FROM req_products rp) AS products_json,
+          (SELECT COALESCE(json_agg(row_to_json(rv)), '[]'::json) FROM req_variants rv) AS variants_json,
+          (SELECT COALESCE(json_agg(row_to_json(rs)), '[]'::json) FROM req_stock rs) AS stock_json
+        `,
+        [uniqueProductIds, uniqueVariantIds, wholesaleWarehouseId],
+      );
+
+      const payloadRow = batchRes.rows[0] || {};
+      for (const p of payloadRow.products_json || []) {
+        productMap.set(Number(p.id), p);
+      }
+      for (const v of payloadRow.variants_json || []) {
+        variantMap.set(Number(v.id), v);
+      }
+      for (const s of payloadRow.stock_json || []) {
+        stockMap.set(
+          `${Number(s.product_id)}:${Number(s.variant_id || 0)}`,
+          Number(s.quantity || 0),
+        );
+      }
+    }
+
     const previewResults = [];
+    const usedStockByKey = new Map();
 
-    for (const item of items) {
-      const { product_id, quantity, variant_id: rawVariantId } = item;
-      const variantId = rawVariantId || 0;
-
-      if (!product_id || !quantity || quantity <= 0) {
+    for (const row of parsedRows) {
+      if (!row.isObj || row.productId === null || row.quantity === null) {
         previewResults.push({
-          product_id,
-          variant_id: variantId,
+          product_id: row.raw?.product_id,
+          variant_id: row.variantId ?? 0,
           status: "rejected",
           reason: "INVALID_ITEM_DATA",
         });
         continue;
       }
 
-      // 1️⃣ بيانات الصنف
-      const productRes = await pool.query(
-        `
-       SELECT
-  id,
-  name,
-  manufacturer,
-  wholesale_package,
-  retail_package
-FROM products
-
-        WHERE id = $1 AND is_active = true
-        `,
-        [product_id],
-      );
-
-      if (!productRes.rows.length) {
+      const product = productMap.get(row.productId);
+      if (!product) {
         previewResults.push({
-          product_id,
-          variant_id: variantId,
+          product_id: row.productId,
+          variant_id: row.variantId ?? 0,
           status: "rejected",
           reason: "PRODUCT_NOT_FOUND",
         });
         continue;
       }
 
-      const product = productRes.rows[0];
+      if (row.variantId === null) {
+        previewResults.push({
+          product_id: row.productId,
+          variant_id: row.raw?.variant_id,
+          product_name: product.name,
+          package_name: product.wholesale_package,
+          status: "rejected",
+          reason: "INVALID_VARIANT",
+        });
+        continue;
+      }
 
-      // بيانات العبوة (من الأصناف الفرعية لو variant_id مش 0)
       let wholesalePkg = product.wholesale_package;
       let retailPkg = product.retail_package;
       let packageName = wholesalePkg;
 
-      if (variantId !== 0) {
-        const vRes = await pool.query(
-          `SELECT wholesale_package, retail_package FROM product_variants WHERE id = $1`,
-          [variantId],
-        );
-        if (vRes.rows.length) {
-          wholesalePkg = vRes.rows[0].wholesale_package || wholesalePkg;
-          retailPkg = vRes.rows[0].retail_package || retailPkg;
-          packageName = wholesalePkg;
+      if (row.variantId !== 0) {
+        const v = variantMap.get(row.variantId);
+        if (!v || Number(v.product_id) !== row.productId) {
+          previewResults.push({
+            product_id: row.productId,
+            variant_id: row.variantId,
+            product_name: product.name,
+            package_name: packageName,
+            status: "rejected",
+            reason: "INVALID_VARIANT",
+          });
+          continue;
         }
+        wholesalePkg = v.wholesale_package || wholesalePkg;
+        retailPkg = v.retail_package || retailPkg;
+        packageName = wholesalePkg;
       }
 
-      // 2️⃣ رصيد مخزن الجملة للعبوة المحددة
-      const stockRes = await pool.query(
-        `
-        SELECT quantity
-        FROM stock
-        WHERE product_id = $1 AND warehouse_id = $2 AND variant_id = $3
-        `,
-        [product_id, wholesaleWarehouseId, variantId],
-      );
+      const stockKey = `${row.productId}:${row.variantId}`;
+      const totalAvailable = stockMap.get(stockKey) ?? 0;
+      const alreadyAllocated = usedStockByKey.get(stockKey) ?? 0;
+      const availableQuantity = totalAvailable - alreadyAllocated;
 
-      const availableQuantity = stockRes.rows.length
-        ? Number(stockRes.rows[0].quantity)
-        : 0;
-
-      if (availableQuantity < quantity) {
+      if (availableQuantity < row.quantity) {
         previewResults.push({
-          product_id,
-          variant_id: variantId,
+          product_id: row.productId,
+          variant_id: row.variantId,
           product_name: product.name,
           package_name: packageName,
           status: "rejected",
@@ -11509,28 +11889,36 @@ FROM products
         continue;
       }
 
-      // 3️⃣ التحويل
       try {
         const result = convertWholesaleToRetail({
           wholesale_package: wholesalePkg,
           retail_package: retailPkg,
-          wholesale_quantity: quantity,
+          wholesale_quantity: row.quantity,
         });
 
+        if (
+          !Number.isInteger(result.retail_quantity) ||
+          result.retail_quantity <= 0
+        ) {
+          throw new Error("INVALID_QUANTITY");
+        }
+
+        usedStockByKey.set(stockKey, alreadyAllocated + row.quantity);
+
         previewResults.push({
-          product_id,
-          variant_id: variantId,
+          product_id: row.productId,
+          variant_id: row.variantId,
           product_name: product.name,
           manufacturer: product.manufacturer,
           package_name: packageName,
-          from_quantity: quantity,
+          from_quantity: row.quantity,
           to_quantity: result.retail_quantity,
           status: "ok",
         });
       } catch (err) {
         previewResults.push({
-          product_id,
-          variant_id: variantId,
+          product_id: row.productId,
+          variant_id: row.variantId,
           product_name: product.name,
           package_name: packageName,
           status: "rejected",
@@ -11542,7 +11930,7 @@ FROM products
     res.json(previewResults);
   } catch (err) {
     console.error("PREVIEW ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
 
@@ -11550,145 +11938,356 @@ app.post(
   "/stock/wholesale-to-retail/execute",
   authMiddleware,
   async (req, res) => {
-    const client = await pool.connect();
+    // 1. Validate request & auth synchronously BEFORE borrowing a DB connection
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const { from_branch_id, to_branch_id, items, note } = body;
 
-    try {
-      const { from_branch_id, to_branch_id, items, note, created_by } =
-        req.body;
+    if (
+      from_branch_id === undefined ||
+      from_branch_id === null ||
+      from_branch_id === "" ||
+      to_branch_id === undefined ||
+      to_branch_id === null ||
+      to_branch_id === "" ||
+      !Array.isArray(items) ||
+      items.length === 0
+    ) {
+      return res.status(400).json({ success: false, error: "بيانات ناقصة" });
+    }
 
-      if (
-        !from_branch_id ||
-        !to_branch_id ||
-        !Array.isArray(items) ||
-        items.length === 0
-      ) {
-        return res.status(400).json({ error: "بيانات ناقصة" });
+    if (items.length > 500) {
+      return res.status(400).json({
+        success: false,
+        error: "الحد الأقصى لعناصر التحويل 500 صنف",
+      });
+    }
+
+    const fromBranchId = parseTransferPositiveInt(from_branch_id);
+    const toBranchId = parseTransferPositiveInt(to_branch_id);
+    if (fromBranchId !== 2 || toBranchId !== 1) {
+      return res.status(400).json({
+        success: false,
+        error: "المسار مخصص للتحويل من مخزن الجملة (2) إلى المعرض (1) فقط",
+      });
+    }
+
+    const actorUserId = parseTransferPositiveInt(req.user?.id);
+    if (!actorUserId) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+
+    const headerNoteNorm = normalizeTransferText(note, 1000);
+    if (!headerNoteNorm.ok) {
+      return res
+        .status(400)
+        .json({ success: false, error: "INVALID_ITEM_DATA" });
+    }
+
+    const lineMap = new Map();
+    const dedupedLines = [];
+
+    for (const item of items) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return res
+          .status(400)
+          .json({ success: false, error: "INVALID_ITEM_DATA" });
       }
 
-      await client.query("BEGIN");
+      const productId = parseTransferPositiveInt(item.product_id);
+      const quantity = parseTransferPositiveInt(item.quantity, 1000000);
+      if (productId === null || quantity === null) {
+        return res
+          .status(400)
+          .json({ success: false, error: "INVALID_ITEM_DATA" });
+      }
 
-      // ✅ مخزن الجملة (المصدر) + ✅ مخزن القطاعي (الوجهة)
+      const variantId = parseTransferNonNegativeInt(item.variant_id);
+      if (variantId === null) {
+        return res
+          .status(400)
+          .json({ success: false, error: "INVALID_VARIANT" });
+      }
+
+      const finalPrice = normalizeTransferFinalPrice(item.final_price);
+      if (finalPrice === null) {
+        return res
+          .status(400)
+          .json({ success: false, error: "INVALID_ITEM_DATA" });
+      }
+
+      const rawItemNote =
+        item.notes !== undefined ? item.notes : item.note;
+      const itemNoteNorm = normalizeTransferText(rawItemNote, 1000);
+      if (!itemNoteNorm.ok) {
+        return res
+          .status(400)
+          .json({ success: false, error: "INVALID_ITEM_DATA" });
+      }
+
+      const lineKey = `${productId}:${variantId}`;
+      const existing = lineMap.get(lineKey);
+      if (!existing) {
+        const entry = {
+          productId,
+          variantId,
+          quantity,
+          finalPrice,
+          notesList: itemNoteNorm.value ? [itemNoteNorm.value] : [],
+        };
+        lineMap.set(lineKey, entry);
+        dedupedLines.push(entry);
+      } else {
+        const nextQty = existing.quantity + quantity;
+        if (!Number.isSafeInteger(nextQty) || nextQty > 2147483647) {
+          return res
+            .status(400)
+            .json({ success: false, error: "INVALID_QUANTITY" });
+        }
+        existing.quantity = nextQty;
+        existing.finalPrice =
+          Math.round((existing.finalPrice + finalPrice) * 100) / 100;
+        if (
+          itemNoteNorm.value &&
+          !existing.notesList.includes(itemNoteNorm.value)
+        ) {
+          existing.notesList.push(itemNoteNorm.value);
+        }
+      }
+    }
+
+    const uniqueProductIds = Array.from(
+      new Set(dedupedLines.map((l) => l.productId)),
+    );
+    const uniqueVariantIds = Array.from(
+      new Set(
+        dedupedLines.map((l) => l.variantId).filter((vid) => vid > 0),
+      ),
+    );
+
+    const client = await pool.connect();
+    let txStarted = false;
+
+    try {
+      await client.query("BEGIN");
+      txStarted = true;
+
+      // مخزن الجملة (المصدر) + مخزن القطاعي (الوجهة)
       const wholesaleWarehouseId = getWarehouseIdByInvoiceType("wholesale");
       const retailWarehouseId = getWarehouseIdByInvoiceType("retail");
 
-      // 1️⃣ إنشاء رأس التحويل
-      const transferRes = await client.query(
+      // 1️⃣ جلب بيانات الأصناف والأكواد الفرعية في استعلام CTE واحد (بدون Promise.all على client واحد)
+      const metaRes = await client.query(
         `
-      INSERT INTO stock_transfers (branch_id, created_by, note)
-      VALUES ($1, $2, $3)
-      RETURNING id
-      `,
-        [from_branch_id, created_by || null, note || null],
+        WITH req_products AS (
+          SELECT id, name, wholesale_package, retail_package, retail_master_product_id
+          FROM products
+          WHERE id = ANY($1::int[]) AND is_active = true
+        ),
+        req_variants AS (
+          SELECT id, product_id, wholesale_package, retail_package
+          FROM product_variants
+          WHERE id = ANY($2::int[])
+        )
+        SELECT
+          (SELECT COALESCE(json_agg(row_to_json(rp)), '[]'::json) FROM req_products rp) AS products_json,
+          (SELECT COALESCE(json_agg(row_to_json(rv)), '[]'::json) FROM req_variants rv) AS variants_json
+        `,
+        [uniqueProductIds, uniqueVariantIds],
       );
 
-      const transferId = transferRes.rows[0].id;
+      const metaRow = metaRes.rows[0] || {};
+      const productMap = new Map();
+      for (const p of metaRow.products_json || []) {
+        productMap.set(Number(p.id), p);
+      }
+      const variantMap = new Map();
+      for (const v of metaRow.variants_json || []) {
+        variantMap.set(Number(v.id), v);
+      }
 
-      const resultItems = [];
+      // 2️⃣ التحقق من الأصناف والعبوات وحساب التحويل قبل إنشاء رأس التحويل
+      const resolvedLines = [];
+      const wholesaleAgg = new Map();
+      const retailAgg = new Map();
 
-      // 2️⃣ تنفيذ العناصر
-      for (const item of items) {
-        const product_id = Number(item.product_id);
-        const quantity = Number(item.quantity);
-        const variantId = Number(item.variant_id) || 0;
-
-        if (!product_id || quantity <= 0) {
-          throw new Error("INVALID_ITEM_DATA");
+      for (const line of dedupedLines) {
+        const product = productMap.get(line.productId);
+        if (!product) {
+          throw createTransferDomainError(`PRODUCT_NOT_FOUND:${line.productId}`);
         }
 
-        // 🔹 بيانات الصنف
-        const productRes = await client.query(
-          `
-        SELECT id, name, wholesale_package, retail_package, retail_master_product_id
-        FROM products
-        WHERE id = $1 AND is_active = true
-        `,
-          [product_id],
-        );
-
-        if (!productRes.rows.length) {
-          throw new Error(`PRODUCT_NOT_FOUND:${product_id}`);
-        }
-
-        const product = productRes.rows[0];
-
-        // بيانات العبوة (من الأصناف الفرعية لو variant_id مش 0)
         let wholesalePkg = product.wholesale_package;
         let retailPkg = product.retail_package;
 
-        if (variantId !== 0) {
-          const vRes = await client.query(
-            `SELECT wholesale_package, retail_package FROM product_variants WHERE id = $1`,
-            [variantId],
-          );
-          if (vRes.rows.length) {
-            wholesalePkg = vRes.rows[0].wholesale_package || wholesalePkg;
-            retailPkg = vRes.rows[0].retail_package || retailPkg;
+        if (line.variantId !== 0) {
+          const variant = variantMap.get(line.variantId);
+          if (!variant || Number(variant.product_id) !== line.productId) {
+            throw createTransferDomainError("INVALID_VARIANT");
           }
+          wholesalePkg = variant.wholesale_package || wholesalePkg;
+          retailPkg = variant.retail_package || retailPkg;
         }
 
-        // 🔹 رصيد الجملة (قفل الصف)
-        const stockRes = await client.query(
-          `
-        SELECT quantity
-        FROM stock
-        WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = $3
-        FOR UPDATE
-        `,
-          [wholesaleWarehouseId, product_id, variantId],
-        );
-
-        const available = stockRes.rows.length
-          ? Number(stockRes.rows[0].quantity)
-          : 0;
-
-        if (available < quantity) {
-          throw new Error(`INSUFFICIENT_STOCK:${product.name}`);
-        }
-
-        // 🔹 التحويل
         const conversion = convertWholesaleToRetail({
           wholesale_package: wholesalePkg,
           retail_package: retailPkg,
-          wholesale_quantity: quantity,
+          wholesale_quantity: line.quantity,
         });
 
-        // 3️⃣ خصم من الجملة
-        await client.query(
-          `
-        UPDATE stock
-        SET quantity = quantity - $1
-        WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
-        `,
-          [quantity, wholesaleWarehouseId, product_id, variantId],
-        );
+        if (
+          !Number.isInteger(conversion.retail_quantity) ||
+          conversion.retail_quantity <= 0
+        ) {
+          throw createTransferDomainError("INVALID_QUANTITY");
+        }
 
-        // 4️⃣ إضافة للقطاعي
-        // 🔥 دمج كود القطاعي: إجبار البضاعة المحولة للقطاعي أينما كانت على الكود الأساسي (0)
-        // ولو الصنف مدموج تحت صنف ماستر، يتم توجيهه للماستر مباشرة
-        const targetVariantId = retailWarehouseId === 1 ? 0 : variantId;
+        // دمج كود القطاعي على 0 (وعلى الماستر لو الصنف مدموج تحت ماستر)
+        const targetVariantId = retailWarehouseId === 1 ? 0 : line.variantId;
         const targetProductId =
           retailWarehouseId === 1 && product.retail_master_product_id
             ? Number(product.retail_master_product_id)
-            : product_id;
+            : line.productId;
 
-        await client.query(
-          `
-        INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (warehouse_id, product_id, variant_id)
-        DO UPDATE SET quantity = stock.quantity + $4
+        const wKey = `${line.productId}:${line.variantId}`;
+        const wEntry = wholesaleAgg.get(wKey);
+        if (!wEntry) {
+          wholesaleAgg.set(wKey, {
+            productId: line.productId,
+            variantId: line.variantId,
+            qty: line.quantity,
+            productName: product.name,
+          });
+        } else {
+          wEntry.qty += line.quantity;
+        }
+
+        const rKey = `${targetProductId}:${targetVariantId}`;
+        const rEntry = retailAgg.get(rKey);
+        if (!rEntry) {
+          retailAgg.set(rKey, {
+            productId: targetProductId,
+            variantId: targetVariantId,
+            qty: conversion.retail_quantity,
+          });
+        } else {
+          rEntry.qty += conversion.retail_quantity;
+        }
+
+        resolvedLines.push({
+          productId: line.productId,
+          variantId: line.variantId,
+          productName: product.name,
+          targetProductId,
+          targetVariantId,
+          fromQuantity: line.quantity,
+          toQuantity: conversion.retail_quantity,
+          finalPrice: line.finalPrice,
+          notes: line.notesList.length ? line.notesList.join(" | ") : null,
+        });
+      }
+
+      const wholesaleSorted = Array.from(wholesaleAgg.values()).sort(
+        (a, b) => a.productId - b.productId || a.variantId - b.variantId,
+      );
+      const retailSorted = Array.from(retailAgg.values()).sort(
+        (a, b) => a.productId - b.productId || a.variantId - b.variantId,
+      );
+
+      // 3️⃣ قفل أرصدة الجملة بالترتيب الحتمي عبر LATERAL FOR UPDATE والتحقق من الكفاية
+      const lockRes = await client.query(
+        `
+        SELECT
+          req.product_id,
+          req.variant_id,
+          COALESCE(s.quantity, 0)::int AS quantity,
+          (s.product_id IS NOT NULL) AS row_exists
+        FROM UNNEST($2::int[], $3::int[]) WITH ORDINALITY AS req(product_id, variant_id, ord)
+        LEFT JOIN LATERAL (
+          SELECT st.product_id, st.variant_id, st.quantity
+          FROM stock st
+          WHERE st.warehouse_id = $1
+            AND st.product_id = req.product_id
+            AND st.variant_id = req.variant_id
+          FOR UPDATE
+        ) s ON true
+        ORDER BY req.ord
         `,
-          [
-            retailWarehouseId,
-            targetProductId,
-            targetVariantId,
-            conversion.retail_quantity,
-          ],
-        );
+        [
+          wholesaleWarehouseId,
+          wholesaleSorted.map((w) => w.productId),
+          wholesaleSorted.map((w) => w.variantId),
+        ],
+      );
 
-        // 5️⃣ تفاصيل التحويل
-        await client.query(
-          `
+      const lockedMap = new Map();
+      for (const r of lockRes.rows) {
+        lockedMap.set(`${Number(r.product_id)}:${Number(r.variant_id)}`, r);
+      }
+
+      for (const w of wholesaleSorted) {
+        const locked = lockedMap.get(`${w.productId}:${w.variantId}`);
+        if (!locked || !locked.row_exists || Number(locked.quantity) < w.qty) {
+          throw createTransferDomainError(`INSUFFICIENT_STOCK:${w.productName}`);
+        }
+      }
+
+      // 4️⃣ إنشاء رأس التحويل (باستخدام معرف المستخدم الحقيقي من التوكن)
+      const transferRes = await client.query(
+        `
+        INSERT INTO stock_transfers (branch_id, created_by, note)
+        VALUES ($1, $2, $3)
+        RETURNING id
+        `,
+        [fromBranchId, actorUserId, headerNoteNorm.value],
+      );
+      const transferId = transferRes.rows[0].id;
+
+      // 5️⃣ خصم مجمّع من الجملة
+      const decRes = await client.query(
+        `
+        UPDATE stock s
+        SET quantity = COALESCE(s.quantity, 0) - u.qty
+        FROM UNNEST($2::int[], $3::int[], $4::int[]) AS u(product_id, variant_id, qty)
+        WHERE s.warehouse_id = $1
+          AND s.product_id = u.product_id
+          AND s.variant_id = u.variant_id
+          AND COALESCE(s.quantity, 0) >= u.qty
+        `,
+        [
+          wholesaleWarehouseId,
+          wholesaleSorted.map((w) => w.productId),
+          wholesaleSorted.map((w) => w.variantId),
+          wholesaleSorted.map((w) => w.qty),
+        ],
+      );
+
+      if (decRes.rowCount !== wholesaleSorted.length) {
+        throw createTransferDomainError(
+          `INSUFFICIENT_STOCK:${wholesaleSorted[0]?.productName || ""}`,
+        );
+      }
+
+      // 6️⃣ إضافة مجمّعة للقطاعي بترتيب حتمي
+      await client.query(
+        `
+        INSERT INTO stock (warehouse_id, product_id, variant_id, quantity)
+        SELECT $1, u.product_id, u.variant_id, u.qty
+        FROM UNNEST($2::int[], $3::int[], $4::int[]) WITH ORDINALITY AS u(product_id, variant_id, qty, ord)
+        ORDER BY u.ord
+        ON CONFLICT (warehouse_id, product_id, variant_id)
+        DO UPDATE SET quantity = COALESCE(stock.quantity, 0) + EXCLUDED.quantity
+        `,
+        [
+          retailWarehouseId,
+          retailSorted.map((r) => r.productId),
+          retailSorted.map((r) => r.variantId),
+          retailSorted.map((r) => r.qty),
+        ],
+      );
+
+      // 7️⃣ إدراج مجمّع لتفاصيل التحويل مع الحفاظ على ترتيب الأصناف
+      await client.query(
+        `
         INSERT INTO stock_transfer_items
         (
           transfer_id,
@@ -11701,146 +12300,207 @@ app.post(
           total_price,
           notes
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        SELECT
+          $1,
+          u.product_id,
+          u.target_product_id,
+          $2,
+          $3,
+          u.from_quantity,
+          u.to_quantity,
+          u.total_price,
+          u.notes
+        FROM UNNEST(
+          $4::int[],
+          $5::int[],
+          $6::numeric[],
+          $7::numeric[],
+          $8::numeric[],
+          $9::text[]
+        ) WITH ORDINALITY AS u(product_id, target_product_id, from_quantity, to_quantity, total_price, notes, ord)
+        ORDER BY u.ord
         `,
-          [
-            transferId,
-            product_id,
-            targetProductId,
-            wholesaleWarehouseId,
-            retailWarehouseId,
-            quantity,
-            conversion.retail_quantity,
-            item.final_price || 0,
-            item.notes || item.note || null,
-          ],
-        );
+        [
+          transferId,
+          wholesaleWarehouseId,
+          retailWarehouseId,
+          resolvedLines.map((l) => l.productId),
+          resolvedLines.map((l) => l.targetProductId),
+          resolvedLines.map((l) => l.fromQuantity),
+          resolvedLines.map((l) => l.toQuantity),
+          resolvedLines.map((l) => l.finalPrice),
+          resolvedLines.map((l) => l.notes),
+        ],
+      );
 
-        // 6️⃣ حركة مخزون (خروج)
-        await client.query(
-          `
-        INSERT INTO stock_movements
-        (
-          warehouse_id,
-          product_id,
-          variant_id,
-          quantity,
-          movement_type,
-          reference_type,
-          reference_id,
-          note
-        )
-        VALUES ($1,$2,$3,$4,'transfer_out','transfer',$5,$6)
-        `,
-          [
-            wholesaleWarehouseId,
-            product_id,
-            variantId,
-            quantity,
-            transferId,
-            "تحويل من الجملة إلى القطاعي",
-          ],
-        );
+      // 8️⃣ إدراج مجمّع لحركات المخزون (خروج ثم دخول بنفس الترتيب المتداخل لكل صنف)
+      const movWarehouses = [];
+      const movProducts = [];
+      const movVariants = [];
+      const movQuantities = [];
+      const movTypes = [];
 
-        // 7️⃣ حركة مخزون (دخول)
-        await client.query(
-          `
-        INSERT INTO stock_movements
-        (
-          warehouse_id,
-          product_id,
-          variant_id,
-          quantity,
-          movement_type,
-          reference_type,
-          reference_id,
-          note
-        )
-        VALUES ($1,$2,$3,$4,'transfer_in','transfer',$5,$6)
-        `,
-          [
-            retailWarehouseId,
-            targetProductId,
-            targetVariantId,
-            conversion.retail_quantity,
-            transferId,
-            "تحويل من الجملة إلى القطاعي",
-          ],
-        );
-
-        resultItems.push({
-          product_id,
-          product_name: product.name,
-          from_quantity: quantity,
-          to_quantity: conversion.retail_quantity,
-        });
+      for (const l of resolvedLines) {
+        movWarehouses.push(wholesaleWarehouseId, retailWarehouseId);
+        movProducts.push(l.productId, l.targetProductId);
+        movVariants.push(l.variantId, l.targetVariantId);
+        movQuantities.push(l.fromQuantity, l.toQuantity);
+        movTypes.push("transfer_out", "transfer_in");
       }
+
+      await client.query(
+        `
+        INSERT INTO stock_movements
+        (
+          warehouse_id,
+          product_id,
+          variant_id,
+          quantity,
+          movement_type,
+          reference_type,
+          reference_id,
+          note
+        )
+        SELECT
+          u.warehouse_id,
+          u.product_id,
+          u.variant_id,
+          u.quantity,
+          u.movement_type,
+          'transfer',
+          $1,
+          'تحويل من الجملة إلى القطاعي'
+        FROM UNNEST(
+          $2::int[],
+          $3::int[],
+          $4::int[],
+          $5::int[],
+          $6::text[]
+        ) WITH ORDINALITY AS u(warehouse_id, product_id, variant_id, quantity, movement_type, ord)
+        ORDER BY u.ord
+        `,
+        [
+          transferId,
+          movWarehouses,
+          movProducts,
+          movVariants,
+          movQuantities,
+          movTypes,
+        ],
+      );
 
       await client.query("COMMIT");
+      txStarted = false;
 
-      // 🔔 Notification to destination branch
-      try {
-        const senderRes = await pool.query(
-          "SELECT full_name FROM users WHERE id = $1",
-          [req.user.id],
-        );
-        const senderName = senderRes.rows[0]?.full_name || "مستخدم";
-        const title = "تحويل بضاعة من المعرض";
-        const message = `قام ${senderName} بسحب ${items.length} صنف من المخزن — تحويل رقم #${transferId}`;
+      const resultItems = resolvedLines.map((l) => ({
+        product_id: l.productId,
+        product_name: l.productName,
+        from_quantity: l.fromQuantity,
+        to_quantity: l.toQuantity,
+      }));
 
-        await pool.query(
-          `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-          [
-            title,
-            message,
-            req.user.id,
-            from_branch_id,
-            "stock_transfer",
-            transferId,
-          ],
-        );
-
-        const broadcast = req.app.get("broadcastRealtime");
-        if (typeof broadcast === "function") {
-          broadcast("new_notification", {
-            title,
-            message,
-            type: "stock_transfer",
-            reference_id: transferId,
-          }, `branch_${from_branch_id}`);
-        } else {
-          const io = req.app.get("io");
-          if (io) {
-            io.to(`branch_${from_branch_id}`).emit("new_notification", {
-              title,
-              message,
-              type: "stock_transfer",
-              reference_id: transferId,
-            });
-          }
-        }
-
-        sendPushToBranch(from_branch_id, title, message, {
-          type: "stock_transfer",
-          transfer_id: transferId,
-        });
-      } catch (notifErr) {
-        console.error("TRANSFER NOTIFICATION ERROR:", notifErr);
-      }
+      // Capture app broadcasters synchronously before responding cleanly
+      const broadcast = req.app.get("broadcastRealtime");
+      const io = req.app.get("io");
+      const transferredCount = resolvedLines.length;
 
       res.json({
         success: true,
         transfer_id: transferId,
         items: resultItems,
       });
+
+      // 🔔 Non-blocking post-commit notification & push (zero added RTT to HTTP response)
+      void (async () => {
+        try {
+          const senderRes = await pool.query(
+            "SELECT full_name FROM users WHERE id = $1",
+            [actorUserId],
+          );
+          const senderName = senderRes.rows[0]?.full_name || "مستخدم";
+          const title = "تحويل بضاعة من المعرض";
+          const message = `قام ${senderName} بسحب ${transferredCount} صنف من المخزن — تحويل رقم #${transferId}`;
+
+          await pool.query(
+            `INSERT INTO notifications (title, message, from_user_id, to_branch_id, type, reference_id)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              title,
+              message,
+              actorUserId,
+              fromBranchId,
+              "stock_transfer",
+              transferId,
+            ],
+          );
+
+          if (typeof broadcast === "function") {
+            broadcast(
+              "new_notification",
+              {
+                title,
+                message,
+                type: "stock_transfer",
+                reference_id: transferId,
+              },
+              `branch_${fromBranchId}`,
+            );
+          } else if (io) {
+            io.to(`branch_${fromBranchId}`).emit("new_notification", {
+              title,
+              message,
+              type: "stock_transfer",
+              reference_id: transferId,
+            });
+          }
+
+          sendPushToBranch(fromBranchId, title, message, {
+            type: "stock_transfer",
+            transfer_id: transferId,
+          });
+        } catch (notifErr) {
+          console.error("TRANSFER NOTIFICATION ERROR:", notifErr);
+        }
+      })();
     } catch (err) {
-      await client.query("ROLLBACK");
+      if (txStarted) {
+        await client.query("ROLLBACK").catch(() => {});
+      }
       console.error("EXECUTE TRANSFER ERROR:", err);
 
-      res.status(400).json({
+      if (err && err.code === "40P01") {
+        return res.status(409).json({
+          success: false,
+          error: "تعارض مؤقت في تعديل المخزون، يرجى المحاولة مرة أخرى",
+        });
+      }
+
+      const knownExact = new Set([
+        "INVALID_ITEM_DATA",
+        "INVALID_VARIANT",
+        "INVALID_QUANTITY",
+        "PACKAGE_NOT_ANALYZABLE",
+        "WHOLESALE_NOT_ANALYZABLE",
+        "FRACTION_RESULT",
+      ]);
+      const msg = String(err?.message || "");
+      const isDomainError =
+        Boolean(err?.isTransferDomainError) ||
+        err?.statusCode === 400 ||
+        knownExact.has(msg) ||
+        msg.startsWith("PRODUCT_NOT_FOUND:") ||
+        msg.startsWith("INSUFFICIENT_STOCK:");
+
+      if (isDomainError) {
+        return res.status(400).json({
+          success: false,
+          error: msg,
+        });
+      }
+
+      return res.status(500).json({
         success: false,
-        error: err.message,
+        error: "خطأ في الخادم",
       });
     } finally {
       client.release();
@@ -12600,6 +13260,24 @@ app.post("/system/factory-reset", authMiddleware, async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    invalidateProductsCache();
+    invalidateDashboardStatsCache();
+    invalidateProductStockCache();
+    invalidateCustomerBalancesCache();
+
+    const broadcast = req.app.get("broadcastRealtime");
+    const io = req.app.get("io");
+    const resetPayload = {
+      invalidateProducts: true,
+      path: req.originalUrl || req.url,
+      ts: Date.now(),
+    };
+    if (typeof broadcast === "function") {
+      broadcast("product_updated", resetPayload);
+    } else if (io) {
+      io.emit("product_updated", resetPayload);
+    }
 
     res.json({
       success: true,

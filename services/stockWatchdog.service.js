@@ -12,6 +12,14 @@ let lastAuditTimestamp = null;
 let isAuditing = false;
 let debounceTimer = null;
 const pendingProductIds = new Set();
+let onReconcileCallback = null;
+
+/**
+ * Registers an optional callback invoked after stock reconciliation updates the DB.
+ */
+function setOnReconcileCallback(fn) {
+  onReconcileCallback = typeof fn === "function" ? fn : null;
+}
 
 /**
  * Returns current watchdog status directly from RAM in 0.1ms.
@@ -209,6 +217,18 @@ async function reconcileStock({ warehouseId = null, io = null, adminName = "Admi
     const updatedCount = res.rows.length;
     console.log(`✅ [Stock Watchdog] Successfully reconciled ${updatedCount} items in stock table by ${adminName}.`);
 
+    if (typeof onReconcileCallback === "function") {
+      try {
+        onReconcileCallback({
+          warehouseId,
+          updatedCount,
+          updatedItems: res.rows,
+        });
+      } catch (cbErr) {
+        console.error("⚠️ [Stock Watchdog] onReconcile callback error:", cbErr.message);
+      }
+    }
+
     // Force an immediate audit refresh and broadcast the new clean status via Socket.IO
     await runAudit({ io, force: true });
 
@@ -231,5 +251,6 @@ module.exports = {
   broadcastStatus,
   initStartupAudit,
   reconcileStock,
+  setOnReconcileCallback,
 };
 
