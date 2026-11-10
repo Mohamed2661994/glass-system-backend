@@ -4207,7 +4207,16 @@ app.get("/suppliers/:id/balance", async (req, res) => {
 
     const openResult = await pool.query(
       `
-      SELECT COALESCE(previous_balance, 0) AS opening_balance
+      SELECT CASE
+               WHEN EXISTS (
+                 SELECT 1
+                 FROM supplier_adjustments sa
+                 WHERE sa.supplier_id = invoices.supplier_id
+                   AND sa.branch_id = invoices.branch_id
+                   AND sa.created_at < (invoices.created_at AT TIME ZONE 'UTC')
+               ) THEN 0
+               ELSE COALESCE(previous_balance, 0)
+             END AS opening_balance
       FROM invoices
       WHERE supplier_id = $1
         AND movement_type = 'purchase'

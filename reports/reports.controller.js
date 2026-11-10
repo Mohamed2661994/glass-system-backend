@@ -40,6 +40,38 @@ async function ensureSupplierAdjustmentsTable() {
   return supplierAdjustmentsTableReadyPromise;
 }
 
+let supplierVerificationsTableReadyPromise = null;
+async function ensureSupplierVerificationsTable() {
+  if (!supplierVerificationsTableReadyPromise) {
+    supplierVerificationsTableReadyPromise = pool
+      .query(`
+        CREATE TABLE IF NOT EXISTS supplier_branch_verifications (
+          branch_id INTEGER NOT NULL,
+          supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+          is_verified BOOLEAN NOT NULL DEFAULT true,
+          verified_by INTEGER,
+          verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (branch_id, supplier_id)
+        );
+      `)
+      .catch((err) => {
+        supplierVerificationsTableReadyPromise = null;
+        throw err;
+      });
+  }
+  return supplierVerificationsTableReadyPromise;
+}
+
+function normalizeSupplierSearchArabic(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    .replace(/[أإآٱ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ة/g, "ه");
+}
+
 async function computeSupplierBranchBalance(clientOrPool, supplierId, branchId) {
   await ensureSupplierAdjustmentsTable();
   const invWhere = branchId
@@ -70,7 +102,16 @@ async function computeSupplierBranchBalance(clientOrPool, supplierId, branchId) 
       params,
     ),
     clientOrPool.query(
-      `SELECT COALESCE(previous_balance, 0) AS opening_balance
+      `SELECT CASE
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM supplier_adjustments sa
+                  WHERE sa.supplier_id = invoices.supplier_id
+                    AND sa.branch_id = invoices.branch_id
+                    AND sa.created_at < (invoices.created_at AT TIME ZONE 'UTC')
+                ) THEN 0
+                ELSE COALESCE(previous_balance, 0)
+              END AS opening_balance
        FROM invoices WHERE ${invWhere}
        ORDER BY invoice_date ASC, id ASC LIMIT 1`,
       params,
@@ -1749,21 +1790,40 @@ exports.getSupplierBalances = async (req, res) => {
     let idx = 1;
 
     if (supplier_name) {
-      conditions.push(`s.name ILIKE $${idx++}`);
-      values.push(`%${supplier_name}%`);
+      const cleanName = String(supplier_name).trim().replace(/\s+/g, " ");
+      if (cleanName) {
+        const escapedNorm = normalizeSupplierSearchArabic(cleanName).replace(
+          /[\\%_]/g,
+          "\\$&",
+        );
+        const escapedRaw = cleanName.replace(/[\\%_]/g, "\\$&");
+        const pNorm = `$${idx++}`;
+        const pRaw = `$${idx++}`;
+        conditions.push(
+          `(translate(regexp_replace(BTRIM(s.name), '\\s+', ' ', 'g'), 'أإآٱىة', 'اااايه') ILIKE ${pNorm} ESCAPE '\\' OR s.name ILIKE ${pRaw} ESCAPE '\\')`,
+        );
+        values.push(`%${escapedNorm}%`, `%${escapedRaw}%`);
+      }
     }
 
     if (warehouse_id) {
+      const isBranch2 = Number(warehouse_id) === 2;
+      if (isBranch2) {
+        await ensureSupplierVerificationsTable();
+      }
       const p = `$${idx++}`;
       invConditions.push(`branch_id = ${p}`);
       payConditions.push(`branch_id = ${p}`);
       adjConditions.push(`branch_id = ${p}`);
       cteConditions.push(`branch_id = ${p}`);
-      // Only show suppliers that have activity in this branch
+      const verifiedBranchCond = isBranch2
+        ? `\n          OR EXISTS (SELECT 1 FROM supplier_branch_verifications WHERE supplier_id = s.id AND branch_id = 2 AND is_verified = true)`
+        : "";
+      // Show suppliers that have activity in this branch (plus verified wholesale suppliers in Branch 2)
       conditions.push(
         `(EXISTS (SELECT 1 FROM invoices WHERE supplier_id = s.id AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = ${p})
           OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND branch_id = ${p})
-          OR EXISTS (SELECT 1 FROM supplier_adjustments WHERE supplier_id = s.id AND branch_id = ${p}))`,
+          OR EXISTS (SELECT 1 FROM supplier_adjustments WHERE supplier_id = s.id AND branch_id = ${p})${verifiedBranchCond})`,
       );
       values.push(warehouse_id);
     }
@@ -1780,7 +1840,16 @@ exports.getSupplierBalances = async (req, res) => {
       WITH opening AS (
         SELECT DISTINCT ON (supplier_id)
           supplier_id,
-          COALESCE(previous_balance, 0) AS opening_balance
+          CASE
+            WHEN EXISTS (
+              SELECT 1
+              FROM supplier_adjustments sa
+              WHERE sa.supplier_id = invoices.supplier_id
+                AND sa.branch_id = invoices.branch_id
+                AND sa.created_at < (invoices.created_at AT TIME ZONE 'UTC')
+            ) THEN 0
+            ELSE COALESCE(previous_balance, 0)
+          END AS opening_balance
         FROM invoices
         WHERE ${cteWhere}
         ORDER BY supplier_id, invoice_date ASC, id ASC
@@ -2089,12 +2158,24 @@ exports.getSupplierDebtDetails = async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT * FROM (
+      SELECT
+        ledger.record_type,
+        ledger.record_id,
+        ledger.record_date,
+        ledger.total,
+        ledger.paid_amount,
+        ledger.remaining_amount,
+        ledger.previous_balance,
+        ledger.notes,
+        ledger.permission_number,
+        ledger.adjustment_amount
+      FROM (
         -- فواتير مشتريات
         SELECT
           'invoice' AS record_type,
           i.id AS record_id,
           i.invoice_date AS record_date,
+          (i.created_at AT TIME ZONE 'UTC') AS sort_ts,
           i.total,
           i.paid_amount,
           i.remaining_amount,
@@ -2112,6 +2193,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
           'payment' AS record_type,
           co.id AS record_id,
           co.transaction_date AS record_date,
+          (co.created_at AT TIME ZONE 'UTC') AS sort_ts,
           0 AS total,
           co.amount AS paid_amount,
           0 AS remaining_amount,
@@ -2129,6 +2211,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
           'adjustment' AS record_type,
           sa.id AS record_id,
           sa.adjustment_date AS record_date,
+          sa.created_at AS sort_ts,
           CASE WHEN sa.amount > 0 THEN sa.amount ELSE 0 END AS total,
           CASE WHEN sa.amount < 0 THEN ABS(sa.amount) ELSE 0 END AS paid_amount,
           0 AS remaining_amount,
@@ -2141,6 +2224,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
       ) ledger
       ORDER BY
         ledger.record_date ASC,
+        ledger.sort_ts ASC,
         CASE ledger.record_type WHEN 'invoice' THEN 1 WHEN 'payment' THEN 2 ELSE 3 END ASC,
         ledger.record_id ASC
       `,
