@@ -359,6 +359,11 @@ app.get("/health", async (req, res) => {
     } catch {}
   }
   const realHostDisplay = `${primaryHost}:${primaryPort}`;
+  const isServer1 =
+    primaryHost.includes("100.91.137.34") ||
+    primaryHost.includes("192.168.1.99") ||
+    primaryHost === "100.91.137.34";
+  const activeHostLabel = isServer1 ? "Server 1" : "Server 2";
 
   // Real live database metrics
   let dbStats = { invoicesCount: 3248, tablesCount: 49, status: "connected" };
@@ -397,11 +402,12 @@ app.get("/health", async (req, res) => {
     activeDb: dbState.activeDb || "primary",
     activeServer: {
       name: "Data Studio Dedicated Server",
-      host: realHostDisplay,
+      host: activeHostLabel,
       ip: primaryHost,
       port: primaryPort,
-      networkType: "Tailscale Private VPN",
-      role: "الأساسي (Master)",
+      realHost: realHostDisplay,
+      networkType: isServer1 ? "Tailscale Private VPN" : "Cloud Dedicated",
+      role: isServer1 ? "الأساسي (Master)" : "الاحتياطي المباشر (Replica / Standby)",
       status: "online",
       isDataStudio: true
     },
@@ -413,7 +419,7 @@ app.get("/health", async (req, res) => {
     lastSync: {
       ok: true,
       synced: dbStats.invoicesCount,
-      message: "Data Studio Dedicated Server Live"
+      message: `${activeHostLabel} Live`
     },
     lastBackup: realBackup,
     lastAutoBackup: realBackup,
@@ -1319,7 +1325,7 @@ app.use((req, res, next) => {
   if (["POST", "PUT", "DELETE", "PATCH"].includes(req.method)) {
     const originalJson = res.json.bind(res);
     res.json = function (data) {
-      if (res.statusCode < 400) {
+      if (res.statusCode < 400 && !res.locals?.skipRealtimeMiddleware) {
         const broadcast = req.app.get("broadcastRealtime");
         const io = req.app.get("io");
         const p = req.originalUrl || req.url;
@@ -1751,6 +1757,34 @@ pool
     console.error("❌ variant migrations error:", e.message);
   }
 })();
+}
+
+// ✅ فهارس لتسريع استعلامات التحويلات اليومية (فحص قراءة أولاً لتفادي أقفال DDL، مع إعادة محاولة محدودة لو حصل انقطاع مؤقت بالشبكة)
+async function ensureStockTransferIndexes(attempt = 1) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         to_regclass('public.idx_stock_transfer_items_transfer_id') AS idx_items,
+         to_regclass('public.idx_stock_transfers_created_at') AS idx_transfers`,
+    );
+    if (!rows[0]?.idx_items) {
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_stock_transfer_items_transfer_id ON stock_transfer_items (transfer_id)`,
+      );
+    }
+    if (!rows[0]?.idx_transfers) {
+      await pool.query(
+        `CREATE INDEX IF NOT EXISTS idx_stock_transfers_created_at ON stock_transfers (created_at DESC)`,
+      );
+    }
+    console.log("✅ stock_transfers indexes ready");
+  } catch (e) {
+    console.error(`❌ stock_transfers indexes error (attempt ${attempt}/5):`, e.message);
+    if (attempt < 5) {
+      const delayMs = attempt * 5000;
+      setTimeout(() => ensureStockTransferIndexes(attempt + 1), delayMs);
+    }
+  }
 }
 
 // � جدول الموردين
@@ -7817,6 +7851,9 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
     if (!branch_id || !invoice_type || !date) {
       return res.status(400).json({ error: "Missing parameters" });
     }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+      return res.status(400).json({ error: "Invalid date format (YYYY-MM-DD)" });
+    }
 
     const isAdmin = req.user?.username === "admin" || req.user?.role === "admin";
     const effectiveBranchId = isAdmin
@@ -7880,7 +7917,8 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
          JOIN products p ON p.id = sti.product_id
          JOIN warehouses fw ON fw.id = sti.from_warehouse_id
          JOIN warehouses tw ON tw.id = sti.to_warehouse_id
-         WHERE (st.created_at AT TIME ZONE 'Africa/Cairo')::date = $1::date
+         WHERE st.created_at >= $1::date::timestamp
+           AND st.created_at < ($1::date + INTERVAL '1 day')::timestamp
          ORDER BY st.created_at ASC, sti.id ASC`,
         [date],
       ).catch((err) => {
@@ -12579,6 +12617,9 @@ app.get("/stock-transfers", async (req, res) => {
 
 app.get("/stock-transfers/summary/by-date", async (req, res) => {
   const { date } = req.query;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+    return res.status(400).json({ error: "date is required (YYYY-MM-DD)" });
+  }
 
   const { rows } = await pool.query(
     `
@@ -12586,7 +12627,8 @@ app.get("/stock-transfers/summary/by-date", async (req, res) => {
       COALESCE(SUM(sti.from_quantity), 0) AS total_quantity
     FROM stock_transfer_items sti
     JOIN stock_transfers st ON st.id = sti.transfer_id
-    WHERE (st.created_at AT TIME ZONE 'Africa/Cairo')::date = $1::date
+    WHERE st.created_at >= $1::date::timestamp
+      AND st.created_at < ($1::date + INTERVAL '1 day')::timestamp
       AND sti.status = 'active'
       AND st.status = 'active'
 
@@ -12603,7 +12645,7 @@ app.get("/stock-transfers/summary/by-date", async (req, res) => {
 app.get("/stock-transfers/by-date", async (req, res) => {
   const { date } = req.query;
 
-  if (!date) {
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
     return res.status(400).json({
       error: "date is required (YYYY-MM-DD)",
     });
@@ -12638,7 +12680,8 @@ app.get("/stock-transfers/by-date", async (req, res) => {
       JOIN products p ON p.id = sti.product_id
       JOIN warehouses fw ON fw.id = sti.from_warehouse_id
       JOIN warehouses tw ON tw.id = sti.to_warehouse_id
-      WHERE (st.created_at AT TIME ZONE 'Africa/Cairo')::date = $1::date
+      WHERE st.created_at >= $1::date::timestamp
+        AND st.created_at < ($1::date + INTERVAL '1 day')::timestamp
       ORDER BY st.created_at ASC, sti.id ASC
       `,
       [date],
@@ -13150,29 +13193,113 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
   }
 });
 
-// ✅ تحديث حالة استلام صنف من التحويل
+// ✅ تحديث حالة استلام صنف من التحويل (مع عزل عن مسح الكاش و stockWatchdog وبث حدث خفيف مخصص)
 app.patch(
   "/stock-transfers/items/:itemId",
   authMiddleware,
   async (req, res) => {
-    const itemId = Number(req.params.itemId);
-    const { received } = req.body;
+    const rawId = String(req.params.itemId || "");
+    if (!/^\d+$/.test(rawId)) {
+      return res.status(400).json({ error: "معرف الصنف غير صحيح" });
+    }
+    const itemId = Number(rawId);
+    if (!Number.isSafeInteger(itemId) || itemId <= 0) {
+      return res.status(400).json({ error: "معرف الصنف غير صحيح" });
+    }
 
+    const actorUserId = Number(req.user?.id);
+    if (!Number.isSafeInteger(actorUserId) || actorUserId <= 0) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { received } = req.body || {};
     if (typeof received !== "boolean") {
       return res.status(400).json({ error: "received must be a boolean" });
     }
 
     try {
-      const { rowCount } = await pool.query(
-        `UPDATE stock_transfer_items SET received = $1 WHERE id = $2`,
-        [received, itemId],
+      const { rows } = await pool.query(
+        `
+        WITH caller AS (
+          SELECT id, username, role, branch_id
+          FROM users
+          WHERE id = $3
+        ),
+        target AS (
+          SELECT
+            sti.id,
+            sti.transfer_id,
+            sti.status AS item_status,
+            st.status AS transfer_status
+          FROM stock_transfer_items sti
+          JOIN stock_transfers st ON st.id = sti.transfer_id
+          WHERE sti.id = $2
+        ),
+        upd AS (
+          UPDATE stock_transfer_items sti
+          SET received = $1
+          FROM caller c, target t
+          WHERE sti.id = t.id
+            AND (c.branch_id = 1 OR c.role = 'admin' OR c.username = 'admin')
+            AND COALESCE(t.item_status, '') <> 'cancelled'
+            AND COALESCE(t.transfer_status, '') <> 'cancelled'
+          RETURNING sti.id, sti.transfer_id, COALESCE(sti.received, false) AS received
+        )
+        SELECT
+          EXISTS(SELECT 1 FROM caller) AS user_exists,
+          COALESCE((SELECT (branch_id = 1 OR role = 'admin' OR username = 'admin') FROM caller), false) AS authorized,
+          EXISTS(SELECT 1 FROM target) AS item_exists,
+          COALESCE((SELECT (COALESCE(item_status, '') = 'cancelled' OR COALESCE(transfer_status, '') = 'cancelled') FROM target), false) AS is_cancelled,
+          (SELECT row_to_json(upd) FROM upd) AS updated_item
+        `,
+        [received, itemId, actorUserId],
       );
 
-      if (!rowCount) {
+      const state = rows[0] || {};
+      if (!state.user_exists) {
+        return res.status(401).json({ error: "المستخدم غير موجود" });
+      }
+      if (!state.authorized) {
+        return res.status(403).json({ error: "غير مصرح بتعديل حالة استلام المعرض" });
+      }
+      if (!state.item_exists) {
         return res.status(404).json({ error: "Item not found" });
       }
+      if (state.is_cancelled) {
+        return res.status(400).json({ error: "لا يمكن تعديل استلام صنف ملغي" });
+      }
 
-      res.json({ success: true, received });
+      const updatedItem = state.updated_item || {
+        id: itemId,
+        transfer_id: null,
+        received,
+      };
+
+      // Skip heavy global middleware (no products/dashboard cache wipe, no watchdog, no data:stock storm)
+      res.locals.skipRealtimeMiddleware = true;
+
+      const payload = {
+        item_id: Number(updatedItem.id || itemId),
+        transfer_id: updatedItem.transfer_id ? Number(updatedItem.transfer_id) : null,
+        received: Boolean(updatedItem.received),
+        ts: Date.now(),
+      };
+      const broadcast = req.app.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        broadcast("transfer_item_received", payload);
+      } else {
+        const io = req.app.get("io");
+        if (io) {
+          io.emit("transfer_item_received", payload);
+        }
+      }
+
+      res.json({
+        success: true,
+        item_id: payload.item_id,
+        transfer_id: payload.transfer_id,
+        received: payload.received,
+      });
     } catch (err) {
       console.error("PATCH TRANSFER ITEM ERROR:", err);
       res.status(500).json({ error: "Failed to update item" });
@@ -15608,6 +15735,7 @@ runStartupMigrations().finally(() => {
     initClusterRealtimeSync();
     prewarmProductsCache();
     stockWatchdogService.initStartupAudit(io);
+    setTimeout(() => ensureStockTransferIndexes(1), 4000);
     if (typeof pool.startContinuousStandbyBackup === "function") {
       pool.startContinuousStandbyBackup();
     }
