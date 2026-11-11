@@ -3062,6 +3062,8 @@ const forReplaceMemoryCache = new Map();
 const forReplaceInFlight = new Map();
 const PRODUCTS_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes TTL
 let productsCacheEpoch = 0;
+let adminCostMapCache = null;
+let adminCostMapInFlight = null;
 
 function getProductsCacheKey(warehouseId, invoiceType, movementType) {
   return `${warehouseId || "null"}:${invoiceType || ""}:${movementType || ""}`;
@@ -3070,13 +3072,49 @@ function getProductsCacheKey(warehouseId, invoiceType, movementType) {
 function invalidateProductsCache() {
   productsCacheEpoch += 1;
   const hadCached =
-    productsMemoryCache.size > 0 || forReplaceMemoryCache.size > 0;
+    productsMemoryCache.size > 0 ||
+    forReplaceMemoryCache.size > 0 ||
+    adminCostMapCache !== null;
   productsMemoryCache.clear();
   forReplaceMemoryCache.clear();
   forReplaceInFlight.clear();
+  adminCostMapCache = null;
+  adminCostMapInFlight = null;
   if (hadCached) {
     console.log("⚡ Products in-memory cache invalidated.");
   }
+}
+
+async function fetchAdminCostMapFromDb() {
+  const [productsRes, variantsRes] = await Promise.all([
+    pool.query(
+      `SELECT id, purchase_price, retail_purchase_price, retail_master_product_id
+       FROM products`,
+    ),
+    pool.query(
+      `SELECT id, product_id, purchase_price, retail_purchase_price
+       FROM product_variants`,
+    ),
+  ]);
+
+  const products = {};
+  for (const row of productsRes.rows) {
+    products[Number(row.id)] = {
+      p: Number(row.purchase_price || 0),
+      rp: Number(row.retail_purchase_price || 0),
+      m: Number(row.retail_master_product_id || 0),
+    };
+  }
+
+  const variants = {};
+  for (const row of variantsRes.rows) {
+    variants[`${Number(row.product_id)}:${Number(row.id)}`] = {
+      p: Number(row.purchase_price || 0),
+      rp: Number(row.retail_purchase_price || 0),
+    };
+  }
+
+  return { products, variants };
 }
 
 async function fetchProductsFromDb(invoiceType, warehouseId, movementType) {
@@ -3337,6 +3375,63 @@ app.get("/products/variants", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// 🔒 Admin-only endpoint: cost map for real-time invoice profitability calculation
+app.get("/products/cost-map", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await loadCurrentUserAccess(req);
+    if (!isAdminUser(currentUser)) {
+      return res.status(403).json({
+        error: "غير مصرح - تكاليف الشراء متاحة للإدارة فقط",
+      });
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+
+    const now = Date.now();
+    if (
+      adminCostMapCache &&
+      now - adminCostMapCache.timestamp < PRODUCTS_CACHE_TTL_MS
+    ) {
+      res.setHeader("X-Cache", "HIT");
+      return res.json(adminCostMapCache.data);
+    }
+
+    if (!adminCostMapInFlight) {
+      const fetchEpoch = productsCacheEpoch;
+      adminCostMapInFlight = fetchAdminCostMapFromDb()
+        .then((data) => {
+          if (fetchEpoch === productsCacheEpoch) {
+            adminCostMapCache = {
+              data,
+              timestamp: Date.now(),
+            };
+          }
+          return data;
+        })
+        .finally(() => {
+          adminCostMapInFlight = null;
+        });
+    }
+
+    const data = await adminCostMapInFlight;
+    res.setHeader("X-Cache", "MISS");
+    return res.json(data);
+  } catch (err) {
+    console.error("PRODUCTS COST MAP ERROR:", err);
+    const isConnTimeout = /timeout|terminated|ECONNREFUSED|ETIMEDOUT/i.test(
+      err?.message || "",
+    );
+    return res
+      .status(err?.statusCode || (isConnTimeout ? 503 : 500))
+      .json({
+        error: isConnTimeout
+          ? "تعذر الاتصال بقاعدة البيانات مؤقتاً"
+          : "Server error",
+      });
+  }
+});
+
 // 🌐 Public API لعرض الأصناف لموقع خارجي
 app.get("/public/products", async (req, res) => {
   try {
@@ -5963,71 +6058,101 @@ app.get("/invoices/retail", async (req, res) => {
 });
 
 app.get("/invoices/:id/edit", async (req, res) => {
-  const { id } = req.params;
+  const invoiceId = Number(req.params.id);
+  if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+    return res.status(400).json({ error: "رقم الفاتورة غير صحيح" });
+  }
+
+  const viewerUserId = Number(req.user?.id || 0);
 
   try {
-    const invoiceRes = await pool.query(
-      `SELECT * FROM invoices WHERE id = $1`,
-      [id],
+    // 🚀 Single round-trip CTE: fetches invoice, items, and verifies admin cost visibility in 1 WAN query
+    const result = await pool.query(
+      `
+      WITH target_invoice AS (
+        SELECT * FROM invoices WHERE id = $1
+      ),
+      viewer AS (
+        SELECT COALESCE(
+          (SELECT (id = 7 OR role = 'admin') FROM users WHERE id = $2 LIMIT 1),
+          false
+        ) AS is_admin
+      ),
+      invoice_lines AS (
+        SELECT
+          ii.id AS _line_id,
+          ii.product_id,
+          ii.product_name,
+          ii.package,
+          ii.price,
+          ii.quantity,
+          ii.discount,
+          ii.total,
+          COALESCE(ii.variant_id, 0) AS variant_id,
+          ii.is_return,
+          p.manufacturer,
+          CASE WHEN (SELECT is_admin FROM viewer) THEN ii.cost_price ELSE NULL END AS cost_price
+        FROM invoice_items ii
+        LEFT JOIN products p ON p.id = ii.product_id
+        WHERE ii.invoice_id = $1
+        ORDER BY ii.id
+      )
+      SELECT
+        row_to_json(ti.*) AS invoice,
+        (SELECT is_admin FROM viewer) AS viewer_is_admin,
+        COALESCE(
+          (SELECT json_agg(
+            json_build_object(
+              'product_id', il.product_id,
+              'product_name', il.product_name,
+              'package', il.package,
+              'price', il.price,
+              'quantity', il.quantity,
+              'discount', il.discount,
+              'total', il.total,
+              'variant_id', il.variant_id,
+              'is_return', il.is_return,
+              'manufacturer', il.manufacturer,
+              'cost_price', il.cost_price
+            )
+            ORDER BY il._line_id
+          ) FROM invoice_lines il),
+          '[]'::json
+        ) AS items
+      FROM target_invoice ti
+      `,
+      [invoiceId, viewerUserId],
     );
 
-    if (!invoiceRes.rows.length) {
+    if (!result.rows.length || !result.rows[0].invoice) {
       return res.status(404).json({ error: "Invoice not found" });
     }
 
-    const invoice = invoiceRes.rows[0];
-
-    const itemsRes = await pool.query(
-      `
-      SELECT
-        ii.product_id,
-        ii.product_name,
-        ii.package,
-        ii.price,
-        ii.quantity,
-        ii.discount,
-        ii.total,
-        COALESCE(ii.variant_id, 0) AS variant_id,
-        ii.is_return,
-        p.manufacturer
-      FROM invoice_items ii
-      LEFT JOIN products p ON p.id = ii.product_id
-      WHERE ii.invoice_id = $1
-      ORDER BY ii.id
-      `,
-      [id],
-    );
+    const invoice = result.rows[0].invoice;
+    const viewerIsAdmin = Boolean(result.rows[0].viewer_is_admin);
+    const rawItems = Array.isArray(result.rows[0].items)
+      ? result.rows[0].items
+      : [];
+    const items = viewerIsAdmin
+      ? rawItems
+      : rawItems.map(({ cost_price, ...rest }) => rest);
 
     /* ================================
        حساب تفصيل الخصم
     ================================= */
-    let items_discount = 0;
-    let extra_discount = 0;
-
-    if (invoice.invoice_type === "wholesale") {
-      items_discount = itemsRes.rows.reduce(
-        (sum, it) => sum + (it.discount || 0) * it.quantity,
-        0,
-      );
-
-      extra_discount = Number(invoice.manual_discount || 0);
-    } else {
-      // القطاعي → الأرقام جاهزة
-      // لو مخزّنتهم لاحقًا في أعمدة يبقوا direct
-      items_discount = itemsRes.rows.reduce(
-        (sum, it) => sum + (it.discount || 0) * it.quantity,
-        0,
-      );
-
-      extra_discount = Number(invoice.manual_discount || 0);
-    }
+    const items_discount = items.reduce(
+      (sum, it) => sum + Number(it.discount || 0) * Number(it.quantity || 0),
+      0,
+    );
 
     res.json({
       id: invoice.id,
       invoice_type: invoice.invoice_type,
       movement_type: invoice.movement_type,
       invoice_date: invoice.invoice_date,
+      created_at: invoice.created_at || null,
 
+      customer_id: invoice.customer_id ?? null,
       customer_name: invoice.customer_name,
       customer_phone: invoice.customer_phone,
 
@@ -6035,13 +6160,14 @@ app.get("/invoices/:id/edit", async (req, res) => {
 
       items_discount,
 
-      extra_discount: Number(invoice.manual_discount || 0), // ✅ السطر المهم
-      manual_discount: Number(invoice.manual_discount || 0), // (اختياري لو محتاجه)
+      extra_discount: Number(invoice.manual_discount || 0),
+      manual_discount: Number(invoice.manual_discount || 0),
 
       discount_total: invoice.discount_total,
       total: invoice.total,
 
       paid_amount: invoice.paid_amount,
+      cash_breakdown: invoice.cash_breakdown || null,
       previous_balance: invoice.previous_balance,
       additional_amount: invoice.additional_amount,
       remaining_amount: invoice.remaining_amount,
@@ -6054,6 +6180,8 @@ app.get("/invoices/:id/edit", async (req, res) => {
       hidden_from_list_by: invoice.hidden_from_list_by || null,
       invoice_source: invoice.invoice_source || null,
       external_order_id: invoice.external_order_id || null,
+      whatsapp_status: invoice.whatsapp_status || null,
+      whatsapp_phone: invoice.whatsapp_phone || null,
 
       supplier_id: invoice.supplier_id,
       supplier_name: invoice.supplier_name,
@@ -6066,54 +6194,90 @@ app.get("/invoices/:id/edit", async (req, res) => {
       updated_by: invoice.updated_by,
       updated_by_name: invoice.updated_by_name,
 
-      items: itemsRes.rows,
+      items,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
+    console.error("GET /invoices/:id/edit ERROR:", err);
+    const isConnTimeout = /timeout|terminated|ECONNREFUSED|ETIMEDOUT/i.test(
+      err?.message || "",
+    );
+    res
+      .status(isConnTimeout ? 503 : 500)
+      .json({
+        error: isConnTimeout
+          ? "تعذر الاتصال بقاعدة البيانات مؤقتاً"
+          : "Server error",
+      });
   }
 });
 
 app.get("/invoices/:id", async (req, res) => {
-  const { id } = req.params;
+  const invoiceId = Number(req.params.id);
+  if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+    return res.status(400).json({ error: "رقم الفاتورة غير صحيح" });
+  }
 
   try {
-    const invoiceRes = await pool.query(
-      "SELECT * FROM invoices WHERE id = $1",
-      [id],
+    // 🚀 Single round-trip CTE instead of sequential queries over WAN
+    const result = await pool.query(
+      `
+      WITH target_invoice AS (
+        SELECT * FROM invoices WHERE id = $1
+      ),
+      invoice_lines AS (
+        SELECT
+          ii.id AS _line_id,
+          ii.product_id,
+          ii.product_name,
+          ii.package,
+          ii.price,
+          ii.quantity,
+          ii.discount,
+          ii.total,
+          COALESCE(ii.variant_id, 0) AS variant_id,
+          p.manufacturer
+        FROM invoice_items ii
+        LEFT JOIN products p ON p.id = ii.product_id
+        WHERE ii.invoice_id = $1
+        ORDER BY ii.id
+      )
+      SELECT
+        row_to_json(ti.*) AS invoice,
+        COALESCE(
+          (SELECT json_agg(
+            json_build_object(
+              'product_id', il.product_id,
+              'product_name', il.product_name,
+              'package', il.package,
+              'price', il.price,
+              'quantity', il.quantity,
+              'discount', il.discount,
+              'total', il.total,
+              'variant_id', il.variant_id,
+              'manufacturer', il.manufacturer
+            )
+            ORDER BY il._line_id
+          ) FROM invoice_lines il),
+          '[]'::json
+        ) AS items
+      FROM target_invoice ti
+      `,
+      [invoiceId],
     );
 
-    if (invoiceRes.rows.length === 0) {
+    if (!result.rows.length || !result.rows[0].invoice) {
       return res.status(404).json({ error: "Invoice not found" });
     }
 
-    const invoice = invoiceRes.rows[0];
+    const invoice = result.rows[0].invoice;
 
-    // ✅ هنا
     if (invoice.invoice_type !== "wholesale") {
       return res
         .status(400)
         .json({ error: "هذا المسار مخصص لفواتير الجملة فقط" });
     }
 
-    const itemsRes = await pool.query(
-      `
-  SELECT
-    ii.product_id,
-    ii.product_name,
-    ii.package,
-    ii.price,
-    ii.quantity,
-    ii.discount,
-    ii.total,
-    COALESCE(ii.variant_id, 0) AS variant_id,
-    p.manufacturer
-  FROM invoice_items ii
-  LEFT JOIN products p ON p.id = ii.product_id
-  WHERE ii.invoice_id = $1
-  `,
-      [id],
-    );
+    const items = Array.isArray(result.rows[0].items) ? result.rows[0].items : [];
 
     const total_due =
       Number(invoice.total || 0) +
@@ -6124,11 +6288,20 @@ app.get("/invoices/:id", async (req, res) => {
       ...invoice,
       manual_discount: Number(invoice.manual_discount || 0),
       total_due,
-      items: itemsRes.rows,
+      items,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Database error" });
+    console.error("GET /invoices/:id ERROR:", err);
+    const isConnTimeout = /timeout|terminated|ECONNREFUSED|ETIMEDOUT/i.test(
+      err?.message || "",
+    );
+    res
+      .status(isConnTimeout ? 503 : 500)
+      .json({
+        error: isConnTimeout
+          ? "تعذر الاتصال بقاعدة البيانات مؤقتاً"
+          : "Database error",
+      });
   }
 });
 
