@@ -15,13 +15,33 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 /* ─── Pool configuration ─── */
 const POOL_OPTS = {
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 20000, // Tolerates Tailscale DERP handshake jitter up to 20s
   query_timeout: 60000,
-  max: 30,
-  idleTimeoutMillis: 30000,
+  statement_timeout: 55000, // Server-side query abort slightly below client query_timeout
+  lock_timeout: 15000, // Prevents lock queues from exhausting pool slots
+  idle_in_transaction_session_timeout: 180000, // Reaps aborted/abandoned transactions at 3m server-side
+  options: "-c timezone=Africa/Cairo", // Avoids extra post-connect WAN round-trip
+  application_name: process.env.PGAPPNAME || "glass-system-backend",
+  min: 2, // Keep 2 warm sockets ready to skip cold DERP handshakes
+  max: 15, // Bounded ceiling leaves ample headroom vs Data Studio max_connections=100 & avoids DERP congestion
+  idleTimeoutMillis: 120000, // Retain burst sockets for 2 min before closing back to min=2
+  maxLifetimeSeconds: 3600, // Recycle idle sockets hourly to clear stale NAT state
   keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
 };
+
+function buildDbSslConfig() {
+  const enabled =
+    parseBooleanEnv(process.env.DB_SSL, false) ||
+    parseBooleanEnv(process.env.DB_SSL_LOCAL, false);
+  if (!enabled) return false;
+  return {
+    rejectUnauthorized: parseBooleanEnv(
+      process.env.DB_SSL_REJECT_UNAUTHORIZED,
+      false,
+    ),
+  };
+}
 
 function parseBooleanEnv(value, defaultValue = false) {
   if (value == null || value === "") return defaultValue;
@@ -63,13 +83,12 @@ const PUBLIC_WEBHOOK_CONFIG = Object.freeze({
   ),
 });
 
+const dbSslConfig = buildDbSslConfig();
+
 const dbConnectionConfig = process.env.DATABASE_URL
   ? {
       connectionString: process.env.DATABASE_URL,
-      ssl:
-        process.env.DB_SSL === "true" || process.env.DB_SSL_LOCAL === "true"
-          ? { rejectUnauthorized: false }
-          : false,
+      ssl: dbSslConfig,
       ...POOL_OPTS,
     }
   : {
@@ -85,10 +104,7 @@ const dbConnectionConfig = process.env.DATABASE_URL
         "SecGlass_2026_Postgres_HA",
       database:
         process.env.DB_NAME || process.env.DB_NAME_LOCAL || "glass_system",
-      ssl:
-        process.env.DB_SSL === "true" || process.env.DB_SSL_LOCAL === "true"
-          ? { rejectUnauthorized: false }
-          : false,
+      ssl: dbSslConfig,
       ...POOL_OPTS,
     };
 
@@ -97,9 +113,6 @@ const primaryPool = new Pool(dbConnectionConfig);
 primaryPool.on("connect", (client) => {
   client.on("error", (err) => {
     console.error("⚠️ PostgreSQL Client socket error (handled):", err.message);
-  });
-  client.query("SET timezone = 'Africa/Cairo'").catch((err) => {
-    console.error("Failed to set timezone on client:", err.message);
   });
 });
 primaryPool.on("error", (err) =>
@@ -1547,13 +1560,58 @@ function scheduleRealtimeSync(reason = "write") {
   // Unified Data Studio HA Cluster handles replication natively
 }
 
-/* ── Health check helpers ── */
+/* ── Health check & warm pool helpers ── */
+let warmPoolPromise = null;
+
+async function ensureMinWarmConnections() {
+  if (primaryPool.ending || primaryPool.ended) return false;
+  const targetMin = Math.max(
+    0,
+    Math.min(Number(POOL_OPTS.min) || 0, Number(POOL_OPTS.max) || 30),
+  );
+  const missing = Math.max(0, targetMin - primaryPool.totalCount);
+  if (missing === 0) return true;
+  if (warmPoolPromise) return warmPoolPromise;
+
+  warmPoolPromise = (async () => {
+    try {
+      const results = await Promise.allSettled(
+        Array.from({ length: missing }, async () => {
+          const client = await primaryPool.connect();
+          try {
+            await client.query("SELECT 1");
+          } finally {
+            client.release();
+          }
+        }),
+      );
+      return results.some((r) => r.status === "fulfilled");
+    } catch {
+      return false;
+    } finally {
+      warmPoolPromise = null;
+    }
+  })();
+
+  return warmPoolPromise;
+}
+
+const initialWarmTimer = setTimeout(() => {
+  ensureMinWarmConnections().catch(() => {});
+}, 1500);
+if (typeof initialWarmTimer.unref === "function") {
+  initialWarmTimer.unref();
+}
+
 async function checkPool(poolInstance, label = "DataStudio DB") {
   try {
     const targetPool = poolInstance || primaryPool;
     const client = await targetPool.connect();
-    await client.query("SELECT 1");
-    client.release();
+    try {
+      await client.query("SELECT 1");
+    } finally {
+      client.release();
+    }
     return true;
   } catch (err) {
     console.error(`❌ ${label} health check failed:`, err.message);
@@ -1561,12 +1619,21 @@ async function checkPool(poolInstance, label = "DataStudio DB") {
   }
 }
 
-/* ── Periodic health checks (every 30s) ── */
+/* ── Periodic health checks (every 30s, single-flight) ── */
+let healthCheckInFlight = false;
 const healthCheckInterval = setInterval(async () => {
-  if (primaryPool.ending || primaryPool.ended) return;
-  const alive = await checkPool(primaryPool, "DataStudio DB");
-  state.localAlive = alive;
-  state.cloudAlive = alive;
+  if (primaryPool.ending || primaryPool.ended || healthCheckInFlight) return;
+  healthCheckInFlight = true;
+  try {
+    const alive = await checkPool(primaryPool, "DataStudio DB");
+    state.localAlive = alive;
+    state.cloudAlive = alive;
+    if (alive && primaryPool.totalCount < (Number(POOL_OPTS.min) || 0)) {
+      await ensureMinWarmConnections();
+    }
+  } finally {
+    healthCheckInFlight = false;
+  }
 }, 30000);
 if (typeof healthCheckInterval.unref === "function") {
   healthCheckInterval.unref();
@@ -3091,8 +3158,14 @@ function startPeriodicSync() {
 }
 
 /* ── Automatic Idle Transaction Reaper (Prevents connection exhaustion) ── */
+let idleTxReaperInterval = null;
+let idleTxReaperInFlight = false;
+
 function startIdleTransactionReaper() {
-  setInterval(async () => {
+  if (idleTxReaperInterval) return;
+  idleTxReaperInterval = setInterval(async () => {
+    if (primaryPool.ending || primaryPool.ended || idleTxReaperInFlight) return;
+    idleTxReaperInFlight = true;
     try {
       await primaryPool.query(`
         SELECT pg_terminate_backend(pid)
@@ -3103,8 +3176,33 @@ function startIdleTransactionReaper() {
       `);
     } catch (err) {
       // ignore transient db errors
+    } finally {
+      idleTxReaperInFlight = false;
     }
   }, 60000);
+  if (typeof idleTxReaperInterval.unref === "function") {
+    idleTxReaperInterval.unref();
+  }
+}
+
+async function closeDbPoolGracefully() {
+  clearInterval(healthCheckInterval);
+  clearTimeout(initialWarmTimer);
+  if (idleTxReaperInterval) {
+    clearInterval(idleTxReaperInterval);
+    idleTxReaperInterval = null;
+  }
+  if (publicWebhookDeliveryInterval) {
+    clearInterval(publicWebhookDeliveryInterval);
+    publicWebhookDeliveryInterval = null;
+  }
+  if (backupSyncTimer) {
+    clearInterval(backupSyncTimer);
+    backupSyncTimer = null;
+  }
+  if (!primaryPool.ending && !primaryPool.ended) {
+    await primaryPool.end();
+  }
 }
 
 // Start background services
@@ -3122,6 +3220,8 @@ pool.cloudPool = primaryPool;
 pool.dbState = state;
 pool.syncBetweenPools = syncBetweenPools;
 pool.checkPool = checkPool;
+pool.ensureMinWarmConnections = ensureMinWarmConnections;
+pool.closeDbPoolGracefully = closeDbPoolGracefully;
 pool.getActivePool = getActivePool;
 pool.getSyncLogs = getSyncLogs;
 pool.enqueueInvoiceAggregateSync = enqueueInvoiceAggregateSync;
@@ -3138,6 +3238,8 @@ module.exports.cloudPool = primaryPool;
 module.exports.dbState = state;
 module.exports.syncBetweenPools = syncBetweenPools;
 module.exports.checkPool = checkPool;
+module.exports.ensureMinWarmConnections = ensureMinWarmConnections;
+module.exports.closeDbPoolGracefully = closeDbPoolGracefully;
 module.exports.getActivePool = getActivePool;
 module.exports.getSyncLogs = getSyncLogs;
 module.exports.enqueueInvoiceAggregateSync = enqueueInvoiceAggregateSync;

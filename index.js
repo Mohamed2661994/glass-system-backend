@@ -15414,7 +15414,7 @@ async function initClusterRealtimeSync() {
       "postgresql://glass_backend:SecGlass_2026_Postgres_HA@dbstudio.hg-alshour.online:5432/glass_system";
     clusterListener = new PgListenerClient({
       connectionString: connStr,
-      connectionTimeoutMillis: 10000,
+      connectionTimeoutMillis: 20000,
       keepAlive: true,
       keepAliveInitialDelayMillis: 10000,
     });
@@ -15930,4 +15930,46 @@ runStartupMigrations().finally(() => {
       console.error("[Quaz AI] Failed to initialize:", aiErr.message);
     }
   });
+
+  let shuttingDown = false;
+  const gracefulShutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`🛑 Received ${signal}, draining DB pool & HTTP server...`);
+    const forceTimer = setTimeout(() => process.exit(0), 5000);
+    if (typeof forceTimer.unref === "function") forceTimer.unref();
+
+    try {
+      if (clusterPingInterval) {
+        clearInterval(clusterPingInterval);
+        clusterPingInterval = null;
+      }
+      if (clusterListener) {
+        try {
+          await clusterListener.end();
+        } catch {}
+        clusterListener = null;
+      }
+      if (typeof io?.close === "function") {
+        io.close();
+      }
+      if (typeof server.closeIdleConnections === "function") {
+        server.closeIdleConnections();
+      }
+      if (typeof server.close === "function") {
+        server.close();
+      }
+      if (typeof pool.closeDbPoolGracefully === "function") {
+        await pool.closeDbPoolGracefully();
+      } else if (typeof pool.end === "function") {
+        await pool.end();
+      }
+    } catch (err) {
+      console.error("Graceful shutdown error:", err?.message || err);
+    }
+    process.exit(0);
+  };
+
+  process.once("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+  process.once("SIGINT", () => void gracefulShutdown("SIGINT"));
 });
