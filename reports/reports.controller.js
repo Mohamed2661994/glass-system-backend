@@ -2168,7 +2168,8 @@ exports.getSupplierDebtDetails = async (req, res) => {
         ledger.previous_balance,
         ledger.notes,
         ledger.permission_number,
-        ledger.adjustment_amount
+        ledger.adjustment_amount,
+        ledger.attachment_count
       FROM (
         -- فواتير مشتريات
         SELECT
@@ -2182,8 +2183,14 @@ exports.getSupplierDebtDetails = async (req, res) => {
           COALESCE(i.previous_balance, 0) AS previous_balance,
           NULL AS notes,
           NULL AS permission_number,
-          0::numeric AS adjustment_amount
+          0::numeric AS adjustment_amount,
+          COALESCE(ia.att_count, 0)::int AS attachment_count
         FROM invoices i
+        LEFT JOIN (
+          SELECT invoice_id, COUNT(*)::int AS att_count
+          FROM invoice_attachments
+          GROUP BY invoice_id
+        ) ia ON ia.invoice_id = i.id
         ${invoiceWhere}
 
         UNION ALL
@@ -2200,7 +2207,8 @@ exports.getSupplierDebtDetails = async (req, res) => {
           0 AS previous_balance,
           co.notes,
           co.permission_number,
-          0::numeric AS adjustment_amount
+          0::numeric AS adjustment_amount,
+          0::int AS attachment_count
         FROM cash_out co
         ${paymentWhere}
 
@@ -2218,7 +2226,8 @@ exports.getSupplierDebtDetails = async (req, res) => {
           0 AS previous_balance,
           sa.notes,
           'تسوية #' || sa.id::text AS permission_number,
-          sa.amount AS adjustment_amount
+          sa.amount AS adjustment_amount,
+          0::int AS attachment_count
         FROM supplier_adjustments sa
         ${adjustmentWhere}
       ) ledger

@@ -32,6 +32,17 @@ const webPush = require("web-push");
 const stockWatchdogService = require("./services/stockWatchdog.service");
 const quazlinkService = require("./services/quazlink.service");
 const {
+  isR2Configured,
+  detectRealImageType,
+  sanitizeOriginalFilename,
+  buildPurchaseAttachmentKey,
+  computeSha256,
+  uploadAttachmentToR2,
+  getAttachmentFromR2,
+  deleteAttachmentFromR2,
+  deleteAttachmentsFromR2BestEffort,
+} = require("./services/r2InvoiceAttachments.service");
+const {
   normalizePartyWhitespace: normalizeCustomerWhitespace,
   toEnglishDigits,
   normalizeCustomerSearchText,
@@ -156,6 +167,26 @@ const loginLimiter = rateLimit({
   message: {
     success: false,
     error: "تم تجاوز الحد المسموح من محاولات الدخول، يرجى الانتظار لمدة دقيقة والمحاولة مجدداً.",
+  },
+});
+
+// 🛡️ Rate Limiter & Multer for Purchase Invoice Image Attachments (Cloudflare R2)
+const purchaseAttachmentUploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: "تم تجاوز الحد المسموح لرفع المرفقات، يرجى الانتظار دقيقة.",
+  },
+});
+
+const purchaseAttachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10 MB max per raw image before server check
+    files: 10,
   },
 });
 
@@ -6159,6 +6190,366 @@ app.get("/invoices/retail", async (req, res) => {
   }
 });
 
+/* =========================================================
+   📎 Purchase Invoice Attachments (Cloudflare R2 Private Storage)
+   Strict: Purchase invoices ONLY (movement_type = 'purchase'),
+           Magic Bytes inspection, JWT Auth download, Admin-only delete
+========================================================= */
+
+app.get("/invoices/attachments/status", authMiddleware, async (req, res) => {
+  res.json({
+    configured: isR2Configured(),
+    provider: "cloudflare-r2",
+    max_file_size_bytes: 10 * 1024 * 1024,
+    max_files_per_upload: 10,
+  });
+});
+
+app.get("/invoices/:id/attachments", authMiddleware, async (req, res) => {
+  const invoiceId = Number(req.params.id);
+  if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+    return res.status(400).json({ error: "رقم الفاتورة غير صحيح" });
+  }
+
+  try {
+    const invRes = await pool.query(
+      `SELECT id, movement_type FROM invoices WHERE id = $1 LIMIT 1`,
+      [invoiceId],
+    );
+    if (!invRes.rows.length) {
+      return res.status(404).json({ error: "الفاتورة غير موجودة" });
+    }
+    if (invRes.rows[0].movement_type !== "purchase") {
+      return res.status(403).json({
+        error: "المرفقات الورقية متاحة لفواتير الشراء (الموردين) فقط",
+      });
+    }
+
+    const attRes = await pool.query(
+      `
+      SELECT
+        id,
+        invoice_id,
+        storage_provider,
+        original_name,
+        mime_type,
+        file_size,
+        sha256,
+        uploaded_by,
+        uploaded_by_name,
+        created_at
+      FROM invoice_attachments
+      WHERE invoice_id = $1
+      ORDER BY id ASC
+      `,
+      [invoiceId],
+    );
+
+    res.json({
+      invoice_id: invoiceId,
+      configured: isR2Configured(),
+      attachments: attRes.rows,
+    });
+  } catch (err) {
+    console.error("GET INVOICE ATTACHMENTS ERROR:", err);
+    res.status(500).json({ error: "فشل تحميل مرفقات الفاتورة" });
+  }
+});
+
+app.post(
+  "/invoices/:id/attachments",
+  authMiddleware,
+  purchaseAttachmentUploadLimiter,
+  (req, res, next) => {
+    purchaseAttachmentUpload.fields([
+      { name: "files", maxCount: 10 },
+      { name: "file", maxCount: 1 },
+    ])(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({
+          error:
+            err.code === "LIMIT_FILE_SIZE"
+              ? "حجم الصورة يتجاوز الحد الأقصى المسموح (10 ميجابايت)"
+              : err.message || "خطأ في استلام الملفات",
+        });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    const invoiceId = Number(req.params.id);
+    if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+      return res.status(400).json({ error: "رقم الفاتورة غير صحيح" });
+    }
+
+    try {
+      if (!isR2Configured()) {
+        return res.status(503).json({
+          error:
+            "خدمة التخزين السحابي (Cloudflare R2) غير مُفعّلة بعد على السيرفر",
+        });
+      }
+
+      const currentUser = await loadCurrentUserAccess(req);
+
+      const invRes = await pool.query(
+        `SELECT id, movement_type, supplier_name FROM invoices WHERE id = $1 LIMIT 1`,
+        [invoiceId],
+      );
+      if (!invRes.rows.length) {
+        return res.status(404).json({ error: "الفاتورة غير موجودة" });
+      }
+      if (invRes.rows[0].movement_type !== "purchase") {
+        return res.status(403).json({
+          error: "إرفاق الصور متاح لفواتير الشراء (الموردين) فقط",
+        });
+      }
+
+      const uploadedFiles = [
+        ...((req.files && Array.isArray(req.files.files) && req.files.files) || []),
+        ...((req.files && Array.isArray(req.files.file) && req.files.file) || []),
+      ];
+
+      if (uploadedFiles.length === 0) {
+        return res.status(400).json({ error: "لم يتم اختيار أي صورة للرفع" });
+      }
+
+      const validated = [];
+      for (const f of uploadedFiles) {
+        const realType = detectRealImageType(f.buffer);
+        if (!realType) {
+          return res.status(400).json({
+            error:
+              "نوع الملف غير مسموح — يُسمح فقط بالصور الحقيقية (JPG / PNG / WebP)",
+          });
+        }
+        validated.push({
+          buffer: f.buffer,
+          mimeType: realType.mimeType,
+          ext: realType.ext,
+          originalName: sanitizeOriginalFilename(f.originalname),
+          fileSize: f.buffer.length,
+          sha256: computeSha256(f.buffer),
+          objectKey: buildPurchaseAttachmentKey(invoiceId, realType.ext),
+        });
+      }
+
+      const insertedRows = [];
+      const uploadedObjectKeys = [];
+
+      try {
+        for (const item of validated) {
+          await uploadAttachmentToR2({
+            objectKey: item.objectKey,
+            buffer: item.buffer,
+            contentType: item.mimeType,
+            metadata: {
+              invoice_id: invoiceId,
+              uploaded_by: currentUser.id,
+              sha256: item.sha256,
+            },
+          });
+          uploadedObjectKeys.push(item.objectKey);
+
+          const insRes = await pool.query(
+            `
+            INSERT INTO invoice_attachments (
+              invoice_id,
+              storage_provider,
+              object_key,
+              original_name,
+              mime_type,
+              file_size,
+              sha256,
+              uploaded_by,
+              uploaded_by_name
+            )
+            VALUES ($1, 'r2', $2, $3, $4, $5, $6, $7, $8)
+            RETURNING
+              id,
+              invoice_id,
+              storage_provider,
+              original_name,
+              mime_type,
+              file_size,
+              sha256,
+              uploaded_by,
+              uploaded_by_name,
+              created_at
+            `,
+            [
+              invoiceId,
+              item.objectKey,
+              item.originalName,
+              item.mimeType,
+              item.fileSize,
+              item.sha256,
+              currentUser.id,
+              currentUser.full_name || currentUser.username || null,
+            ],
+          );
+          insertedRows.push(insRes.rows[0]);
+        }
+      } catch (innerErr) {
+        await deleteAttachmentsFromR2BestEffort(uploadedObjectKeys);
+        throw innerErr;
+      }
+
+      res.status(201).json({
+        success: true,
+        invoice_id: invoiceId,
+        attachments: insertedRows,
+      });
+    } catch (err) {
+      console.error("UPLOAD INVOICE ATTACHMENT ERROR:", err);
+      const status = err?.statusCode || 500;
+      res
+        .status(status)
+        .json({ error: err.message || "فشل رفع صورة الفاتورة إلى Cloudflare R2" });
+    }
+  },
+);
+
+app.get(
+  "/invoices/:id/attachments/:attId/file",
+  authMiddleware,
+  async (req, res) => {
+    const invoiceId = Number(req.params.id);
+    const attId = Number(req.params.attId);
+    if (
+      !Number.isInteger(invoiceId) ||
+      invoiceId <= 0 ||
+      !Number.isInteger(attId) ||
+      attId <= 0
+    ) {
+      return res.status(400).json({ error: "معرف غير صحيح" });
+    }
+
+    try {
+      const attRes = await pool.query(
+        `
+        SELECT
+          ia.id,
+          ia.invoice_id,
+          ia.object_key,
+          ia.original_name,
+          ia.mime_type,
+          i.movement_type
+        FROM invoice_attachments ia
+        JOIN invoices i ON i.id = ia.invoice_id
+        WHERE ia.id = $1 AND ia.invoice_id = $2
+        LIMIT 1
+        `,
+        [attId, invoiceId],
+      );
+
+      if (!attRes.rows.length) {
+        return res.status(404).json({ error: "المرفق غير موجود" });
+      }
+      if (attRes.rows[0].movement_type !== "purchase") {
+        return res.status(403).json({
+          error: "المرفقات الورقية متاحة لفواتير الشراء فقط",
+        });
+      }
+
+      if (!isR2Configured()) {
+        return res.status(503).json({
+          error: "خدمة التخزين السحابي (Cloudflare R2) غير مُعدّة على السيرفر",
+        });
+      }
+
+      const row = attRes.rows[0];
+      const r2Obj = await getAttachmentFromR2(row.object_key);
+      const bytes = await r2Obj.Body.transformToByteArray();
+      const buffer = Buffer.from(bytes);
+
+      const safeDownloadName = sanitizeOriginalFilename(
+        row.original_name || `invoice-${invoiceId}-${attId}`,
+      );
+      const isDownload = String(req.query.download || "") === "1";
+
+      res.setHeader("Content-Type", row.mime_type || "image/webp");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader(
+        "Content-Security-Policy",
+        "default-src 'none'; sandbox",
+      );
+      res.setHeader("Cache-Control", "private, max-age=86400");
+      res.setHeader(
+        "Content-Disposition",
+        `${isDownload ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(safeDownloadName)}`,
+      );
+      res.send(buffer);
+    } catch (err) {
+      console.error("GET INVOICE ATTACHMENT FILE ERROR:", err);
+      const status = err?.statusCode || (err?.name === "NoSuchKey" ? 404 : 500);
+      res.status(status).json({
+        error:
+          status === 404
+            ? "ملف الصورة غير موجود في التخزين السحابي"
+            : err.message || "فشل جلب صورة الفاتورة",
+      });
+    }
+  },
+);
+
+app.delete(
+  "/invoices/:id/attachments/:attId",
+  authMiddleware,
+  async (req, res) => {
+    const invoiceId = Number(req.params.id);
+    const attId = Number(req.params.attId);
+    if (
+      !Number.isInteger(invoiceId) ||
+      invoiceId <= 0 ||
+      !Number.isInteger(attId) ||
+      attId <= 0
+    ) {
+      return res.status(400).json({ error: "معرف غير صحيح" });
+    }
+
+    try {
+      const adminUser = await requireAdminUser(req, res);
+      if (!adminUser) return;
+
+      const attRes = await pool.query(
+        `
+        SELECT id, invoice_id, object_key
+        FROM invoice_attachments
+        WHERE id = $1 AND invoice_id = $2
+        LIMIT 1
+        `,
+        [attId, invoiceId],
+      );
+
+      if (!attRes.rows.length) {
+        return res.status(404).json({ error: "المرفق غير موجود" });
+      }
+
+      const objectKey = attRes.rows[0].object_key;
+      if (isR2Configured() && objectKey) {
+        try {
+          await deleteAttachmentFromR2(objectKey);
+        } catch (r2Err) {
+          if (r2Err?.name !== "NoSuchKey") {
+            throw r2Err;
+          }
+        }
+      }
+
+      await pool.query(
+        `DELETE FROM invoice_attachments WHERE id = $1 AND invoice_id = $2`,
+        [attId, invoiceId],
+      );
+
+      res.json({ success: true, deleted_id: attId, invoice_id: invoiceId });
+    } catch (err) {
+      console.error("DELETE INVOICE ATTACHMENT ERROR:", err);
+      res.status(500).json({ error: "فشل حذف مرفق الفاتورة" });
+    }
+  },
+);
+
 app.get("/invoices/:id/edit", async (req, res) => {
   const invoiceId = Number(req.params.id);
   if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
@@ -6202,6 +6593,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
       SELECT
         row_to_json(ti.*) AS invoice,
         (SELECT is_admin FROM viewer) AS viewer_is_admin,
+        (SELECT COUNT(*)::int FROM invoice_attachments ia WHERE ia.invoice_id = ti.id) AS attachment_count,
         COALESCE(
           (SELECT json_agg(
             json_build_object(
@@ -6232,6 +6624,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
 
     const invoice = result.rows[0].invoice;
     const viewerIsAdmin = Boolean(result.rows[0].viewer_is_admin);
+    const attachmentCount = Number(result.rows[0].attachment_count || 0);
     const rawItems = Array.isArray(result.rows[0].items)
       ? result.rows[0].items
       : [];
@@ -6295,6 +6688,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
       created_by_name: invoice.created_by_name,
       updated_by: invoice.updated_by,
       updated_by_name: invoice.updated_by_name,
+      attachment_count: attachmentCount,
 
       items,
     });
@@ -6345,6 +6739,11 @@ app.get("/invoices/:id", async (req, res) => {
       )
       SELECT
         row_to_json(ti.*) AS invoice,
+        (
+          SELECT COUNT(*)::int
+          FROM invoice_attachments ia
+          WHERE ia.invoice_id = ti.id
+        ) AS attachment_count,
         COALESCE(
           (SELECT json_agg(
             json_build_object(
@@ -6380,6 +6779,7 @@ app.get("/invoices/:id", async (req, res) => {
     }
 
     const items = Array.isArray(result.rows[0].items) ? result.rows[0].items : [];
+    const attachmentCount = Number(result.rows[0].attachment_count || 0);
 
     const total_due =
       Number(invoice.total || 0) +
@@ -6389,6 +6789,7 @@ app.get("/invoices/:id", async (req, res) => {
     res.json({
       ...invoice,
       manual_discount: Number(invoice.manual_discount || 0),
+      attachment_count: attachmentCount,
       total_due,
       items,
     });
@@ -7717,8 +8118,14 @@ app.get("/invoices", async (req, res) => {
         whatsapp_sent_at,
         whatsapp_error,
         notes,
-        apply_items_discount
+        apply_items_discount,
+        COALESCE(ia.att_count, 0)::int AS attachment_count
       FROM invoices
+      LEFT JOIN (
+        SELECT invoice_id, COUNT(*)::int AS att_count
+        FROM invoice_attachments
+        GROUP BY invoice_id
+      ) ia ON ia.invoice_id = invoices.id
       ${whereClause}
       ORDER BY id DESC
       LIMIT $${idx++} OFFSET $${idx++}
@@ -8377,12 +8784,22 @@ app.delete("/invoices/:id", authMiddleware, async (req, res) => {
       invoiceId,
     ]);
 
+    // Capture any R2 attachment keys before cascade-deleting invoice
+    const attKeysRes = await client.query(
+      `SELECT object_key FROM invoice_attachments WHERE invoice_id = $1`,
+      [invoiceId],
+    );
+    const r2KeysToDelete = attKeysRes.rows.map((r) => r.object_key).filter(Boolean);
+
     // 5️⃣ مسح الفاتورة
     await client.query(`DELETE FROM invoices WHERE id = $1`, [invoiceId]);
 
     await enqueueInvoiceAggregateSync(client, invoiceId, "delete");
 
     await client.query("COMMIT");
+    if (r2KeysToDelete.length > 0) {
+      void deleteAttachmentsFromR2BestEffort(r2KeysToDelete);
+    }
     res.json({ success: true });
   } catch (err) {
     await client.query("ROLLBACK");
