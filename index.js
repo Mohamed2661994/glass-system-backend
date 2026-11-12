@@ -31,6 +31,15 @@ const launchPuppeteer = async () => {
 const webPush = require("web-push");
 const stockWatchdogService = require("./services/stockWatchdog.service");
 const quazlinkService = require("./services/quazlink.service");
+const {
+  normalizePartyWhitespace: normalizeCustomerWhitespace,
+  toEnglishDigits,
+  normalizeCustomerSearchText,
+  compactText: compactCustomerText,
+  normalizePhoneDigits,
+  prepareCustomerForSearch,
+  searchAndRankCustomers,
+} = require("./utils/customer-search");
 
 // VAPID keys for Web Push
 const VAPID_PUBLIC_KEY =
@@ -1388,10 +1397,16 @@ app.use((req, res, next) => {
         if (shouldInvalidateBalances) {
           invalidateCustomerBalancesCache();
         }
+        if (channel === "data:customers" || channel === "data:invoices") {
+          invalidateCustomerSearchCache();
+        }
 
         // 2. Broadcast realtime updates
         if (typeof broadcast === "function") {
           broadcast(channel, payload);
+          if (res.locals?.emitCustomersUpdate && channel !== "data:customers") {
+            broadcast("data:customers", payload);
+          }
           // Inter-branch transfers and invoices also change stock levels across branches
           if (channel === "data:inter-branch" || channel === "data:invoices") {
             broadcast("data:stock", payload);
@@ -1410,6 +1425,9 @@ app.use((req, res, next) => {
           }
         } else if (io) {
           io.emit(channel, payload);
+          if (res.locals?.emitCustomersUpdate && channel !== "data:customers") {
+            io.emit("data:customers", payload);
+          }
           if (channel === "data:inter-branch" || channel === "data:invoices") {
             io.emit("data:stock", payload);
           }
@@ -2336,48 +2354,14 @@ async function upsertOnlineInvoiceCustomer(
   applyItemsDiscount,
   client,
 ) {
-  const normalizedName = String(customerName || "").trim();
-  const normalizedPhone = String(customerPhone || "").trim();
-
-  if (!normalizedName) {
-    return null;
-  }
-
-  const existingCustomer = await client.query(
-    `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
-    [normalizedName],
+  const { id } = await resolveCustomerForInvoice(
+    client,
+    customerName,
+    customerPhone,
+    invoiceType,
+    applyItemsDiscount,
   );
-
-  let customerId = existingCustomer.rows[0]?.id || null;
-  if (!customerId) {
-    const newCustomer = await client.query(
-      `
-      INSERT INTO customers (name, customer_type)
-      VALUES ($1, $2)
-      RETURNING id
-      `,
-      [normalizedName, invoiceType],
-    );
-    customerId = newCustomer.rows[0].id;
-  }
-
-  if (normalizedPhone) {
-    await client.query(
-      `
-      INSERT INTO customer_phones (customer_id, phone)
-      VALUES ($1, $2)
-      ON CONFLICT (phone) DO NOTHING
-      `,
-      [customerId, normalizedPhone],
-    );
-  }
-
-  await client.query(
-    `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
-    [Boolean(applyItemsDiscount), customerId],
-  );
-
-  return customerId;
+  return id;
 }
 
 async function findCatalogItemByBarcode(code, client = pool) {
@@ -3540,29 +3524,146 @@ app.get("/public/stock", async (req, res) => {
   }
 });
 
+/* =========================================================
+   Smart Customer Search Cache & Resolution Helpers
+   ========================================================= */
+let customerSearchMemoryCache = null; // { data: preparedCustomers[], expiresAt: number }
+let customerSearchCachePromise = null;
+const CUSTOMER_SEARCH_CACHE_TTL_MS = 60 * 1000;
+
+function invalidateCustomerSearchCache() {
+  customerSearchMemoryCache = null;
+}
+
+async function getPreparedCustomersForSearch() {
+  const now = Date.now();
+  if (customerSearchMemoryCache && customerSearchMemoryCache.expiresAt > now) {
+    return customerSearchMemoryCache.data;
+  }
+  if (customerSearchCachePromise) {
+    return customerSearchCachePromise;
+  }
+  customerSearchCachePromise = (async () => {
+    try {
+      const result = await pool.query(`
+        SELECT c.id,
+               c.name,
+               c.apply_items_discount,
+               COALESCE(c.is_market_customer, false) AS is_market_customer,
+               COALESCE(
+                 (SELECT json_agg(json_build_object('id', cp.id, 'phone', cp.phone) ORDER BY cp.id ASC)
+                  FROM customer_phones cp
+                  WHERE cp.customer_id = c.id),
+                 '[]'::json
+               ) AS phones,
+               COALESCE(inv.inv_count, 0)::int AS invoice_count
+        FROM customers c
+        LEFT JOIN (
+          SELECT customer_id, COUNT(*)::int AS inv_count
+          FROM invoices
+          WHERE is_void IS NOT TRUE AND customer_id IS NOT NULL
+          GROUP BY customer_id
+        ) inv ON inv.customer_id = c.id
+        ORDER BY c.id ASC
+      `);
+      const prepared = result.rows.map(prepareCustomerForSearch);
+      customerSearchMemoryCache = {
+        data: prepared,
+        expiresAt: Date.now() + CUSTOMER_SEARCH_CACHE_TTL_MS,
+      };
+      return prepared;
+    } finally {
+      customerSearchCachePromise = null;
+    }
+  })();
+  return customerSearchCachePromise;
+}
+
+async function resolveCustomerForInvoice(
+  client,
+  rawName,
+  customerPhone,
+  invoiceType,
+  applyItemsDiscount = null,
+) {
+  const cleanName = normalizeCustomerWhitespace(rawName);
+  const cleanPhone = normalizeCustomerWhitespace(toEnglishDigits(customerPhone || ""));
+
+  if (!cleanName) {
+    return { id: null, name: null, isNew: false };
+  }
+
+  let customerId = null;
+  let resolvedName = cleanName;
+  let isNew = false;
+
+  const existingCustomer = await client.query(
+    `
+    SELECT id, name
+    FROM customers
+    WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1
+    ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END, id ASC
+    LIMIT 1
+    `,
+    [cleanName],
+  );
+
+  if (existingCustomer.rows.length > 0) {
+    customerId = existingCustomer.rows[0].id;
+    resolvedName =
+      normalizeCustomerWhitespace(existingCustomer.rows[0].name) || cleanName;
+    if (applyItemsDiscount !== undefined && applyItemsDiscount !== null) {
+      await client.query(
+        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
+        [Boolean(applyItemsDiscount), customerId],
+      );
+    }
+  } else {
+    const newCustomer = await client.query(
+      `
+      INSERT INTO customers (name, customer_type, apply_items_discount)
+      VALUES ($1, $2, COALESCE($3, false))
+      RETURNING id, name
+      `,
+      [
+        cleanName,
+        invoiceType || "retail",
+        applyItemsDiscount !== undefined && applyItemsDiscount !== null
+          ? Boolean(applyItemsDiscount)
+          : null,
+      ],
+    );
+    customerId = newCustomer.rows[0].id;
+    resolvedName = newCustomer.rows[0].name || cleanName;
+    isNew = true;
+  }
+
+  if (cleanPhone && customerId) {
+    await client.query(
+      `
+      INSERT INTO customer_phones (customer_id, phone)
+      VALUES ($1, $2)
+      ON CONFLICT (phone) DO NOTHING
+      `,
+      [customerId, cleanPhone],
+    );
+  }
+
+  return { id: customerId, name: resolvedName, isNew };
+}
+
 app.get("/customers/search", async (req, res) => {
   try {
-    const { name } = req.query;
-    if (!name || name.length < 2) return res.json([]);
+    const rawQuery = req.query.name ?? req.query.q ?? req.query.search ?? "";
+    const cleanQuery = String(rawQuery || "").trim();
+    if (!cleanQuery) return res.json([]);
 
-    const result = await pool.query(
-      `
-      SELECT DISTINCT c.id, c.name, c.apply_items_discount,
-             (SELECT phone FROM customer_phones 
-              WHERE customer_id = c.id 
-              ORDER BY id ASC LIMIT 1) AS phone
-      FROM customers c
-      LEFT JOIN customer_phones cp ON cp.customer_id = c.id
-      WHERE c.name ILIKE $1 OR cp.phone ILIKE $1
-      ORDER BY c.name
-      LIMIT 10
-      `,
-      [`%${name}%`],
-    );
-
-    res.json(result.rows);
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 30));
+    const prepared = await getPreparedCustomersForSearch();
+    const matches = searchAndRankCustomers(prepared, cleanQuery, { limit });
+    res.json(matches);
   } catch (err) {
-    console.error(err);
+    console.error("CUSTOMERS SEARCH ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -3570,15 +3671,16 @@ app.get("/customers/search", async (req, res) => {
 app.post("/customers/:id/phones", async (req, res) => {
   try {
     const { id } = req.params;
-    const { phone } = req.body;
+    const rawPhone = toEnglishDigits(req.body?.phone || "").trim();
 
-    if (!phone) return res.status(400).json({ error: "رقم الهاتف مطلوب" });
+    if (!rawPhone) return res.status(400).json({ error: "رقم الهاتف مطلوب" });
 
     await pool.query(
       `INSERT INTO customer_phones (customer_id, phone) VALUES ($1, $2)`,
-      [id, phone],
+      [id, rawPhone],
     );
 
+    invalidateCustomerSearchCache();
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -3589,7 +3691,7 @@ app.post("/customers/:id/phones", async (req, res) => {
 app.get("/customers/:id/phones", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, phone FROM customer_phones WHERE customer_id = $1`,
+      `SELECT id, phone FROM customer_phones WHERE customer_id = $1 ORDER BY id ASC`,
       [req.params.id],
     );
 
@@ -3601,39 +3703,56 @@ app.get("/customers/:id/phones", async (req, res) => {
 
 app.get("/customers/by-phone", async (req, res) => {
   try {
-    const { phone } = req.query;
-    if (!phone) return res.json(null);
+    const rawPhone = req.query.phone;
+    if (!rawPhone) return res.json([]);
 
-    const customerResult = await pool.query(
-      `
-      SELECT c.id, c.name, c.apply_items_discount, cp.phone
-      FROM customer_phones cp
-      JOIN customers c ON c.id = cp.customer_id
-      WHERE cp.phone ILIKE $1
-      ORDER BY cp.phone
-      LIMIT 10
-      `,
-      [`%${phone}%`],
-    );
+    const digits = normalizePhoneDigits(rawPhone);
+    if (digits.length < 2) return res.json([]);
 
-    if (customerResult.rows.length === 0) return res.json([]);
-
-    // Build unique customers with their phones
-    const customersMap = new Map();
-    for (const row of customerResult.rows) {
-      if (!customersMap.has(row.id)) {
-        customersMap.set(row.id, {
-          id: row.id,
-          name: row.name,
-          phone: row.phone,
-          apply_items_discount: row.apply_items_discount,
+    const prepared = await getPreparedCustomersForSearch();
+    const results = [];
+    for (const c of prepared) {
+      if (!c._phonesDigits || c._phonesDigits.length === 0) continue;
+      let rank = -1;
+      let matchedPhone = null;
+      for (let i = 0; i < c._phonesDigits.length; i++) {
+        const pd = c._phonesDigits[i];
+        if (pd === digits) {
+          rank = 0;
+          matchedPhone = c._phonesList[i];
+          break;
+        } else if (pd.startsWith(digits) && (rank === -1 || rank > 1)) {
+          rank = 1;
+          matchedPhone = c._phonesList[i];
+        } else if (pd.includes(digits) && rank === -1) {
+          rank = 2;
+          matchedPhone = c._phonesList[i];
+        }
+      }
+      if (rank >= 0) {
+        results.push({
+          rank,
+          invCount: Number(c.invoice_count || 0),
+          row: {
+            id: c.id,
+            name: c.name,
+            phone: matchedPhone,
+            phones: c._phonesList,
+            apply_items_discount: c.apply_items_discount,
+          },
         });
       }
     }
 
-    res.json(Array.from(customersMap.values()));
+    results.sort((a, b) => {
+      if (a.rank !== b.rank) return a.rank - b.rank;
+      if (b.invCount !== a.invCount) return b.invCount - a.invCount;
+      return String(a.row.name || "").localeCompare(String(b.row.name || ""), "ar");
+    });
+
+    res.json(results.slice(0, 25).map((r) => r.row));
   } catch (err) {
-    console.error(err);
+    console.error("CUSTOMERS BY PHONE ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -3645,35 +3764,60 @@ app.get("/customers/by-phone", async (req, res) => {
 // List all customers with phones
 app.get("/customers", async (req, res) => {
   try {
-    
     const { search, market_only } = req.query;
+    const cleanSearch = String(search || "").trim();
+    const onlyMarket = String(market_only || "") === "1";
+
+    if (cleanSearch.length >= 1) {
+      const prepared = await getPreparedCustomersForSearch();
+      const filteredPool = onlyMarket
+        ? prepared.filter((c) => Boolean(c.is_market_customer))
+        : prepared;
+      const ranked = searchAndRankCustomers(filteredPool, cleanSearch, {
+        limit: 150,
+      });
+      const byId = new Map(filteredPool.map((c) => [c.id, c]));
+      return res.json(
+        ranked.map((r) => {
+          const orig = byId.get(r.id);
+          return {
+            id: r.id,
+            name: r.name,
+            apply_items_discount: r.apply_items_discount,
+            is_market_customer: Boolean(r.is_market_customer),
+            phones: Array.isArray(orig?.phones) ? orig.phones : [],
+            invoice_count: Number(r.invoice_count || 0),
+          };
+        }),
+      );
+    }
+
     let query = `
       SELECT c.id, c.name, c.apply_items_discount,
              COALESCE(c.is_market_customer, false) AS is_market_customer,
              COALESCE(
-               json_agg(json_build_object('id', cp.id, 'phone', cp.phone))
+               json_agg(json_build_object('id', cp.id, 'phone', cp.phone) ORDER BY cp.id ASC)
                FILTER (WHERE cp.id IS NOT NULL), '[]'
-             ) AS phones
+             ) AS phones,
+             COALESCE(MAX(inv.inv_count), 0)::int AS invoice_count
       FROM customers c
       LEFT JOIN customer_phones cp ON cp.customer_id = c.id
+      LEFT JOIN (
+        SELECT customer_id, COUNT(*)::int AS inv_count
+        FROM invoices
+        WHERE is_void IS NOT TRUE AND customer_id IS NOT NULL
+        GROUP BY customer_id
+      ) inv ON inv.customer_id = c.id
     `;
-    const params = [];
     const whereClauses = [];
-    if (search && search.trim().length >= 2) {
-      params.push(`%${search.trim()}%`);
-      const searchParamIndex = params.length;
-      whereClauses.push(
-        `(c.name ILIKE $${searchParamIndex} OR c.id::text ILIKE $${searchParamIndex} OR EXISTS (SELECT 1 FROM customer_phones cp2 WHERE cp2.customer_id = c.id AND cp2.phone ILIKE $${searchParamIndex}))`,
-      );
-    }
-    if (String(market_only || "") === "1") {
+    if (onlyMarket) {
       whereClauses.push(`COALESCE(c.is_market_customer, false) = true`);
     }
     if (whereClauses.length > 0) {
       query += ` WHERE ${whereClauses.join(" AND ")}`;
     }
     query += ` GROUP BY c.id ORDER BY c.name`;
-    const result = await pool.query(query, params);
+    const result = await pool.query(query);
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -3684,17 +3828,26 @@ app.get("/customers", async (req, res) => {
 // Update customer name
 app.put("/customers/:id", async (req, res) => {
   try {
-    
     const { id } = req.params;
     const { name, is_market_customer } = req.body;
     const updates = [];
     const params = [];
 
     if (name !== undefined) {
-      if (!String(name).trim()) {
+      const cleanName = normalizeCustomerWhitespace(name);
+      if (!cleanName) {
         return res.status(400).json({ error: "الاسم مطلوب" });
       }
-      params.push(String(name).trim());
+      const dupCheck = await pool.query(
+        `SELECT id, name FROM customers WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1 AND id <> $2 LIMIT 1`,
+        [cleanName, id],
+      );
+      if (dupCheck.rows.length > 0) {
+        return res.status(409).json({
+          error: `يوجد عميل آخر مسجل بنفس الاسم (${dupCheck.rows[0].name})`,
+        });
+      }
+      params.push(cleanName);
       updates.push(`name = $${params.length}`);
     }
 
@@ -3712,6 +3865,7 @@ app.put("/customers/:id", async (req, res) => {
       `UPDATE customers SET ${updates.join(", ")} WHERE id = $${params.length}`,
       params,
     );
+    invalidateCustomerSearchCache();
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -3727,6 +3881,7 @@ app.delete("/customers/:id/phones/:phoneId", async (req, res) => {
       `DELETE FROM customer_phones WHERE id = $1 AND customer_id = $2`,
       [phoneId, id],
     );
+    invalidateCustomerSearchCache();
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -3796,6 +3951,7 @@ app.delete("/customers/:id", async (req, res) => {
       id,
     ]);
     await pool.query(`DELETE FROM customers WHERE id = $1`, [id]);
+    invalidateCustomerSearchCache();
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -4941,32 +5097,15 @@ app.post("/invoices", authMiddleware, async (req, res) => {
         [customer_name, total, paid_amount],
       ),
       (async () => {
-        if (!customer_name) return null;
-        let cId = null;
-        const updateRes = await client.query(
-          `UPDATE customers SET apply_items_discount = $1 WHERE name = $2 RETURNING id`,
-          [apply_items_discount, customer_name],
+        const custRes = await resolveCustomerForInvoice(
+          client,
+          customer_name,
+          customer_phone,
+          invoice_type,
+          apply_items_discount,
         );
-        if (updateRes.rows.length > 0) {
-          cId = updateRes.rows[0].id;
-        } else {
-          const newCustomer = await client.query(
-            `INSERT INTO customers (name, customer_type, apply_items_discount)
-             VALUES ($1, $2, $3)
-             RETURNING id`,
-            [customer_name, invoice_type, apply_items_discount],
-          );
-          cId = newCustomer.rows[0].id;
-        }
-        if (customer_phone && cId) {
-          await client.query(
-            `INSERT INTO customer_phones (customer_id, phone)
-             VALUES ($1, $2)
-             ON CONFLICT (phone) DO NOTHING`,
-            [cId, customer_phone],
-          );
-        }
-        return cId;
+        if (custRes.isNew) res.locals.emitCustomersUpdate = true;
+        return custRes.id;
       })(),
       normalizeInvoiceItemsForStorage(items, invoice_type, client),
       (async () => {
@@ -5396,32 +5535,15 @@ app.post("/invoices/retail", async (req, res) => {
     // 🚀 Parallel pre-fetch: resolve customer, supplier, and normalized items simultaneously
     const [customerId, normalizedItems, supplierResolution] = await Promise.all([
       (async () => {
-        if (!customer_name) return null;
-        let cId = null;
-        const updateRes = await client.query(
-          `UPDATE customers SET apply_items_discount = $1 WHERE name = $2 RETURNING id`,
-          [apply_items_discount, customer_name],
+        const custRes = await resolveCustomerForInvoice(
+          client,
+          customer_name,
+          customer_phone,
+          "retail",
+          apply_items_discount,
         );
-        if (updateRes.rows.length > 0) {
-          cId = updateRes.rows[0].id;
-        } else {
-          const newCustomer = await client.query(
-            `INSERT INTO customers (name, customer_type, apply_items_discount)
-             VALUES ($1, 'retail', $2)
-             RETURNING id`,
-            [customer_name, apply_items_discount],
-          );
-          cId = newCustomer.rows[0].id;
-        }
-        if (customer_phone && cId) {
-          await client.query(
-            `INSERT INTO customer_phones (customer_id, phone)
-             VALUES ($1, $2)
-             ON CONFLICT (phone) DO NOTHING`,
-            [cId, customer_phone],
-          );
-        }
-        return cId;
+        if (custRes.isNew) res.locals.emitCustomersUpdate = true;
+        return custRes.id;
       })(),
       normalizeInvoiceItemsForStorage(items, "retail", client),
       (async () => {
@@ -5889,35 +6011,15 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
 
     let customerId = null;
     if (customer_name?.trim()) {
-      const existingCustomer = await client.query(
-        `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
-        [customer_name.trim()],
+      const custRes = await resolveCustomerForInvoice(
+        client,
+        customer_name,
+        customer_phone,
+        "retail",
+        apply_items_discount,
       );
-      if (existingCustomer.rows.length > 0) {
-        customerId = existingCustomer.rows[0].id;
-      } else {
-        const newCustomer = await client.query(
-          `INSERT INTO customers (name, customer_type)
-           VALUES ($1, 'retail')
-           RETURNING id`,
-          [customer_name.trim()],
-        );
-        customerId = newCustomer.rows[0].id;
-      }
-
-      if (customer_phone) {
-        await client.query(
-          `INSERT INTO customer_phones (customer_id, phone)
-           VALUES ($1, $2)
-           ON CONFLICT (phone) DO NOTHING`,
-          [customerId, customer_phone],
-        );
-      }
-
-      await client.query(
-        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
-        [apply_items_discount, customerId],
-      );
+      customerId = custRes.id;
+      if (custRes.isNew) res.locals.emitCustomersUpdate = true;
     }
 
     // ===== حل المورد لفواتير الشراء =====
@@ -6655,35 +6757,15 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
 
     let customerId = null;
     if (customer_name?.trim()) {
-      const existingCustomer = await client.query(
-        `SELECT id FROM customers WHERE name = $1 LIMIT 1`,
-        [customer_name.trim()],
+      const custRes = await resolveCustomerForInvoice(
+        client,
+        customer_name,
+        customer_phone,
+        invoice_type,
+        apply_items_discount,
       );
-      if (existingCustomer.rows.length > 0) {
-        customerId = existingCustomer.rows[0].id;
-      } else {
-        const newCustomer = await client.query(
-          `INSERT INTO customers (name, customer_type)
-           VALUES ($1, $2)
-           RETURNING id`,
-          [customer_name.trim(), invoice_type],
-        );
-        customerId = newCustomer.rows[0].id;
-      }
-
-      if (customer_phone) {
-        await client.query(
-          `INSERT INTO customer_phones (customer_id, phone)
-           VALUES ($1, $2)
-           ON CONFLICT (phone) DO NOTHING`,
-          [customerId, customer_phone],
-        );
-      }
-
-      await client.query(
-        `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
-        [apply_items_discount, customerId],
-      );
+      customerId = custRes.id;
+      if (custRes.isNew) res.locals.emitCustomersUpdate = true;
     }
 
     /* ================================
