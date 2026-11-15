@@ -855,6 +855,24 @@ async function getPayrollSheet(req, res) {
       }
     }
 
+    // Fetch applied advances for paid records if any
+    const appliedAdvancesByEmp = {};
+    if (paidRecordIds.length > 0) {
+      const appliedAdvRes = await pool.query(
+        `
+        SELECT id, branch_id, employee_id, amount, advance_date, notes, status, payroll_record_id, cash_out_id, created_at
+        FROM payroll_advances
+        WHERE branch_id = $1 AND payroll_record_id = ANY($2)
+        ORDER BY advance_date ASC, id ASC
+        `,
+        [branchId, paidRecordIds],
+      );
+      for (const adv of appliedAdvRes.rows) {
+        if (!appliedAdvancesByEmp[adv.employee_id]) appliedAdvancesByEmp[adv.employee_id] = [];
+        appliedAdvancesByEmp[adv.employee_id].push(adv);
+      }
+    }
+
     // 3.b Fetch attendance records for these employees within the period window
     const attendanceByEmp = {};
     try {
@@ -1032,7 +1050,9 @@ async function getPayrollSheet(req, res) {
         deductions_amount: deductionsAmount,
         pending_advances: effectivePendingAdvances,
         excess_advances: excessAdvances,
-        advances_list: isPaid ? [] : (priorExcessAdvances > 0 ? empAdvances : currentAdvances),
+        advances_list: isPaid
+          ? (appliedAdvancesByEmp[emp.id] || [])
+          : (priorExcessAdvances > 0 ? empAdvances : currentAdvances),
         all_pending_advance_ids: isPaid ? [] : empAdvances.map((a) => a.id),
         adjustments_list: empAdjustmentsList,
         carried_over_dues: carriedOverDues,
