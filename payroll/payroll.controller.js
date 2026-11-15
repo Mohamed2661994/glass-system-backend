@@ -1497,7 +1497,7 @@ async function confirmPayrollPayout(req, res) {
           ? `راتب ومستحقات: ${item.name || "موظف"}`
           : `راتب: ${item.name || "موظف"}`;
 
-        const rolePrefix = formatJobTitleWithPrefix(item.job_title);
+        const rolePrefix = formatJobTitleWithPrefix(item.job_title || empInfo?.job_title);
         const notesBreakdown = [
           `صرف راتب ${itemCycle === "monthly" ? "شهري" : "أسبوعي"} ${rolePrefix}: ${item.name || ""}`,
           `الفترة من ${safeStart} إلى ${safeEnd}`,
