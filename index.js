@@ -9375,6 +9375,74 @@ app.delete("/admin/products/:id", async (req, res) => {
   }
 });
 
+function calculateRecommendedPricingBackend(
+  purchasePrice,
+  wholesalePackage,
+  retailPackage,
+  retailPurchasePriceInput,
+) {
+  const wp = Number(purchasePrice) || 0;
+
+  let wNum = 0;
+  let wholesaleType = "";
+  if (wholesalePackage) {
+    const parts = String(wholesalePackage).trim().split(/\s+/);
+    if (parts.length >= 3) {
+      wNum = Number(parts[1]) || 0;
+      wholesaleType = parts[2] || "";
+    } else if (parts.length === 2) {
+      wNum = Number(parts[0]) || 0;
+      wholesaleType = parts[1] || "";
+    }
+  }
+
+  let rNum = 0;
+  if (retailPackage) {
+    const parts = String(retailPackage).trim().split(/\s+/);
+    const qtyPart = parts[0] || "";
+    if (qtyPart.includes(",")) {
+      rNum = Number(qtyPart.split(",")[0]) || 0;
+    } else {
+      rNum = Number(qtyPart) || 0;
+    }
+  }
+
+  let retailPurchasePrice = 0;
+  let hasValidWholesale = false;
+
+  if (wp > 0 && wNum > 0 && rNum > 0) {
+    let wPieces = wNum;
+    if (wholesaleType === "دستة") wPieces = wNum * 12;
+
+    const rPieces = rNum;
+    const totalRetailPackages = wPieces / rPieces;
+
+    if (totalRetailPackages > 0) {
+      const baseCost = wp + 5;
+      const retailPurchasePriceRaw = baseCost / totalRetailPackages;
+      retailPurchasePrice = parseFloat(retailPurchasePriceRaw.toFixed(2));
+      hasValidWholesale = true;
+    }
+  }
+
+  if (!hasValidWholesale) {
+    retailPurchasePrice = Number(retailPurchasePriceInput) || 0;
+  }
+
+  if (retailPurchasePrice <= 0) return null;
+
+  const netTargetPrice = Math.ceil((retailPurchasePrice * 1.10) / 5) * 5;
+  const grossTargetPrice = netTargetPrice * 1.10;
+  const finalRetailPrice = Math.ceil(grossTargetPrice / 5) * 5;
+  const fixedDiscount = finalRetailPrice - netTargetPrice;
+
+  return {
+    retailPurchasePrice,
+    retailPrice: finalRetailPrice,
+    discountAmount: fixedDiscount,
+  };
+}
+
 // إضافة صنف جديد
 app.post("/admin/products", async (req, res) => {
   try {
@@ -9409,6 +9477,31 @@ app.post("/admin/products", async (req, res) => {
       return res.status(400).json({ error: "بيانات ناقصة" });
     }
 
+    let finalRetailPurchasePrice = Number(retail_purchase_price) || 0;
+    let finalRetailPrice = Number(retail_price) || 0;
+    let finalDiscountAmount = Number(discount_amount) || 0;
+
+    // اعتماد الأسعار المقترحة كـ default تلقائياً إذا كانت 0 أو فارغة عند توفر بيانات الجملة
+    if (finalRetailPrice <= 0 || finalRetailPurchasePrice <= 0) {
+      const rec = calculateRecommendedPricingBackend(
+        purchase_price,
+        wholesalePackageNormalized,
+        retailPackageNormalized,
+        finalRetailPurchasePrice,
+      );
+      if (rec) {
+        if (finalRetailPurchasePrice <= 0 && rec.retailPurchasePrice) {
+          finalRetailPurchasePrice = rec.retailPurchasePrice;
+        }
+        if (finalRetailPrice <= 0 && rec.retailPrice) {
+          finalRetailPrice = rec.retailPrice;
+        }
+        if (finalDiscountAmount <= 0 && rec.discountAmount) {
+          finalDiscountAmount = rec.discountAmount;
+        }
+      }
+    }
+
     const insertRes = await pool.query(
       `
       INSERT INTO products
@@ -9437,14 +9530,14 @@ RETURNING *
         wholesalePackageNormalized,
         retailPackageNormalized,
         manufacturer,
-        retail_purchase_price,
+        finalRetailPurchasePrice,
         barcode || null,
         purchase_price || 0,
         purchase_price_adjustment || 0,
         Boolean(purchase_price_adjustment_is_percentage),
         wholesale_price || 0,
-        retail_price,
-        discount_amount,
+        finalRetailPrice,
+        finalDiscountAmount,
         description || "",
         has_wholesale,
       ],
@@ -9511,6 +9604,31 @@ app.put("/admin/products/:id", async (req, res) => {
       return res.status(400).json({ error: "بيانات ناقصة" });
     }
 
+    let finalRetailPurchasePrice = Number(retail_purchase_price) || 0;
+    let finalRetailPrice = Number(retail_price) || 0;
+    let finalDiscountAmount = Number(discount_amount) || 0;
+
+    // اعتماد الأسعار المقترحة كـ default تلقائياً إذا كانت 0 أو فارغة عند توفر بيانات الجملة
+    if (finalRetailPrice <= 0 || finalRetailPurchasePrice <= 0) {
+      const rec = calculateRecommendedPricingBackend(
+        purchase_price,
+        wholesalePackageNormalized,
+        retailPackageNormalized,
+        finalRetailPurchasePrice,
+      );
+      if (rec) {
+        if (finalRetailPurchasePrice <= 0 && rec.retailPurchasePrice) {
+          finalRetailPurchasePrice = rec.retailPurchasePrice;
+        }
+        if (finalRetailPrice <= 0 && rec.retailPrice) {
+          finalRetailPrice = rec.retailPrice;
+        }
+        if (finalDiscountAmount <= 0 && rec.discountAmount) {
+          finalDiscountAmount = rec.discountAmount;
+        }
+      }
+    }
+
     const result = await pool.query(
       `
       UPDATE products
@@ -9541,10 +9659,10 @@ RETURNING *
         purchase_price || 0,
         purchase_price_adjustment || 0,
         Boolean(purchase_price_adjustment_is_percentage),
-        retail_purchase_price,
+        finalRetailPurchasePrice,
         wholesale_price || 0,
-        retail_price,
-        discount_amount,
+        finalRetailPrice,
+        finalDiscountAmount,
         description || "",
         has_wholesale,
         id,
@@ -9997,9 +10115,9 @@ app.post("/admin/products/:id/variants", async (req, res) => {
       return res.status(400).json({ error: "العبوة مطلوبة" });
     }
 
-    // لو القطاعي فاضي أو 0 → ياخد من الصنف الأساسي
+    // لو القطاعي فاضي أو 0 → ياخد من المقترح أولاً ثم من الصنف الأساسي
     const parentProduct = await pool.query(
-      `SELECT retail_package, retail_price, retail_purchase_price FROM products WHERE id = $1`,
+      `SELECT purchase_price, retail_package, retail_price, retail_purchase_price, discount_amount FROM products WHERE id = $1`,
       [id],
     );
     const parent = parentProduct.rows[0] || {};
@@ -10007,14 +10125,40 @@ app.post("/admin/products/:id/variants", async (req, res) => {
       !retail_package || retail_package === "0"
         ? parent.retail_package
         : retail_package;
-    const finalRetailPrice =
-      Number(retail_price) === 0
-        ? Number(parent.retail_price || 0)
-        : retail_price;
-    const finalRetailPurchasePrice =
-      Number(retail_purchase_price) === 0
-        ? Number(parent.retail_purchase_price || 0)
-        : retail_purchase_price;
+
+    let finalRetailPrice = Number(retail_price) || 0;
+    let finalRetailPurchasePrice = Number(retail_purchase_price) || 0;
+    let finalDiscountAmount = Number(discount_amount) || 0;
+
+    if (finalRetailPrice <= 0 || finalRetailPurchasePrice <= 0) {
+      const rec = calculateRecommendedPricingBackend(
+        purchase_price || parent.purchase_price,
+        wholesale_package,
+        finalRetailPackage,
+        finalRetailPurchasePrice,
+      );
+      if (rec) {
+        if (finalRetailPurchasePrice <= 0 && rec.retailPurchasePrice) {
+          finalRetailPurchasePrice = rec.retailPurchasePrice;
+        }
+        if (finalRetailPrice <= 0 && rec.retailPrice) {
+          finalRetailPrice = rec.retailPrice;
+        }
+        if (finalDiscountAmount <= 0 && rec.discountAmount) {
+          finalDiscountAmount = rec.discountAmount;
+        }
+      }
+    }
+
+    if (finalRetailPrice <= 0) {
+      finalRetailPrice = Number(parent.retail_price || 0);
+    }
+    if (finalRetailPurchasePrice <= 0) {
+      finalRetailPurchasePrice = Number(parent.retail_purchase_price || 0);
+    }
+    if (finalDiscountAmount <= 0) {
+      finalDiscountAmount = Number(parent.discount_amount || 0);
+    }
 
     // تحقق من الباركود لو موجود
     if (barcode) {
@@ -10077,9 +10221,9 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
       discount_amount = 0,
     } = req.body;
 
-    // لو القطاعي فاضي أو 0 → ياخد من الصنف الأساسي
+    // لو القطاعي فاضي أو 0 → ياخد من المقترح أولاً ثم من الصنف الأساسي
     const variantRow = await pool.query(
-      `SELECT pv.product_id, p.retail_package, p.retail_price, p.retail_purchase_price
+      `SELECT pv.product_id, p.purchase_price, p.retail_package, p.retail_price, p.retail_purchase_price, p.discount_amount
        FROM product_variants pv
        JOIN products p ON p.id = pv.product_id
        WHERE pv.id = $1`,
@@ -10090,14 +10234,40 @@ app.put("/admin/products/variants/:variantId", async (req, res) => {
       !retail_package || retail_package === "0"
         ? parent.retail_package
         : retail_package;
-    const finalRetailPrice =
-      Number(retail_price) === 0
-        ? Number(parent.retail_price || 0)
-        : retail_price;
-    const finalRetailPurchasePrice =
-      Number(retail_purchase_price) === 0
-        ? Number(parent.retail_purchase_price || 0)
-        : retail_purchase_price;
+
+    let finalRetailPrice = Number(retail_price) || 0;
+    let finalRetailPurchasePrice = Number(retail_purchase_price) || 0;
+    let finalDiscountAmount = Number(discount_amount) || 0;
+
+    if (finalRetailPrice <= 0 || finalRetailPurchasePrice <= 0) {
+      const rec = calculateRecommendedPricingBackend(
+        purchase_price || parent.purchase_price,
+        wholesale_package,
+        finalRetailPackage,
+        finalRetailPurchasePrice,
+      );
+      if (rec) {
+        if (finalRetailPurchasePrice <= 0 && rec.retailPurchasePrice) {
+          finalRetailPurchasePrice = rec.retailPurchasePrice;
+        }
+        if (finalRetailPrice <= 0 && rec.retailPrice) {
+          finalRetailPrice = rec.retailPrice;
+        }
+        if (finalDiscountAmount <= 0 && rec.discountAmount) {
+          finalDiscountAmount = rec.discountAmount;
+        }
+      }
+    }
+
+    if (finalRetailPrice <= 0) {
+      finalRetailPrice = Number(parent.retail_price || 0);
+    }
+    if (finalRetailPurchasePrice <= 0) {
+      finalRetailPurchasePrice = Number(parent.retail_purchase_price || 0);
+    }
+    if (finalDiscountAmount <= 0) {
+      finalDiscountAmount = Number(parent.discount_amount || 0);
+    }
 
     // تحقق من الباركود لو موجود
     if (barcode) {
