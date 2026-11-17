@@ -1038,8 +1038,8 @@ exports.withdrawPrincipal = async (req, res) => {
     await client.query(
       `UPDATE capital_investors
        SET current_principal = $1,
-           status = $2,
-           next_payout_date = CASE WHEN $2 = 'settled' THEN NULL ELSE next_payout_date END,
+           status = $2::varchar,
+           next_payout_date = CASE WHEN $2::varchar = 'settled' THEN NULL ELSE next_payout_date END,
            updated_at = NOW()
        WHERE id = $3`,
       [newPrincipal, newStatus, id],
