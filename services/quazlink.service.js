@@ -24,6 +24,7 @@ const QUAZLINK_CONFIG = {
   timeoutMs: Number(process.env.QUAZLINK_TIMEOUT_MS) || 4500,
   storeName: process.env.QUAZLINK_STORE_NAME || 'معرض آل عاشور عدس - House of Glass',
   websiteUrl: process.env.QUAZLINK_WEBSITE_URL || 'https://www.hg-alshour.online',
+  channelUrl: process.env.QUAZLINK_CHANNEL_URL || 'https://whatsapp.com/channel/0029Vavz4EY6GcGG3Sl9Ez21',
 };
 
 // Memory cache for debounce/anti-spam (stores invoiceId -> lastSentTimestamp)
@@ -151,131 +152,253 @@ function postToQuazLink(payload) {
  * ═══════════════════════════════════════════════════════════════════
  */
 
-// 🛒 Retail Templates (4 variations)
+// 🛒 Retail Templates (4 compact mobile-first variations)
 const RETAIL_TEMPLATES = [
-  // 1: الاستكشاف والكولكشن الجديد
-  (name, invNum, finance, website, store) => `(${store})
+  // 1: ترحيب دافئ ومختصر
+  (name, invNum, finance, linksBlock) => `*آل عاشور عدس | House of Glass* ✨
+أهلاً بك يا ${name}، نورتنا اليوم! ❤️
 
-أهلاً بك يا ${name}، شرفتنا ونورتنا اليوم! ❤️
-📄 *رقم الفاتورة:* #${invNum}
+📄 *فاتورة:* #${invNum}
 ${finance}
 
-✨ تشكيلتنا لسه فيها كتير!
-تقدر تكتشف أحدث منتجاتنا وباقي الكولكشن بسهولة من خلال الرابط:
-👉 ${website}
+${linksBlock}
 
-شكراً لاختيارك لنا وسعداء دائماً بخدمتك! 🌟`,
+سعداء بخدمتك دائماً! 🌟`,
 
-  // 2: شياكة البيت والديكور الفاخر
-  (name, invNum, finance, website, store) => `(${store})
+  // 2: شياكة وذوق
+  (name, invNum, finance, linksBlock) => `*آل عاشور عدس | House of Glass* 🥂
+أهلاً بك يا ${name}، شرفتنا ويسعدنا اختيارك لذوقنا! ❤️
 
-أهلاً بك يا ${name}، نورتنا ويسعدنا دائماً اختيارك لذوقنا! ❤️
-📄 *رقم الفاتورة:* #${invNum}
+📄 *فاتورة:* #${invNum}
 ${finance}
 
-🏠 عشان تكمل شياكة بيتك..
-جمعنالك تشكيلة واسعة من أرقى أدوات الزجاج والديكور على موقعنا، تقدر تشوفها من هنا:
-👉 ${website}
+${linksBlock}
 
-يومك جميل ونتمنى نشوفك تاني قريب! ✨`,
+يومك جميل ونتمنى نشوفك قريب! ✨`,
 
-  // 3: العميل المميز والعروض الحصرية
-  (name, invNum, finance, website, store) => `(${store})
+  // 3: شكر وثقة
+  (name, invNum, finance, linksBlock) => `*آل عاشور عدس | House of Glass* ✨
+شكراً لزيارتك وثقتك بنا يا ${name}! 💐
 
-أهلاً بك يا ${name}، شرفتنا ونورتنا اليوم! ❤️
-📄 *رقم الفاتورة:* #${invNum}
+📄 *فاتورة:* #${invNum}
 ${finance}
 
-🎁 لأنك عميل مميز، حابين تتابع أول بأول جديدنا وعروضنا الحصرية:
-تصفح باقي المنتجات واطلب مباشرة من موقعنا:
-👉 ${website}
+${linksBlock}
 
-شكراً جزيلاً لك ونتمنى لك تجربة تسوق ممتعة دائماً! 🌟`,
+في خدمتك دائماً ونتطلع لزيارتك القادمة! 🌟`,
 
-  // 4: الذوق والكتالوج الكامل
-  (name, invNum, finance, website, store) => `(${store})
+  // 4: تجربة تسوق ممتعة
+  (name, invNum, finance, linksBlock) => `*آل عاشور عدس | House of Glass* 💎
+أهلاً بك يا ${name}، تشرّفنا بزيارتك اليوم! ❤️
 
-شكراً لزيارتك وثقتك بنا يا ${name} 💐
-📄 *الفاتورة:* #${invNum}
+📄 *فاتورة:* #${invNum}
 ${finance}
 
-🛒 كتالوج المنتجات الكامل متاح الآن أونلاين:
-👉 ${website}
+${linksBlock}
 
-في خدمتك دائماً، ونتطلع لزيارتك القادمة! ✨`
+شكراً لاختيارك لنا ونتمنى لك تجربة تسوق ممتعة! ✨`,
 ];
 
-// 🤝 Wholesale Templates (3 variations)
+// 🤝 Wholesale Templates (3 compact mobile-first variations)
 const WHOLESALE_TEMPLATES = [
-  // 1: شراكة نجاح وتجارة رابحة
-  (name, invNum, finance, website) => `(معرض آل عاشور عدس - كبار العملاء والتوزيع) 🤝
+  // 1: شراكة نجاح
+  (name, invNum, finance, linksBlock) => `*آل عاشور عدس | كبار العملاء والجملة* 🤝
+أهلاً بك يا ${name}، سعداء بشراكتنا المستمرة! 🌟
 
-أهلاً بك يا ${name}، سعداء بشراكتنا المستمرة ونتمنى لك تجارة رابحة ورزقاً واسعاً! 🌟
-
-📄 *رقم فاتورة الجملة:* #${invNum}
+📄 *فاتورة جملة:* #${invNum}
 ${finance}
 
-📦 لمعرفة أحدث الحاويات والأصناف والبضائع المتاحة للكميات:
-👉 ${website}
+${linksBlock}
 
-بالبركة إن شاء الله، وفي خدمتك دائماً لأي طلبيات إضافية! 🚚`,
+بالبركة إن شاء الله، وفي خدمتك دائماً لأي طلبيات! 🚚`,
 
-  // 2: طلبيات المحلات وتوريد البضاعة
-  (name, invNum, finance, website) => `(معرض آل عاشور عدس - قسم الجملة) 💎
+  // 2: طلبيات المحلات والتوريد
+  (name, invNum, finance, linksBlock) => `*آل عاشور عدس | قسم الجملة* 💎
+تحياتنا لك يا ${name}، يسعدنا دائماً تلبية احتياجات معرضك! 🤝
 
-تحياتنا لك يا ${name} ويسعدنا دائماً تلبية كافة احتياجات محلك ومعرضك! 🤝
-
-📄 *فاتورة توريد بضاعة:* #${invNum}
+📄 *فاتورة توريد:* #${invNum}
 ${finance}
 
-🚛 تقدر تتابع وصول تشكيلات البضاعة الجديدة وطلبيات الكراتين أول بأول عبر موقعنا:
-👉 ${website}
+${linksBlock}
 
-سعداء بالتعاون المستمر ونتمنى لك موسماً مباركاً ومبيعات موفقة! ✨`,
+نتمنى لك موسماً مباركاً ومبيعات موفقة! ✨`,
 
-  // 3: كشف حساب وفاتورة جملة مباشرة
-  (name, invNum, finance, website) => `(معرض آل عاشور عدس - House of Glass) 📋
-
+  // 3: بيان فاتورة جملة مباشر
+  (name, invNum, finance, linksBlock) => `*آل عاشور عدس | House of Glass* 📋
 بيان فاتورة جملة للعميل: ${name} 💐
-───────────────────
-📄 *رقم الفاتورة:* #${invNum}
-${finance}
-───────────────────
-🛒 للاطلاع على كتالوج المنتجات والأسعار الخاصة بالكميات:
-👉 ${website}
 
-شاكرين لتعاملكم الراقي وثقتكم الدائمة في منتجاتنا! 🌟`
+📄 *فاتورة:* #${invNum}
+${finance}
+
+${linksBlock}
+
+شاكرين لتعاملكم الراقي وثقتكم الدائمة بنا! 🌟`,
 ];
 
 /**
- * Build smart financial text block conditionally:
- * - If remaining is 0 or paid >= total: Shows "خالصة بالكامل ✅"
- * - If partial payment: Shows Total, Paid, and Remaining
- * - If 0 paid (unpaid / credit): Shows "آجل ⏳"
+ * Check if this normalized phone number has NEVER received a successful WhatsApp
+ * invoice message before. Ensures the WhatsApp Channel invite is sent strictly
+ * ONCE (for new customers only, covering both retail and wholesale).
  */
-function buildFinancialBlock({ amount, paidAmount, remainingAmount, currency = 'ج.م' }) {
-  const formattedTotal = formatAmount(amount);
+async function isFirstWhatsAppForPhone(cleanPhone) {
+  if (!cleanPhone) return false;
+  try {
+    const res = await pool.query(
+      `SELECT 1 FROM invoices
+       WHERE whatsapp_status = 'sent'
+         AND whatsapp_phone = $1
+       LIMIT 1`,
+      [cleanPhone]
+    );
+    return res.rows.length === 0;
+  } catch (err) {
+    console.warn(`[QuazLink] Could not verify new-customer status for ${maskPhone(cleanPhone)}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Build smart financial text block conditionally:
+ * - If discount > 0: Shows original invoice subtotal & discount on line 1, then net total & payment status on line 2
+ * - If no discount: Compact single line with Total & payment status
+ * - Handles fully paid ("خالصة بالكامل ✅"), partial payment, and unpaid ("آجل ⏳")
+ */
+function buildFinancialBlock({
+  subtotal,
+  discount,
+  previousBalance,
+  amount,
+  paidAmount,
+  remainingAmount,
+  currency = 'ج.م',
+}) {
   const numTotal = Number(amount || 0);
+  const numSubtotal = subtotal !== undefined && subtotal !== null ? Number(subtotal) : 0;
+  const numDiscount = Math.max(0, Number(discount || 0));
+  const numPrevious = Number(previousBalance || 0);
   const numPaid = Number(paidAmount || 0);
   const numRemaining = remainingAmount !== undefined && remainingAmount !== null
     ? Number(remainingAmount)
     : (numTotal - numPaid);
 
+  const formattedTotal = formatAmount(numTotal);
   const formattedPaid = formatAmount(numPaid);
   const formattedRemaining = formatAmount(Math.max(0, numRemaining));
 
+  const hasDiscount = numDiscount > 0;
+  const effectiveSubtotal = hasDiscount
+    ? (numSubtotal > 0 ? numSubtotal : Math.max(0, numTotal - numPrevious + numDiscount))
+    : numSubtotal;
+
+  const hasPreviousIncluded =
+    hasDiscount &&
+    numPrevious > 0 &&
+    numTotal > (effectiveSubtotal - numDiscount + 0.01);
+
+  const totalLabel = hasDiscount
+    ? (hasPreviousIncluded ? 'الإجمالي (شامل السابق)' : 'الصافي')
+    : 'الإجمالي';
+
+  let paymentLine;
   // Case 1: Fully paid
   if (numRemaining <= 0 || (numTotal > 0 && numPaid >= numTotal)) {
-    return `💰 *الإجمالي:* ${formattedTotal} ${currency} *(خالصة بالكامل ✅)*`;
+    paymentLine = `💰 *${totalLabel}:* ${formattedTotal} ${currency} *(خالصة بالكامل ✅)*`;
+  } else if (numPaid > 0 && numRemaining > 0) {
+    // Case 2: Partial payment
+    paymentLine = `💰 *${totalLabel}:* ${formattedTotal} ${currency} | 💵 *المدفوع:* ${formattedPaid} ${currency} | ⏳ *المتبقي:* ${formattedRemaining} ${currency}`;
+  } else {
+    // Case 3: Fully credit / Unpaid
+    paymentLine = `💰 *${totalLabel}:* ${formattedTotal} ${currency} *(آجل ⏳)*`;
   }
 
-  // Case 2: Partial payment
-  if (numPaid > 0 && numRemaining > 0) {
-    return `💰 *الإجمالي:* ${formattedTotal} ${currency}\n💵 *المدفوع:* ${formattedPaid} ${currency}\n⏳ *المتبقي:* ${formattedRemaining} ${currency}`;
+  if (hasDiscount) {
+    const subtotalLine = `🧾 *قيمة الفاتورة:* ${formatAmount(effectiveSubtotal)} ${currency} | 🏷️ *الخصم:* ${formatAmount(numDiscount)} ${currency}`;
+    return `${subtotalLine}\n${paymentLine}`;
   }
 
-  // Case 3: Fully credit / Unpaid
-  return `💰 *الإجمالي:* ${formattedTotal} ${currency} *(آجل ⏳)*`;
+  return paymentLine;
+}
+
+/**
+ * Build links block:
+ * - For NEW customers only: Places the official WhatsApp Channel link FIRST
+ *   (so WhatsApp renders the rich Channel Preview Card with a Follow button),
+ *   followed by the website URL.
+ * - For returning customers: Compact website link only (no repeated channel invite).
+ */
+function buildLinksBlock({ isNewCustomer, isWholesale, website, channelUrl }) {
+  const targetWebsite = website || QUAZLINK_CONFIG.websiteUrl;
+  const targetChannel = channelUrl || QUAZLINK_CONFIG.channelUrl;
+
+  if (isNewCustomer && targetChannel) {
+    if (isWholesale) {
+      return `📦 *تابع أحدث الشحنات وتشكيلاتنا (مجات، طفايات، وهدايا) أول بأول:*\n📲 قناتنا الرسمية على واتساب (اعمل Follow):\n${targetChannel}\n🌐 كتالوج الجملة على موقعنا:\n${targetWebsite}`;
+    }
+    return `🥂 *تابع أحدث تشكيلاتنا (مجات، طفايات، وهدايا) أول بأول:*\n📲 قناتنا على واتساب (اعمل Follow):\n${targetChannel}\n🌐 موقعنا الإلكتروني:\n${targetWebsite}`;
+  }
+
+  if (isWholesale) {
+    return `🌐 لمتابعة أحدث الشحنات وكتالوج الكميات:\n${targetWebsite}`;
+  }
+  return `🌐 تصفح أحدث تشكيلاتنا على موقعنا:\n${targetWebsite}`;
+}
+
+/**
+ * Pure helper to compose the complete WhatsApp message (also usable for dry-run previews/tests).
+ */
+function buildInvoiceMessage({
+  invoiceId,
+  customerName,
+  subtotal,
+  discount,
+  previousBalance,
+  amount,
+  paidAmount,
+  remainingAmount,
+  invoiceType = 'retail',
+  currency = 'ج.م',
+  isNewCustomer = false,
+  templateIndex = null,
+}) {
+  const invoiceNumber = `INV-${invoiceId}`;
+  let displayName = 'عميلنا العزيز';
+  if (customerName && customerName.trim()) {
+    const rawName = customerName.trim();
+    const cleanedName = rawName.replace(/^(أ\s*[\/\.]|أستاذ\s*[\/\.]?|الاستاذ\s*[\/\.]?|الأستاذ\s*[\/\.]?)\s*/i, '');
+    displayName = `أ / ${cleanedName}`;
+  }
+
+  const isWholesale = invoiceType === 'wholesale';
+  const financialBlock = buildFinancialBlock({
+    subtotal,
+    discount,
+    previousBalance,
+    amount,
+    paidAmount,
+    remainingAmount,
+    currency,
+  });
+
+  const linksBlock = buildLinksBlock({
+    isNewCustomer,
+    isWholesale,
+    website: QUAZLINK_CONFIG.websiteUrl,
+    channelUrl: QUAZLINK_CONFIG.channelUrl,
+  });
+
+  const poolTemplates = isWholesale ? WHOLESALE_TEMPLATES : RETAIL_TEMPLATES;
+  const selectedIndex =
+    templateIndex !== null && templateIndex >= 0 && templateIndex < poolTemplates.length
+      ? templateIndex
+      : Math.floor(Math.random() * poolTemplates.length);
+  const selectedTemplate = poolTemplates[selectedIndex];
+
+  return {
+    invoiceNumber,
+    displayName,
+    templateIndex: selectedIndex,
+    message: selectedTemplate(displayName, invoiceNumber, financialBlock, linksBlock),
+  };
 }
 
 /**
@@ -286,6 +409,9 @@ function buildFinancialBlock({ amount, paidAmount, remainingAmount, currency = '
  * @param {number|string} params.invoiceId
  * @param {string} [params.customerPhone]
  * @param {string} [params.customerName]
+ * @param {number|string} [params.subtotal]
+ * @param {number|string} [params.discount]
+ * @param {number|string} [params.previousBalance]
  * @param {number|string} [params.amount]
  * @param {number|string} [params.paidAmount]
  * @param {number|string} [params.remainingAmount]
@@ -297,6 +423,9 @@ async function dispatchInvoiceWhatsApp({
   invoiceId,
   customerPhone,
   customerName,
+  subtotal,
+  discount,
+  previousBalance,
   amount,
   paidAmount,
   remainingAmount,
@@ -325,6 +454,9 @@ async function dispatchInvoiceWhatsApp({
   // If details are missing, fetch from database
   let targetPhone = customerPhone;
   let targetName = customerName;
+  let targetSubtotal = subtotal;
+  let targetDiscount = discount;
+  let targetPreviousBalance = previousBalance;
   let targetAmount = amount;
   let targetPaid = paidAmount;
   let targetRemaining = remainingAmount;
@@ -332,6 +464,8 @@ async function dispatchInvoiceWhatsApp({
 
   if (
     !targetPhone ||
+    targetSubtotal === undefined ||
+    targetDiscount === undefined ||
     targetAmount === undefined ||
     targetPaid === undefined ||
     targetRemaining === undefined ||
@@ -339,7 +473,8 @@ async function dispatchInvoiceWhatsApp({
   ) {
     try {
       const invRes = await pool.query(
-        `SELECT customer_phone, customer_name, total, paid_amount, remaining_amount, invoice_type, branch_id 
+        `SELECT customer_phone, customer_name, subtotal, discount_total, manual_discount, previous_balance,
+                total, paid_amount, remaining_amount, invoice_type, branch_id
          FROM invoices WHERE id = $1`,
         [id]
       );
@@ -347,6 +482,13 @@ async function dispatchInvoiceWhatsApp({
         const row = invRes.rows[0];
         targetPhone = targetPhone || row.customer_phone;
         targetName = targetName || row.customer_name;
+        if (targetSubtotal === undefined || targetSubtotal === null) targetSubtotal = row.subtotal;
+        if (targetDiscount === undefined || targetDiscount === null) {
+          targetDiscount = row.discount_total ?? row.manual_discount ?? 0;
+        }
+        if (targetPreviousBalance === undefined || targetPreviousBalance === null) {
+          targetPreviousBalance = row.previous_balance ?? 0;
+        }
         if (targetAmount === undefined || targetAmount === null) targetAmount = row.total;
         if (targetPaid === undefined || targetPaid === null) targetPaid = row.paid_amount;
         if (targetRemaining === undefined || targetRemaining === null) targetRemaining = row.remaining_amount;
@@ -377,41 +519,30 @@ async function dispatchInvoiceWhatsApp({
     return { success: false, reason: 'no_valid_phone' };
   }
 
-  const invoiceNumber = `INV-${id}`;
+  // 🆕 Check if this is the customer's very first successful WhatsApp message (new customer only)
+  const isNewCustomer = await isFirstWhatsAppForPhone(cleanPhone);
+
   const formattedAmount = formatAmount(targetAmount);
+  const isWholesale = targetInvoiceType === 'wholesale';
 
-  let displayName = 'عميلنا العزيز';
-  if (targetName && targetName.trim()) {
-    const rawName = targetName.trim();
-    const cleanedName = rawName.replace(/^(أ\s*[\/\.]|أستاذ\s*[\/\.]?|الاستاذ\s*[\/\.]?|الأستاذ\s*[\/\.]?)\s*/i, '');
-    displayName = `أ / ${cleanedName}`;
-  }
-
-  // 🚀 Generate Smart Financial Block
-  const financialBlock = buildFinancialBlock({
+  // 🚀 Compose Compact Dynamic Message (with subtotal/discount & first-time channel invite)
+  const { invoiceNumber, displayName, templateIndex, message: customMessage } = buildInvoiceMessage({
+    invoiceId: id,
+    customerName: targetName,
+    subtotal: targetSubtotal,
+    discount: targetDiscount,
+    previousBalance: targetPreviousBalance,
     amount: targetAmount,
     paidAmount: targetPaid,
     remainingAmount: targetRemaining,
+    invoiceType: targetInvoiceType || 'retail',
     currency,
+    isNewCustomer,
   });
-
-  // 🎲 Select Random Template based on Invoice Type (Wholesale vs Retail)
-  const isWholesale = targetInvoiceType === 'wholesale';
-  const poolTemplates = isWholesale ? WHOLESALE_TEMPLATES : RETAIL_TEMPLATES;
-  const randomIndex = Math.floor(Math.random() * poolTemplates.length);
-  const selectedTemplate = poolTemplates[randomIndex];
-
-  const customMessage = selectedTemplate(
-    displayName,
-    invoiceNumber,
-    financialBlock,
-    QUAZLINK_CONFIG.websiteUrl,
-    QUAZLINK_CONFIG.storeName
-  );
 
   const senderStoreName = isWholesale ? 'معرض آل عاشور عدس - كبار العملاء والتوزيع' : QUAZLINK_CONFIG.storeName;
 
-  console.log(`[QuazLink] 🚀 Dispatching WhatsApp invoice #${id} (${targetInvoiceType || 'retail'}, template #${randomIndex + 1}) to ${maskPhone(cleanPhone)} (${displayName}, ${formattedAmount} ${currency})...`);
+  console.log(`[QuazLink] 🚀 Dispatching WhatsApp invoice #${id} (${targetInvoiceType || 'retail'}, template #${templateIndex + 1}, newCustomer=${isNewCustomer}) to ${maskPhone(cleanPhone)} (${displayName}, ${formattedAmount} ${currency})...`);
 
   try {
     const result = await postToQuazLink({
@@ -497,7 +628,8 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
   if (!id) throw new Error('معرف الفاتورة غير صالح');
 
   const invRes = await pool.query(
-    `SELECT id, customer_phone, customer_name, total, paid_amount, remaining_amount, invoice_type, branch_id 
+    `SELECT id, customer_phone, customer_name, subtotal, discount_total, manual_discount, previous_balance,
+            total, paid_amount, remaining_amount, invoice_type, branch_id
      FROM invoices WHERE id = $1`,
     [id]
   );
@@ -514,6 +646,9 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
     invoiceId: invoice.id,
     customerPhone: invoice.customer_phone,
     customerName: invoice.customer_name,
+    subtotal: invoice.subtotal,
+    discount: invoice.discount_total ?? invoice.manual_discount ?? 0,
+    previousBalance: invoice.previous_balance ?? 0,
     amount: invoice.total,
     paidAmount: invoice.paid_amount,
     remainingAmount: invoice.remaining_amount,
@@ -530,5 +665,9 @@ module.exports = {
   resendInvoiceWhatsApp,
   normalizeEgyptianPhone,
   maskPhone,
+  isFirstWhatsAppForPhone,
+  buildFinancialBlock,
+  buildLinksBlock,
+  buildInvoiceMessage,
   QUAZLINK_CONFIG,
 };

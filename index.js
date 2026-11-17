@@ -149,7 +149,7 @@ app.use(
       }
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key", "x-owner-token", "X-Owner-Token"],
     credentials: true,
   }),
 );
@@ -1359,6 +1359,7 @@ const {
   invalidateProductStockCache,
   invalidateCustomerBalancesCache,
 } = require("./reports/reports.controller");
+const ownerController = require("./owner/owner.controller");
 
 /* ========== Real-time: auto-emit socket events on successful writes ========== */
 app.use((req, res, next) => {
@@ -1430,6 +1431,13 @@ app.use((req, res, next) => {
         }
         if (channel === "data:customers" || channel === "data:invoices") {
           invalidateCustomerSearchCache();
+        }
+        // 🛡️ Owner Cockpit: instant fast-cache clear + debounced background heavy refresh (0ms impact on writes)
+        if (shouldInvalidateDashboard || shouldInvalidateBalances || channel === "data:suppliers") {
+          ownerController.invalidateOwnerFastCache();
+          if (shouldInvalidateProducts || shouldInvalidateBalances || channel === "data:suppliers") {
+            ownerController.scheduleOwnerCacheRefresh(broadcast);
+          }
         }
 
         // 2. Broadcast realtime updates
@@ -1507,6 +1515,10 @@ const debtsController = require("./debts/debts.controller");
 const warehouseRentsController = require("./debts/warehouseRents.controller");
 app.use("/debts", debtsRoutes);
 app.use("/api/debts", debtsRoutes);
+
+const ownerRoutes = require("./owner/owner.routes");
+app.use("/owner", ownerRoutes);
+app.use("/api/owner", ownerRoutes);
 
 const productsRoutes = require("./modules/products/products.routes");
 
@@ -5472,6 +5484,9 @@ VALUES
               invoiceId,
               customerPhone: customer_phone || req.body.customer_phone,
               customerName: customer_name || req.body.customer_name,
+              subtotal: Number(subtotal || 0),
+              discount: Number(discount_total || 0),
+              previousBalance: Number(previous_balance || 0),
               amount: totalWithPrevious || total,
               paidAmount: Number(paid_amount || 0),
               remainingAmount: remaining_amount,
@@ -5801,6 +5816,9 @@ app.post("/invoices/retail", async (req, res) => {
             invoiceId,
             customerPhone: customer_phone || req.body.customer_phone,
             customerName: customer_name || req.body.customer_name,
+            subtotal: Number(total_before_discount || 0),
+            discount: Number(items_discount || 0) + Number(extra_discount || 0),
+            previousBalance: Number(previous_balance || 0),
             amount: final_total,
             paidAmount: Number(paid_amount || 0),
             remainingAmount: remaining_amount,
@@ -7301,6 +7319,9 @@ SET
             invoiceId,
             customerPhone: customer_phone || req.body.customer_phone,
             customerName: customer_name || req.body.customer_name,
+            subtotal: Number(subtotal || 0),
+            discount: Number(discountTotal || 0),
+            previousBalance: Number(previous_balance || 0),
             amount: totalWithPrevious || total,
             paidAmount: Number(paid_amount || 0),
             remainingAmount: remaining,
@@ -16576,6 +16597,7 @@ runStartupMigrations().finally(() => {
     console.log(`🚀 Server + Socket running on port ${PORT}`);
     initClusterRealtimeSync();
     prewarmProductsCache();
+    setTimeout(() => ownerController.warmOwnerCache(broadcastRealtime), 5000);
     stockWatchdogService.initStartupAudit(io);
     setTimeout(() => ensureStockTransferIndexes(1), 4000);
     if (typeof pool.startContinuousStandbyBackup === "function") {
