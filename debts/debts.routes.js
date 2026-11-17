@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const controller = require("./debts.controller");
 const warehouseRentsController = require("./warehouseRents.controller");
+const capitalInvestorsController = require("./capitalInvestors.controller");
 
 /**
  * Middleware: Strictly restrict Debts & Personal Liabilities access to Administrators
@@ -45,6 +46,17 @@ router.put("/rents/:id", warehouseRentsController.updateRent);
 router.delete("/rents/:id", warehouseRentsController.deleteRent);
 router.post("/rents/:id/pay", warehouseRentsController.payRent);
 router.post("/rents/:id/apply-increase", warehouseRentsController.applyAnnualIncrease);
+
+// 2.6 Operating Capital / Investors Management (MUST be registered before /:id!)
+router.get("/investors/summary", capitalInvestorsController.getSummary);
+router.delete("/investors/transactions/:txId", capitalInvestorsController.deleteTransaction);
+router.get("/investors", capitalInvestorsController.getInvestors);
+router.post("/investors", capitalInvestorsController.createInvestor);
+router.put("/investors/:id", capitalInvestorsController.updateInvestor);
+router.delete("/investors/:id", capitalInvestorsController.deleteInvestor);
+router.post("/investors/:id/deposit", capitalInvestorsController.depositCapital);
+router.post("/investors/:id/profit", capitalInvestorsController.recordProfit);
+router.post("/investors/:id/withdraw", capitalInvestorsController.withdrawPrincipal);
 
 // 3. Debts CRUD
 router.get("/", controller.getDebts);

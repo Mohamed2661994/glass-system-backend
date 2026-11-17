@@ -203,9 +203,10 @@ function calculateNextDueDate(startDateStr, index, frequency) {
 // Controller Methods
 // ==========================================
 
-// 0. Unified Single-Shot Bootstrap Endpoint (Replaces 5 parallel HTTP calls with 1 fast call)
+// 0. Unified Single-Shot Bootstrap Endpoint (Replaces 5+ parallel HTTP calls with 1 fast call)
 exports.getBootstrap = async (req, res) => {
   const warehouseRentsController = require("./warehouseRents.controller");
+  const capitalInvestorsController = require("./capitalInvestors.controller");
   try {
     const todayIso = warehouseRentsController.getCairoToday();
 
@@ -257,13 +258,17 @@ exports.getBootstrap = async (req, res) => {
       LIMIT 50
     `;
 
-    const [summaryRes, instRes, debtsRes, upcomingRes, rents] = await Promise.all([
+    const [summaryRes, instRes, debtsRes, upcomingRes, rents, investors] = await Promise.all([
       pool.query(summaryQuery),
       pool.query(installmentsSummaryQuery),
       pool.query(debtsQuery),
       pool.query(upcomingQuery),
       warehouseRentsController.fetchAllComputedRents(todayIso).catch((e) => {
         console.error("Bootstrap warehouse rents fetch error:", e.message);
+        return [];
+      }),
+      capitalInvestorsController.fetchAllComputedInvestors(todayIso).catch((e) => {
+        console.error("Bootstrap capital investors fetch error:", e.message);
         return [];
       }),
     ]);
@@ -311,6 +316,7 @@ exports.getBootstrap = async (req, res) => {
     }));
 
     const rentSummary = warehouseRentsController.buildRentsSummaryFromComputed(rents, todayIso);
+    const investorSummary = capitalInvestorsController.buildInvestorsSummaryFromComputed(investors);
 
     return res.json({
       summary,
@@ -318,6 +324,8 @@ exports.getBootstrap = async (req, res) => {
       upcoming,
       rentSummary,
       rents,
+      investorSummary,
+      investors,
     });
   } catch (err) {
     console.error("debts.getBootstrap error:", err);
