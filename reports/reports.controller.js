@@ -1405,7 +1405,9 @@ exports.getCustomerBalances = async (req, res) => {
         const total = toNumber(inv.total);
         const paid = toNumber(inv.paid_amount);
         const remaining = toNumber(inv.remaining_amount);
-        const prevBal = isBranch1 && inv.previous_balance != null ? toNumber(inv.previous_balance) : undefined;
+        // Match getCustomerDebtDetails (line 1630): always set a numeric previous_balance (0 for Branch 2)
+        // so cumulative invoice remaining_amount replaces currentBalance instead of double-counting previous_balance!
+        const prevBal = isBranch1 && inv.previous_balance != null ? toNumber(inv.previous_balance) : 0;
         const invDate = (inv.invoice_date || "").substring(0, 10);
 
         totalSales += subtotal;
