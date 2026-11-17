@@ -555,17 +555,33 @@ async function fetchAllComputedRents(todayIso = getCairoToday()) {
 // Automatic 3-Day & Annual Increase Notification Sync
 // ==========================================
 let reminderSyncInFlight = null;
+let lastReminderSyncAt = 0;
+const REMINDER_SYNC_COOLDOWN_MS = 5 * 60 * 1000; // Run at most once every 5 minutes on passive reads
 
-async function syncWarehouseRentReminders({ broadcastRealtime = null, sendPushToUser = null } = {}) {
+async function syncWarehouseRentReminders({
+  broadcastRealtime = null,
+  sendPushToUser = null,
+  precomputedRents = null,
+  force = false,
+} = {}) {
   if (reminderSyncInFlight) return reminderSyncInFlight;
+  const now = Date.now();
+  if (!force && lastReminderSyncAt > 0 && now - lastReminderSyncAt < REMINDER_SYNC_COOLDOWN_MS) {
+    return { created: 0, skipped: true };
+  }
 
   reminderSyncInFlight = (async () => {
     try {
       await ensureWarehouseRentsTables();
       const todayIso = getCairoToday();
-      const rents = await fetchAllComputedRents(todayIso);
+      const rents = Array.isArray(precomputedRents)
+        ? precomputedRents
+        : await fetchAllComputedRents(todayIso);
       const activeRents = rents.filter((r) => r.status === "active");
-      if (activeRents.length === 0) return { created: 0 };
+      if (activeRents.length === 0) {
+        lastReminderSyncAt = Date.now();
+        return { created: 0 };
+      }
 
       const adminsRes = await pool.query(
         `SELECT id, branch_id, full_name, username FROM users
@@ -671,6 +687,7 @@ async function syncWarehouseRentReminders({ broadcastRealtime = null, sendPushTo
         }
       }
 
+      lastReminderSyncAt = Date.now();
       return { created };
     } catch (err) {
       console.error("syncWarehouseRentReminders error:", err.message);
@@ -684,6 +701,67 @@ async function syncWarehouseRentReminders({ broadcastRealtime = null, sendPushTo
 }
 
 // ==========================================
+// Shared Summary Builder (Zero Duplicate DB Calls)
+// ==========================================
+function buildRentsSummaryFromComputed(rents = [], todayIso = getCairoToday()) {
+  const activeRents = rents.filter((r) => r.status === "active");
+  const pausedRents = rents.filter((r) => r.status === "paused");
+  const endedRents = rents.filter((r) => r.status === "ended");
+
+  const totalMonthlyRent = round2(
+    activeRents.reduce((s, r) => s + r.monthly_rent, 0),
+  );
+  const currentMonth = getMonthKey(todayIso);
+
+  // Include payments recorded toward the current calendar month (across all warehouses)
+  let totalPaidThisMonth = 0;
+  let remainingThisMonth = 0;
+  for (const r of rents) {
+    const mPay = r.payments
+      .filter((p) => p.billing_month === currentMonth)
+      .reduce((s, p) => s + Number(p.amount || 0), 0);
+    totalPaidThisMonth = round2(totalPaidThisMonth + mPay);
+    if (r.status === "active") {
+      remainingThisMonth = round2(
+        remainingThisMonth + Number(r.current_month_remaining || 0),
+      );
+    }
+  }
+
+  const overdueRents = activeRents.filter((r) => r.overdue_count > 0);
+  const overdueAmount = round2(
+    overdueRents.reduce((s, r) => s + r.overdue_amount, 0),
+  );
+  const dueSoonRents = activeRents.filter(
+    (r) =>
+      r.overdue_count === 0 &&
+      r.days_until_due !== null &&
+      r.days_until_due >= 0 &&
+      r.days_until_due <= r.reminder_days_before,
+  );
+  const annualIncreaseReadyCount = activeRents.filter(
+    (r) => r.annual_increase?.is_ready_to_apply || r.annual_increase?.is_due_soon,
+  ).length;
+
+  return {
+    current_month: currentMonth,
+    current_month_label: formatMonthArabic(currentMonth),
+    total_warehouses: rents.length,
+    active_warehouses_count: activeRents.length,
+    paused_warehouses_count: pausedRents.length,
+    ended_warehouses_count: endedRents.length,
+    total_monthly_rent: totalMonthlyRent,
+    total_paid_this_month: totalPaidThisMonth,
+    remaining_this_month: remainingThisMonth,
+    overdue_count: overdueRents.length,
+    overdue_amount: overdueAmount,
+    due_soon_count: dueSoonRents.length,
+    alerts_count: overdueRents.length + dueSoonRents.length,
+    annual_increase_due_count: annualIncreaseReadyCount,
+  };
+}
+
+// ==========================================
 // Controller Endpoints
 // ==========================================
 
@@ -693,67 +771,14 @@ exports.getSummary = async (req, res) => {
     const todayIso = getCairoToday();
     const rents = await fetchAllComputedRents(todayIso);
 
-    // Fire reminder sync asynchronously so new due windows reflect in bell too
+    // Fire reminder sync asynchronously (cooldown-guarded, reuses precomputed rents)
     void syncWarehouseRentReminders({
       broadcastRealtime: req.app?.get("broadcastRealtime"),
       sendPushToUser: req.app?.get("sendPushToUser"),
+      precomputedRents: rents,
     });
 
-    const activeRents = rents.filter((r) => r.status === "active");
-    const pausedRents = rents.filter((r) => r.status === "paused");
-    const endedRents = rents.filter((r) => r.status === "ended");
-
-    const totalMonthlyRent = round2(
-      activeRents.reduce((s, r) => s + r.monthly_rent, 0),
-    );
-    const currentMonth = getMonthKey(todayIso);
-
-    // Include payments recorded toward the current calendar month (across all warehouses)
-    let totalPaidThisMonth = 0;
-    let remainingThisMonth = 0;
-    for (const r of rents) {
-      const mPay = r.payments
-        .filter((p) => p.billing_month === currentMonth)
-        .reduce((s, p) => s + Number(p.amount || 0), 0);
-      totalPaidThisMonth = round2(totalPaidThisMonth + mPay);
-      if (r.status === "active") {
-        remainingThisMonth = round2(
-          remainingThisMonth + Number(r.current_month_remaining || 0),
-        );
-      }
-    }
-
-    const overdueRents = activeRents.filter((r) => r.overdue_count > 0);
-    const overdueAmount = round2(
-      overdueRents.reduce((s, r) => s + r.overdue_amount, 0),
-    );
-    const dueSoonRents = activeRents.filter(
-      (r) =>
-        r.overdue_count === 0 &&
-        r.days_until_due !== null &&
-        r.days_until_due >= 0 &&
-        r.days_until_due <= r.reminder_days_before,
-    );
-    const annualIncreaseReadyCount = activeRents.filter(
-      (r) => r.annual_increase?.is_ready_to_apply || r.annual_increase?.is_due_soon,
-    ).length;
-
-    return res.json({
-      current_month: currentMonth,
-      current_month_label: formatMonthArabic(currentMonth),
-      total_warehouses: rents.length,
-      active_warehouses_count: activeRents.length,
-      paused_warehouses_count: pausedRents.length,
-      ended_warehouses_count: endedRents.length,
-      total_monthly_rent: totalMonthlyRent,
-      total_paid_this_month: totalPaidThisMonth,
-      remaining_this_month: remainingThisMonth,
-      overdue_count: overdueRents.length,
-      overdue_amount: overdueAmount,
-      due_soon_count: dueSoonRents.length,
-      alerts_count: overdueRents.length + dueSoonRents.length,
-      annual_increase_due_count: annualIncreaseReadyCount,
-    });
+    return res.json(buildRentsSummaryFromComputed(rents, todayIso));
   } catch (err) {
     console.error("getWarehouseRentsSummary error:", err);
     return res.status(500).json({ error: "فشل تحميل ملخص إيجار المخازن" });
@@ -769,6 +794,7 @@ exports.getRents = async (req, res) => {
     void syncWarehouseRentReminders({
       broadcastRealtime: req.app?.get("broadcastRealtime"),
       sendPushToUser: req.app?.get("sendPushToUser"),
+      precomputedRents: rents,
     });
 
     const { status, search } = req.query;
@@ -1650,4 +1676,6 @@ exports.applyAnnualIncrease = async (req, res) => {
 
 exports.syncWarehouseRentReminders = syncWarehouseRentReminders;
 exports.ensureWarehouseRentsTables = ensureWarehouseRentsTables;
+exports.fetchAllComputedRents = fetchAllComputedRents;
+exports.buildRentsSummaryFromComputed = buildRentsSummaryFromComputed;
 exports.getCairoToday = getCairoToday;

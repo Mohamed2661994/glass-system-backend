@@ -203,6 +203,128 @@ function calculateNextDueDate(startDateStr, index, frequency) {
 // Controller Methods
 // ==========================================
 
+// 0. Unified Single-Shot Bootstrap Endpoint (Replaces 5 parallel HTTP calls with 1 fast call)
+exports.getBootstrap = async (req, res) => {
+  const warehouseRentsController = require("./warehouseRents.controller");
+  try {
+    const todayIso = warehouseRentsController.getCairoToday();
+
+    const summaryQuery = `
+      SELECT 
+        COALESCE(SUM(total_amount), 0) AS total_debts,
+        COALESCE(SUM(paid_amount), 0) AS total_paid,
+        COALESCE(SUM(remaining_amount), 0) AS total_remaining,
+        COUNT(*) FILTER (WHERE status = 'active') AS active_debts_count,
+        COUNT(*) FILTER (WHERE status = 'completed') AS completed_debts_count
+      FROM external_debts
+    `;
+    const installmentsSummaryQuery = `
+      SELECT 
+        COUNT(*) FILTER (WHERE status = 'pending' AND due_date < CURRENT_DATE) AS overdue_count,
+        COALESCE(SUM(amount - paid_amount) FILTER (WHERE status = 'pending' AND due_date < CURRENT_DATE), 0) AS overdue_amount,
+        COALESCE(SUM(amount - paid_amount) FILTER (WHERE status = 'pending' AND due_date >= CURRENT_DATE AND due_date <= CURRENT_DATE + INTERVAL '30 days'), 0) AS upcoming_30_days_amount
+      FROM debt_installments
+    `;
+    const debtsQuery = `
+      SELECT 
+        d.*,
+        (
+          SELECT MIN(due_date) 
+          FROM debt_installments i 
+          WHERE i.debt_id = d.id AND i.status = 'pending'
+        ) AS next_due_date,
+        (
+          SELECT COUNT(*) 
+          FROM debt_installments i 
+          WHERE i.debt_id = d.id AND i.status = 'paid'
+        ) AS paid_installments_count
+      FROM external_debts d
+      ORDER BY 
+        CASE WHEN d.status = 'active' THEN 1 ELSE 2 END,
+        d.id DESC
+    `;
+    const upcomingQuery = `
+      SELECT 
+        i.*,
+        d.title as debt_title,
+        d.creditor_name,
+        d.creditor_phone,
+        d.category as debt_category
+      FROM debt_installments i
+      JOIN external_debts d ON i.debt_id = d.id
+      WHERE i.status = 'pending' AND i.due_date <= CURRENT_DATE + INTERVAL '30 days'
+      ORDER BY i.due_date ASC
+      LIMIT 50
+    `;
+
+    const [summaryRes, instRes, debtsRes, upcomingRes, rents] = await Promise.all([
+      pool.query(summaryQuery),
+      pool.query(installmentsSummaryQuery),
+      pool.query(debtsQuery),
+      pool.query(upcomingQuery),
+      warehouseRentsController.fetchAllComputedRents(todayIso).catch((e) => {
+        console.error("Bootstrap warehouse rents fetch error:", e.message);
+        return [];
+      }),
+    ]);
+
+    // Fire cooldown-guarded reminder sync asynchronously reusing already-fetched rents
+    void warehouseRentsController.syncWarehouseRentReminders({
+      broadcastRealtime: req.app?.get("broadcastRealtime"),
+      sendPushToUser: req.app?.get("sendPushToUser"),
+      precomputedRents: rents,
+    });
+
+    const s = summaryRes.rows[0] || {};
+    const i = instRes.rows[0] || {};
+
+    const summary = {
+      total_debts: Number(s.total_debts || 0),
+      total_paid: Number(s.total_paid || 0),
+      total_remaining: Number(s.total_remaining || 0),
+      active_debts_count: Number(s.active_debts_count || 0),
+      completed_debts_count: Number(s.completed_debts_count || 0),
+      overdue_count: Number(i.overdue_count || 0),
+      overdue_amount: Number(i.overdue_amount || 0),
+      upcoming_30_days_amount: Number(i.upcoming_30_days_amount || 0),
+    };
+
+    const debts = debtsRes.rows.map((d) => ({
+      ...d,
+      total_amount: Number(d.total_amount),
+      paid_amount: Number(d.paid_amount),
+      remaining_amount: Number(d.remaining_amount),
+      installment_amount: Number(d.installment_amount),
+      paid_installments_count: Number(d.paid_installments_count || 0),
+      progress_percent:
+        Number(d.total_amount) > 0
+          ? Math.min(100, Math.round((Number(d.paid_amount) / Number(d.total_amount)) * 100))
+          : 0,
+    }));
+
+    const todayMidnight = new Date(new Date().toISOString().split("T")[0]);
+    const upcoming = upcomingRes.rows.map((r) => ({
+      ...r,
+      amount: Number(r.amount),
+      paid_amount: Number(r.paid_amount),
+      is_overdue: new Date(r.due_date) < todayMidnight,
+    }));
+
+    const rentSummary = warehouseRentsController.buildRentsSummaryFromComputed(rents, todayIso);
+
+    return res.json({
+      summary,
+      debts,
+      upcoming,
+      rentSummary,
+      rents,
+    });
+  } catch (err) {
+    console.error("debts.getBootstrap error:", err);
+    return res.status(500).json({ error: "فشل تحميل بيانات المديونيات" });
+  }
+};
+
 // 1. Summary Statistics (KPI Cards)
 exports.getSummary = async (req, res) => {
   try {

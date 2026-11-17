@@ -323,31 +323,27 @@ async function computeHeavyAggregates(broadcastFn) {
       GROUP BY s.warehouse_id
     `;
 
-    // Run Stock Valuation, Customer Balances, and Supplier Balances in PARALLEL
+    // Run Stock Valuation, Per-Branch Customer Balances, and Per-Branch Supplier Balances in PARALLEL
+    // Matches /reports/customer-balances and /reports/supplier-balances 100% by passing warehouse_id=1 and warehouse_id=2
     const reportsController = require("../reports/reports.controller");
+    const callReport = (fn, query) =>
+      new Promise((resolve) => {
+        fn(
+          { query },
+          {
+            setHeader: () => {},
+            json: resolve,
+            status: () => ({ json: () => resolve([]) }),
+          }
+        );
+      }).catch(() => []);
 
-    const [stockRes, custData, supData] = await Promise.all([
+    const [stockRes, custB1Data, custB2Data, supB1Data, supB2Data] = await Promise.all([
       pool.query(stockQuery),
-      new Promise((resolve) => {
-        reportsController.getCustomerBalances(
-          { query: { show_all: "1" } },
-          {
-            setHeader: () => {},
-            json: resolve,
-            status: () => ({ json: () => resolve([]) }),
-          }
-        );
-      }).catch(() => []),
-      new Promise((resolve) => {
-        reportsController.getSupplierBalances(
-          { query: {} },
-          {
-            setHeader: () => {},
-            json: resolve,
-            status: () => ({ json: () => resolve([]) }),
-          }
-        );
-      }).catch(() => []),
+      callReport(reportsController.getCustomerBalances, { warehouse_id: "1" }),
+      callReport(reportsController.getCustomerBalances, { warehouse_id: "2" }),
+      callReport(reportsController.getSupplierBalances, { warehouse_id: "1" }),
+      callReport(reportsController.getSupplierBalances, { warehouse_id: "2" }),
     ]);
 
     const inventoryByBranch = {
@@ -366,45 +362,46 @@ async function computeHeavyAggregates(broadcastFn) {
       inventoryByBranch[bId].total_quantity = Number(r.total_quantity || 0);
     }
 
+    const extractRows = (payload, key) =>
+      Array.isArray(payload) ? payload : (payload?.[key] || []);
+
+    const sumBalanceDue = (rows) =>
+      Math.round(rows.reduce((sum, item) => sum + Number(item.balance_due || 0), 0) * 100) / 100;
+
+    const custB1Rows = extractRows(custB1Data, "customers");
+    const custB2Rows = extractRows(custB2Data, "customers");
+    const supB1Rows = extractRows(supB1Data, "suppliers");
+    const supB2Rows = extractRows(supB2Data, "suppliers");
+
     const customerDebtsByBranch = {
-      1: { total_remaining: 0, count_customers: 0 },
-      2: { total_remaining: 0, count_customers: 0 },
+      1: {
+        total_remaining: sumBalanceDue(custB1Rows),
+        count_customers: custB1Rows.length,
+      },
+      2: {
+        total_remaining: sumBalanceDue(custB2Rows),
+        count_customers: custB2Rows.length,
+      },
     };
 
-    const custRows = custData?.customers || (Array.isArray(custData) ? custData : []);
-    let b1Rem = 0, b1Count = 0, b2Rem = 0, b2Count = 0;
-    for (const c of custRows) {
-      const bal = Number(c.balance_due || 0);
-      if (bal > 0) {
-        if (c.is_market_customer) {
-          b2Rem += bal;
-          b2Count++;
-        } else {
-          b1Rem += bal;
-          b1Count++;
-        }
-      }
-    }
-    customerDebtsByBranch[1] = {
-      total_remaining: Math.round(b1Rem * 100) / 100,
-      count_customers: b1Count,
-    };
-    customerDebtsByBranch[2] = {
-      total_remaining: Math.round(b2Rem * 100) / 100,
-      count_customers: b2Count,
+    const supplierPayablesByBranch = {
+      1: {
+        total_remaining: sumBalanceDue(supB1Rows),
+        count_suppliers: supB1Rows.length,
+      },
+      2: {
+        total_remaining: sumBalanceDue(supB2Rows),
+        count_suppliers: supB2Rows.length,
+      },
     };
 
-    const supRows = Array.isArray(supData) ? supData : (supData?.suppliers || []);
-    let totalSup = 0;
-    for (const s of supRows) {
-      const bal = Number(s.balance_due || 0);
-      if (bal > 0) totalSup += bal;
-    }
-    const supplierPayablesTotal = Math.round(totalSup * 100) / 100;
+    const supplierPayablesTotal =
+      Math.round((supplierPayablesByBranch[1].total_remaining + supplierPayablesByBranch[2].total_remaining) * 100) / 100;
 
     ownerHeavyCache.data = {
       inventoryByBranch,
       customerDebtsByBranch,
+      supplierPayablesByBranch,
       supplierPayablesTotal,
       computedAt: new Date().toISOString(),
     };
@@ -484,7 +481,18 @@ function compileBranchPillars(branchKey, cashByBranch, periodSalesByBranch, peri
   let inventorySale = 0;
   let inventoryQty = 0;
   let customerDebts = 0;
-  const supplierPayables = heavy.supplierPayablesTotal || 0;
+  let customerCount = 0;
+  let supplierPayables = 0;
+  let supplierCount = 0;
+
+  const supB1 = heavy.supplierPayablesByBranch?.[1]?.total_remaining || 0;
+  const supB2 = heavy.supplierPayablesByBranch?.[2]?.total_remaining || 0;
+  const supB1Count = heavy.supplierPayablesByBranch?.[1]?.count_suppliers || 0;
+  const supB2Count = heavy.supplierPayablesByBranch?.[2]?.count_suppliers || 0;
+  const custB1 = heavy.customerDebtsByBranch?.[1]?.total_remaining || 0;
+  const custB2 = heavy.customerDebtsByBranch?.[2]?.total_remaining || 0;
+  const custB1Count = heavy.customerDebtsByBranch?.[1]?.count_customers || 0;
+  const custB2Count = heavy.customerDebtsByBranch?.[2]?.count_customers || 0;
 
   if (branchKey === "1") {
     usesOpeningBalance = true;
@@ -503,10 +511,13 @@ function compileBranchPillars(branchKey, cashByBranch, periodSalesByBranch, peri
     periodCashInTotal = periodCashInByBranch[1];
     periodCashOutTotal = periodExpensesByBranch[1].total;
 
-    inventoryCost = heavy.inventoryByBranch[1]?.purchase_value || 0;
-    inventorySale = heavy.inventoryByBranch[1]?.selling_value || 0;
-    inventoryQty = heavy.inventoryByBranch[1]?.total_quantity || 0;
-    customerDebts = heavy.customerDebtsByBranch[1]?.total_remaining || 0;
+    inventoryCost = heavy.inventoryByBranch?.[1]?.purchase_value || 0;
+    inventorySale = heavy.inventoryByBranch?.[1]?.selling_value || 0;
+    inventoryQty = heavy.inventoryByBranch?.[1]?.total_quantity || 0;
+    customerDebts = custB1;
+    customerCount = custB1Count;
+    supplierPayables = supB1;
+    supplierCount = supB1Count;
   } else if (branchKey === "2") {
     // Warehouse (Branch 2): Period-scoped actual cash drawer (NO ghost lifetime carryover!)
     usesOpeningBalance = false;
@@ -525,10 +536,13 @@ function compileBranchPillars(branchKey, cashByBranch, periodSalesByBranch, peri
     periodCashInTotal = periodCashInByBranch[2];
     periodCashOutTotal = periodExpensesByBranch[2].total;
 
-    inventoryCost = heavy.inventoryByBranch[2]?.purchase_value || 0;
-    inventorySale = heavy.inventoryByBranch[2]?.selling_value || 0;
-    inventoryQty = heavy.inventoryByBranch[2]?.total_quantity || 0;
-    customerDebts = heavy.customerDebtsByBranch[2]?.total_remaining || 0;
+    inventoryCost = heavy.inventoryByBranch?.[2]?.purchase_value || 0;
+    inventorySale = heavy.inventoryByBranch?.[2]?.selling_value || 0;
+    inventoryQty = heavy.inventoryByBranch?.[2]?.total_quantity || 0;
+    customerDebts = custB2;
+    customerCount = custB2Count;
+    supplierPayables = supB2;
+    supplierCount = supB2Count;
   } else {
     // Combined All Branches: Showroom cumulative + Warehouse period actual
     usesOpeningBalance = true;
@@ -547,10 +561,13 @@ function compileBranchPillars(branchKey, cashByBranch, periodSalesByBranch, peri
     periodCashInTotal = Math.round((periodCashInByBranch[1] + periodCashInByBranch[2]) * 100) / 100;
     periodCashOutTotal = Math.round((periodExpensesByBranch[1].total + periodExpensesByBranch[2].total) * 100) / 100;
 
-    inventoryCost = Math.round(((heavy.inventoryByBranch[1]?.purchase_value || 0) + (heavy.inventoryByBranch[2]?.purchase_value || 0)) * 100) / 100;
-    inventorySale = Math.round(((heavy.inventoryByBranch[1]?.selling_value || 0) + (heavy.inventoryByBranch[2]?.selling_value || 0)) * 100) / 100;
-    inventoryQty = (heavy.inventoryByBranch[1]?.total_quantity || 0) + (heavy.inventoryByBranch[2]?.total_quantity || 0);
-    customerDebts = Math.round(((heavy.customerDebtsByBranch[1]?.total_remaining || 0) + (heavy.customerDebtsByBranch[2]?.total_remaining || 0)) * 100) / 100;
+    inventoryCost = Math.round(((heavy.inventoryByBranch?.[1]?.purchase_value || 0) + (heavy.inventoryByBranch?.[2]?.purchase_value || 0)) * 100) / 100;
+    inventorySale = Math.round(((heavy.inventoryByBranch?.[1]?.selling_value || 0) + (heavy.inventoryByBranch?.[2]?.selling_value || 0)) * 100) / 100;
+    inventoryQty = (heavy.inventoryByBranch?.[1]?.total_quantity || 0) + (heavy.inventoryByBranch?.[2]?.total_quantity || 0);
+    customerDebts = Math.round((custB1 + custB2) * 100) / 100;
+    customerCount = custB1Count + custB2Count;
+    supplierPayables = Math.round((supB1 + supB2) * 100) / 100;
+    supplierCount = supB1Count + supB2Count;
   }
 
   const totalInWithOpening = Math.round((openingBalance + periodCashInTotal) * 100) / 100;
@@ -594,10 +611,14 @@ function compileBranchPillars(branchKey, cashByBranch, periodSalesByBranch, peri
     operationsToday: operationsPayload,
     market: {
       customerDebtsTotal: customerDebts,
+      customerCount,
       supplierPayablesTotal: supplierPayables,
+      supplierCount,
       netMarketPosition,
-      branch1CustomerDebts: heavy.customerDebtsByBranch[1]?.total_remaining || 0,
-      branch2CustomerDebts: heavy.customerDebtsByBranch[2]?.total_remaining || 0,
+      branch1CustomerDebts: custB1,
+      branch2CustomerDebts: custB2,
+      branch1SupplierPayables: supB1,
+      branch2SupplierPayables: supB2,
     },
     inventory: {
       costValue: inventoryCost,

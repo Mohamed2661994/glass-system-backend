@@ -26,6 +26,9 @@ router.get("/active-list", controller.getActiveList);
 // All debts management routes require admin
 router.use(requireAdmin);
 
+// 0. Unified Fast Bootstrap (All page sections in 1 parallel request)
+router.get("/bootstrap", controller.getBootstrap);
+
 // 1. KPI & Dashboard Summary
 router.get("/summary", controller.getSummary);
 
