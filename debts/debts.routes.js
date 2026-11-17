@@ -55,6 +55,7 @@ router.post("/investors", capitalInvestorsController.createInvestor);
 router.put("/investors/:id", capitalInvestorsController.updateInvestor);
 router.delete("/investors/:id", capitalInvestorsController.deleteInvestor);
 router.post("/investors/:id/deposit", capitalInvestorsController.depositCapital);
+router.post("/investors/:id/close-cycle", capitalInvestorsController.closeProfitCycle);
 router.post("/investors/:id/profit", capitalInvestorsController.recordProfit);
 router.post("/investors/:id/withdraw", capitalInvestorsController.withdrawPrincipal);
 

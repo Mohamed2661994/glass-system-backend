@@ -121,10 +121,21 @@ async function ensureCapitalInvestorsTables() {
     const checkRes = await pool.query(`
       SELECT
         to_regclass('public.capital_investors') AS t1,
-        to_regclass('public.capital_investor_transactions') AS t2
+        to_regclass('public.capital_investor_transactions') AS t2,
+        (SELECT COUNT(*)::int FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'capital_investors'
+           AND column_name = 'available_profit_balance') AS has_avail_col,
+        (SELECT pg_get_constraintdef(oid) FROM pg_constraint
+         WHERE conrelid = to_regclass('public.capital_investor_transactions')
+           AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%tx_type%' LIMIT 1) AS tx_type_check
     `);
     const existing = checkRes.rows[0] || {};
-    if (existing.t1 && existing.t2) {
+    if (
+      existing.t1 &&
+      existing.t2 &&
+      Number(existing.has_avail_col) === 1 &&
+      String(existing.tx_type_check || "").includes("profit_accrual")
+    ) {
       return;
     }
 
@@ -135,6 +146,7 @@ async function ensureCapitalInvestorsTables() {
         investor_phone VARCHAR(50) DEFAULT '',
         initial_principal NUMERIC(14, 2) NOT NULL DEFAULT 0,
         current_principal NUMERIC(14, 2) NOT NULL DEFAULT 0,
+        available_profit_balance NUMERIC(14, 2) NOT NULL DEFAULT 0,
         profit_mode VARCHAR(30) NOT NULL DEFAULT 'fixed_percent'
           CHECK (profit_mode IN ('fixed_percent', 'fixed_amount', 'variable')),
         profit_rate NUMERIC(10, 4) NOT NULL DEFAULT 0,
@@ -150,20 +162,15 @@ async function ensureCapitalInvestorsTables() {
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
 
+      ALTER TABLE capital_investors
+        ADD COLUMN IF NOT EXISTS available_profit_balance NUMERIC(14, 2) NOT NULL DEFAULT 0;
+
       CREATE INDEX IF NOT EXISTS idx_capital_investors_status ON capital_investors(status);
 
       CREATE TABLE IF NOT EXISTS capital_investor_transactions (
         id SERIAL PRIMARY KEY,
         investor_id INTEGER NOT NULL REFERENCES capital_investors(id) ON DELETE CASCADE,
-        tx_type VARCHAR(40) NOT NULL
-          CHECK (tx_type IN (
-            'initial_deposit',
-            'deposit',
-            'profit_payout',
-            'profit_reinvest',
-            'withdrawal_to_debt',
-            'withdrawal_instant'
-          )),
+        tx_type VARCHAR(40) NOT NULL,
         amount NUMERIC(14, 2) NOT NULL,
         tx_date DATE NOT NULL DEFAULT CURRENT_DATE,
         payment_method VARCHAR(100) DEFAULT 'كاش',
@@ -179,12 +186,26 @@ async function ensureCapitalInvestorsTables() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
       );
 
+      ALTER TABLE capital_investor_transactions
+        DROP CONSTRAINT IF EXISTS capital_investor_transactions_tx_type_check;
+      ALTER TABLE capital_investor_transactions
+        ADD CONSTRAINT capital_investor_transactions_tx_type_check
+        CHECK (tx_type IN (
+          'initial_deposit',
+          'deposit',
+          'profit_accrual',
+          'profit_payout',
+          'profit_reinvest',
+          'withdrawal_to_debt',
+          'withdrawal_instant'
+        ));
+
       CREATE INDEX IF NOT EXISTS idx_cit_investor_id ON capital_investor_transactions(investor_id);
       CREATE INDEX IF NOT EXISTS idx_cit_tx_date ON capital_investor_transactions(tx_date);
       CREATE INDEX IF NOT EXISTS idx_cit_converted_debt ON capital_investor_transactions(converted_debt_id);
     `;
     await pool.query(sql);
-    console.log("✅ capital_investors & capital_investor_transactions tables ready");
+    console.log("✅ capital_investors (with monthly payroll accrual wallet) & transactions tables ready");
   })().catch((err) => {
     tablesReadyPromise = null;
     throw err;
@@ -194,16 +215,122 @@ async function ensureCapitalInvestorsTables() {
 }
 
 // ==========================================
+// Automatic Monthly Profit Payroll Accrual Engine
+// Closes matured cycles (today >= next_payout_date) for fixed % / fixed amount
+// investors and credits their withdrawable profit wallet automatically.
+// Strictly NEVER accrues early before next_payout_date!
+// ==========================================
+let accrualSyncInFlight = null;
+
+async function syncMaturedInvestorCycles(todayIso = getCairoToday()) {
+  if (accrualSyncInFlight) return accrualSyncInFlight;
+
+  accrualSyncInFlight = (async () => {
+    try {
+      const dueRes = await pool.query(
+        `SELECT id FROM capital_investors
+         WHERE status = 'active'
+           AND current_principal > 0
+           AND profit_mode IN ('fixed_percent', 'fixed_amount')
+           AND cycle_frequency <> 'custom'
+           AND next_payout_date IS NOT NULL
+           AND next_payout_date <= $1::date`,
+        [todayIso],
+      );
+      if (dueRes.rows.length === 0) return { accrued: 0 };
+
+      let accrued = 0;
+      for (const row of dueRes.rows) {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const invRes = await client.query(
+            `SELECT * FROM capital_investors WHERE id = $1 FOR UPDATE`,
+            [row.id],
+          );
+          if (invRes.rows.length === 0) {
+            await client.query("ROLLBACK");
+            continue;
+          }
+          const inv = invRes.rows[0];
+          const principal = round2(inv.current_principal || 0);
+          let nextDate = toIsoDateOnly(inv.next_payout_date);
+          let availBalance = round2(inv.available_profit_balance || 0);
+
+          if (inv.status !== "active" || principal <= 0 || !nextDate || nextDate > todayIso) {
+            await client.query("ROLLBACK");
+            continue;
+          }
+
+          let safetyGuard = 0;
+          while (nextDate && nextDate <= todayIso && safetyGuard < 24) {
+            safetyGuard++;
+            const cycleProfit =
+              inv.profit_mode === "fixed_percent"
+                ? round2((principal * Number(inv.profit_rate || 0)) / 100)
+                : round2(inv.fixed_profit_amount || 0);
+
+            if (cycleProfit > 0) {
+              availBalance = round2(availBalance + cycleProfit);
+              await client.query(
+                `INSERT INTO capital_investor_transactions
+                  (investor_id, tx_type, amount, tx_date, payment_method, source_type, notes)
+                 VALUES ($1, 'profit_accrual', $2, $3::date, 'إقفال دورة الأرباح الشهرية', 'internal', $4)`,
+                [
+                  inv.id,
+                  cycleProfit,
+                  nextDate,
+                  `إقفال دورة ${nextDate.slice(0, 7)} وترحيل ${cycleProfit.toLocaleString()} ج.م إلى رصيد الأرباح المتاح للسحب`,
+                ],
+              );
+              accrued++;
+            }
+
+            nextDate = advanceDateByCycle(nextDate, inv.cycle_frequency);
+          }
+
+          await client.query(
+            `UPDATE capital_investors
+             SET available_profit_balance = $1,
+                 next_payout_date = $2::date,
+                 updated_at = NOW()
+             WHERE id = $3`,
+            [availBalance, nextDate, inv.id],
+          );
+
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {});
+          console.error(`syncMaturedInvestorCycles investor #${row.id} error:`, err.message);
+        } finally {
+          client.release();
+        }
+      }
+      return { accrued };
+    } catch (err) {
+      console.error("syncMaturedInvestorCycles error:", err.message);
+      return { accrued: 0 };
+    } finally {
+      accrualSyncInFlight = null;
+    }
+  })();
+
+  return accrualSyncInFlight;
+}
+
+// ==========================================
 // Computation Engine & Shared Summary Builder
 // ==========================================
 function computeInvestorRow(rawInv, txs = [], linkedDebtsMap = new Map(), todayIso = getCairoToday()) {
   const currentPrincipal = round2(rawInv.current_principal || 0);
   const initialPrincipal = round2(rawInv.initial_principal || 0);
+  const availableProfitBalance = round2(rawInv.available_profit_balance || 0);
   const profitMode = rawInv.profit_mode || "fixed_percent";
   const profitRate = round2(rawInv.profit_rate || 0);
   const fixedProfitAmount = round2(rawInv.fixed_profit_amount || 0);
 
   let totalDeposited = 0;
+  let totalProfitAccrued = 0;
   let totalProfitPaid = 0;
   let totalReinvested = 0;
   let totalWithdrawnToDebt = 0;
@@ -213,6 +340,8 @@ function computeInvestorRow(rawInv, txs = [], linkedDebtsMap = new Map(), todayI
     const amt = round2(t.amount || 0);
     if (t.tx_type === "initial_deposit" || t.tx_type === "deposit") {
       totalDeposited = round2(totalDeposited + amt);
+    } else if (t.tx_type === "profit_accrual") {
+      totalProfitAccrued = round2(totalProfitAccrued + amt);
     } else if (t.tx_type === "profit_payout") {
       totalProfitPaid = round2(totalProfitPaid + amt);
     } else if (t.tx_type === "profit_reinvest") {
@@ -256,6 +385,7 @@ function computeInvestorRow(rawInv, txs = [], linkedDebtsMap = new Map(), todayI
     }
   }
 
+  const cycleFrequency = rawInv.cycle_frequency || "monthly";
   const nextPayoutDate = toIsoDateOnly(rawInv.next_payout_date);
   const daysUntilPayout =
     rawInv.status === "active" && nextPayoutDate ? diffDays(todayIso, nextPayoutDate) : null;
@@ -265,21 +395,30 @@ function computeInvestorRow(rawInv, txs = [], linkedDebtsMap = new Map(), todayI
   const isPayoutDueSoon =
     rawInv.status === "active" && daysUntilPayout !== null && daysUntilPayout >= 0 && daysUntilPayout <= 5;
 
+  const canCloseCycleNow =
+    rawInv.status === "active" &&
+    currentPrincipal > 0.01 &&
+    (cycleFrequency === "custom" || (Boolean(nextPayoutDate) && nextPayoutDate <= todayIso));
+  const canWithdrawProfit = availableProfitBalance > 0.01;
+
   return {
     id: Number(rawInv.id),
     investor_name: rawInv.investor_name,
     investor_phone: rawInv.investor_phone || "",
     initial_principal: initialPrincipal,
     current_principal: currentPrincipal,
+    available_profit_balance: availableProfitBalance,
     profit_mode: profitMode,
     profit_rate: profitRate,
     fixed_profit_amount: fixedProfitAmount,
-    cycle_frequency: rawInv.cycle_frequency || "monthly",
+    cycle_frequency: cycleFrequency,
     start_date: toIsoDateOnly(rawInv.start_date) || todayIso,
     next_payout_date: nextPayoutDate,
     days_until_payout: daysUntilPayout,
     is_payout_overdue: isPayoutOverdue,
     is_payout_due_soon: isPayoutDueSoon,
+    can_close_cycle_now: canCloseCycleNow,
+    can_withdraw_profit: canWithdrawProfit,
     status: rawInv.status || "active",
     notes: rawInv.notes || "",
     created_at: rawInv.created_at,
@@ -287,6 +426,7 @@ function computeInvestorRow(rawInv, txs = [], linkedDebtsMap = new Map(), todayI
     // Computed totals
     suggested_cycle_profit: suggestedCycleProfit,
     total_deposited: totalDeposited,
+    total_profit_accrued: totalProfitAccrued,
     total_profit_paid: totalProfitPaid,
     total_reinvested: totalReinvested,
     total_withdrawn_to_debt: totalWithdrawnToDebt,
@@ -299,6 +439,8 @@ function computeInvestorRow(rawInv, txs = [], linkedDebtsMap = new Map(), todayI
 
 async function fetchAllComputedInvestors(todayIso = getCairoToday()) {
   await ensureCapitalInvestorsTables();
+  // Automatically close & accrue any matured monthly/periodic cycles (strictly today >= next_payout_date)
+  await syncMaturedInvestorCycles(todayIso);
 
   const [invRes, txRes] = await Promise.all([
     pool.query(`
@@ -356,6 +498,12 @@ function buildInvestorsSummaryFromComputed(investors = []) {
   const totalActivePrincipal = round2(
     active.reduce((s, i) => s + Number(i.current_principal || 0), 0),
   );
+  const totalAvailableProfitBalance = round2(
+    investors.reduce((s, i) => s + Number(i.available_profit_balance || 0), 0),
+  );
+  const totalProfitAccrued = round2(
+    investors.reduce((s, i) => s + Number(i.total_profit_accrued || 0), 0),
+  );
   const totalProfitPaid = round2(
     investors.reduce((s, i) => s + Number(i.total_profit_paid || 0), 0),
   );
@@ -371,6 +519,9 @@ function buildInvestorsSummaryFromComputed(investors = []) {
   const dueSoonOrOverdueCount = active.filter(
     (i) => i.is_payout_overdue || i.is_payout_due_soon,
   ).length;
+  const withdrawableInvestorsCount = investors.filter(
+    (i) => Number(i.available_profit_balance || 0) > 0.01,
+  ).length;
 
   return {
     total_investors: investors.length,
@@ -378,11 +529,14 @@ function buildInvestorsSummaryFromComputed(investors = []) {
     paused_investors_count: paused.length,
     settled_investors_count: settled.length,
     total_active_principal: totalActivePrincipal,
+    total_available_profit_balance: totalAvailableProfitBalance,
+    total_profit_accrued: totalProfitAccrued,
     total_profit_paid: totalProfitPaid,
     total_reinvested: totalReinvested,
     total_withdrawn_to_debt: totalWithdrawnToDebt,
     expected_cycle_payout_total: expectedCyclePayoutTotal,
     due_soon_count: dueSoonOrOverdueCount,
+    withdrawable_investors_count: withdrawableInvestorsCount,
   };
 }
 
@@ -739,12 +893,135 @@ exports.depositCapital = async (req, res) => {
   }
 };
 
-// 6. Profit Payout OR Reinvest (صرف أرباح أو إعادة استثمارها في الأصل)
+// 5.5 Close Matured Profit Cycle & Accrue to Withdrawable Wallet (إقفال الدورة الشهرية وترحيل الربح)
+// Strictly blocks early closing before next_payout_date!
+exports.closeProfitCycle = async (req, res) => {
+  let client = null;
+  let txStarted = false;
+  try {
+    await ensureCapitalInvestorsTables();
+    const id = parseStrictId(req.params.id);
+    if (!id) return res.status(400).json({ error: "معرف المستثمر غير صالح" });
+
+    const { amount, tx_date, next_payout_date, notes = "" } = req.body || {};
+    const todayIso = getCairoToday();
+    const safeNotes = String(notes || "").trim();
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+    txStarted = true;
+
+    const invRes = await client.query(`SELECT * FROM capital_investors WHERE id = $1 FOR UPDATE`, [id]);
+    if (invRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "المستثمر غير موجود" });
+    }
+    const investor = invRes.rows[0];
+    const principal = round2(investor.current_principal || 0);
+    const currentAvail = round2(investor.available_profit_balance || 0);
+    const currentNextDate = toIsoDateOnly(investor.next_payout_date);
+    const cycleFreq = investor.cycle_frequency || "monthly";
+
+    if (investor.status !== "active" || principal <= 0.01) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "لا يمكن إقفال دورة أرباح لمستثمر غير نشط أو برأس مال صفري" });
+    }
+
+    // STRICT NO-EARLY-ACCRUAL RULE:
+    if (cycleFreq !== "custom") {
+      if (!currentNextDate) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "لم يتم تحديد موعد إقفال الدورة الشهرية لهذا المستثمر" });
+      }
+      if (todayIso < currentNextDate) {
+        const remaining = diffDays(todayIso, currentNextDate);
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `لا يمكن إقفال الدورة وترحيل الأرباح مبكراً قبل موعد الإقفال (${currentNextDate}) — متبقي ${remaining} يوم`,
+        });
+      }
+    }
+
+    let cycleProfit = parsePositiveFinite(amount);
+    if (!cycleProfit) {
+      if (investor.profit_mode === "fixed_percent") {
+        cycleProfit = round2((principal * Number(investor.profit_rate || 0)) / 100);
+      } else if (investor.profit_mode === "fixed_amount") {
+        cycleProfit = round2(investor.fixed_profit_amount || 0);
+      }
+    }
+    if (!cycleProfit || cycleProfit <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "برجاء إدخال مبلغ ربح الدورة المستحق بشكل صحيح" });
+    }
+
+    const closeDate = isValidIsoDate(tx_date)
+      ? tx_date
+      : currentNextDate && currentNextDate <= todayIso
+      ? currentNextDate
+      : todayIso;
+
+    let newNextDate = currentNextDate;
+    if (cycleFreq !== "custom") {
+      newNextDate = advanceDateByCycle(currentNextDate || closeDate, cycleFreq);
+    } else if (isValidIsoDate(next_payout_date)) {
+      newNextDate = next_payout_date;
+    }
+
+    const newAvail = round2(currentAvail + cycleProfit);
+
+    await client.query(
+      `INSERT INTO capital_investor_transactions
+        (investor_id, tx_type, amount, tx_date, payment_method, source_type, notes, created_by)
+       VALUES ($1, 'profit_accrual', $2, $3::date, 'إقفال دورة الأرباح الشهرية', 'internal', $4, $5)`,
+      [
+        id,
+        cycleProfit,
+        closeDate,
+        safeNotes ||
+          `إقفال دورة ${closeDate.slice(0, 7)} وترحيل ${cycleProfit.toLocaleString()} ج.م إلى رصيد الأرباح المتاح للسحب`,
+        req.user?.id || null,
+      ],
+    );
+
+    await client.query(
+      `UPDATE capital_investors
+       SET available_profit_balance = $1,
+           next_payout_date = $2::date,
+           updated_at = NOW()
+       WHERE id = $3`,
+      [newAvail, newNextDate, id],
+    );
+
+    await client.query("COMMIT");
+    txStarted = false;
+
+    return res.json({
+      success: true,
+      accrued_amount: cycleProfit,
+      available_profit_balance: newAvail,
+      next_payout_date: newNextDate,
+      message: `تم إقفال الدورة وترحيل ${cycleProfit.toLocaleString()} ج.م — الرصيد المتاح للسحب الآن ${newAvail.toLocaleString()} ج.م`,
+    });
+  } catch (err) {
+    if (txStarted && client) await client.query("ROLLBACK").catch(() => {});
+    console.error("capitalInvestors.closeProfitCycle error:", err);
+    return res.status(500).json({ error: "فشل إقفال دورة الأرباح" });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+// 6. Profit Payout OR Reinvest FROM Withdrawable Profit Wallet (صرف أو إعادة استثمار من رصيد الأرباح المرحّل فقط)
+// STRICT RULE: Zero early withdrawals allowed! Amount MUST NOT exceed available_profit_balance.
 exports.recordProfit = async (req, res) => {
   let client = null;
   let txStarted = false;
   try {
     await ensureCapitalInvestorsTables();
+    // Ensure any cycle that matured today is accrued before checking wallet balance
+    await syncMaturedInvestorCycles(getCairoToday());
+
     const id = parseStrictId(req.params.id);
     if (!id) return res.status(400).json({ error: "معرف المستثمر غير صالح" });
 
@@ -755,7 +1032,6 @@ exports.recordProfit = async (req, res) => {
       source_type = "personal",
       treasury_branch_id = 1,
       payment_method = "كاش",
-      advance_next_payout = true,
       notes = "",
     } = req.body || {};
 
@@ -778,6 +1054,25 @@ exports.recordProfit = async (req, res) => {
       return res.status(404).json({ error: "المستثمر غير موجود" });
     }
     const investor = invRes.rows[0];
+    const availBalance = round2(investor.available_profit_balance || 0);
+    const nextPayoutDate = toIsoDateOnly(investor.next_payout_date);
+
+    // STRICT NO-EARLY-WITHDRAWAL ENFORCEMENT
+    if (availBalance <= 0.01) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `لا يوجد رصيد أرباح مرحّل متاح للسحب حالياً — لا يمكن الصرف المبكر قبل إقفال الدورة الشهرية${
+          nextPayoutDate ? ` (${nextPayoutDate})` : ""
+        }`,
+      });
+    }
+
+    if (profitAmt > availBalance + 0.01) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `المبلغ المطلوب (${profitAmt.toLocaleString()} ج.م) أكبر من رصيد الأرباح المتاح للسحب (${availBalance.toLocaleString()} ج.م) — لا يمكن الصرف المبكر من الدورة الجارية`,
+      });
+    }
 
     let cashOutId = null;
     let permissionNumber = "";
@@ -819,7 +1114,7 @@ exports.recordProfit = async (req, res) => {
         safeBranch,
         cashOutId,
         permissionNumber,
-        safeNotes || (isReinvest ? "إعادة استثمار الأرباح ضمن رأس المال" : "صرف أرباح دورة التشغيل"),
+        safeNotes || (isReinvest ? "إعادة استثمار من رصيد الأرباح المتاح ضمن رأس المال" : "صرف من رصيد الأرباح المتاح للسحب"),
         req.user?.id || null,
       ],
     );
@@ -827,20 +1122,15 @@ exports.recordProfit = async (req, res) => {
     const newPrincipal = isReinvest
       ? round2(Number(investor.current_principal || 0) + profitAmt)
       : round2(Number(investor.current_principal || 0));
-
-    let nextPayoutDate = toIsoDateOnly(investor.next_payout_date);
-    if (advance_next_payout && investor.cycle_frequency !== "custom") {
-      const baseForNext = nextPayoutDate && nextPayoutDate >= safeDate ? nextPayoutDate : safeDate;
-      nextPayoutDate = advanceDateByCycle(baseForNext, investor.cycle_frequency);
-    }
+    const newAvailBalance = Math.max(0, round2(availBalance - profitAmt));
 
     await client.query(
       `UPDATE capital_investors
        SET current_principal = $1,
-           next_payout_date = $2::date,
+           available_profit_balance = $2,
            updated_at = NOW()
        WHERE id = $3`,
-      [newPrincipal, nextPayoutDate, id],
+      [newPrincipal, newAvailBalance, id],
     );
 
     await client.query("COMMIT");
@@ -849,10 +1139,11 @@ exports.recordProfit = async (req, res) => {
     return res.json({
       success: true,
       new_principal: newPrincipal,
+      available_profit_balance: newAvailBalance,
       next_payout_date: nextPayoutDate,
       message: isReinvest
-        ? `تمت إعادة استثمار ${profitAmt.toLocaleString()} ج.م — رأس المال الحالي ${newPrincipal.toLocaleString()} ج.م`
-        : `تم صرف أرباح ${profitAmt.toLocaleString()} ج.م للمستثمر «${investor.investor_name}» بنجاح`,
+        ? `تمت إعادة استثمار ${profitAmt.toLocaleString()} ج.م — رأس المال الحالي ${newPrincipal.toLocaleString()} ج.م (المتبقي برصيد الأرباح: ${newAvailBalance.toLocaleString()} ج.م)`
+        : `تم صرف أرباح ${profitAmt.toLocaleString()} ج.م للمستثمر «${investor.investor_name}» — المتبقي برصيد الأرباح ${newAvailBalance.toLocaleString()} ج.م`,
     });
   } catch (err) {
     if (txStarted && client) await client.query("ROLLBACK").catch(() => {});
@@ -1100,6 +1391,7 @@ exports.deleteTransaction = async (req, res) => {
     );
     const investor = invRes.rows[0];
     let principal = round2(investor?.current_principal || 0);
+    let availBalance = round2(investor?.available_profit_balance || 0);
     const amt = round2(tx.amount || 0);
 
     // If withdrawal_to_debt, verify debt has no payments before deleting it
@@ -1116,8 +1408,21 @@ exports.deleteTransaction = async (req, res) => {
       }
       await client.query(`DELETE FROM external_debts WHERE id = $1`, [tx.converted_debt_id]);
       principal = round2(principal + amt);
-    } else if (tx.tx_type === "deposit" || tx.tx_type === "profit_reinvest") {
+    } else if (tx.tx_type === "deposit") {
       principal = Math.max(0, round2(principal - amt));
+    } else if (tx.tx_type === "profit_reinvest") {
+      principal = Math.max(0, round2(principal - amt));
+      availBalance = round2(availBalance + amt);
+    } else if (tx.tx_type === "profit_payout") {
+      availBalance = round2(availBalance + amt);
+    } else if (tx.tx_type === "profit_accrual") {
+      if (availBalance < amt - 0.01) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "لا يمكن التراجع عن ترحيل أرباح هذه الدورة بعد سحب جزء منها — قم بالتراجع عن حركات الصرف أولاً",
+        });
+      }
+      availBalance = Math.max(0, round2(availBalance - amt));
     } else if (tx.tx_type === "withdrawal_instant") {
       principal = round2(principal + amt);
     }
@@ -1132,17 +1437,23 @@ exports.deleteTransaction = async (req, res) => {
     await client.query(`DELETE FROM capital_investor_transactions WHERE id = $1`, [txId]);
 
     if (investor) {
-      const nextStatus = principal > 0.01 ? "active" : "settled";
+      const nextStatus =
+        principal > 0.01 ? (investor.status === "paused" ? "paused" : "active") : "settled";
       await client.query(
-        `UPDATE capital_investors SET current_principal = $1, status = $2, updated_at = NOW() WHERE id = $3`,
-        [principal, nextStatus, investor.id],
+        `UPDATE capital_investors
+         SET current_principal = $1,
+             available_profit_balance = $2,
+             status = $3::varchar,
+             updated_at = NOW()
+         WHERE id = $4`,
+        [principal, availBalance, nextStatus, investor.id],
       );
     }
 
     await client.query("COMMIT");
     txStarted = false;
 
-    return res.json({ success: true, message: "تم التراجع عن الحركة وتحديث رأس المال بنجاح" });
+    return res.json({ success: true, message: "تم التراجع عن الحركة وتحديث الأرصدة بنجاح" });
   } catch (err) {
     if (txStarted && client) await client.query("ROLLBACK").catch(() => {});
     console.error("capitalInvestors.deleteTransaction error:", err);
@@ -1199,5 +1510,6 @@ exports.deleteInvestor = async (req, res) => {
 };
 
 exports.ensureCapitalInvestorsTables = ensureCapitalInvestorsTables;
+exports.syncMaturedInvestorCycles = syncMaturedInvestorCycles;
 exports.fetchAllComputedInvestors = fetchAllComputedInvestors;
 exports.buildInvestorsSummaryFromComputed = buildInvestorsSummaryFromComputed;
