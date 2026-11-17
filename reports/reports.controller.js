@@ -2731,52 +2731,33 @@ async function getTimelineAnalytics({
 
   const debtPaymentsMap = {};
   if (isIncludeDebts) {
-    const debtConditions = [];
+    // Include ONLY actual treasury debt payment vouchers (cash_out entry_type = 'debt_payment'),
+    // excluding personal/external bank transfers that did not come out of store treasuries.
+    const debtConditions = ["entry_type = 'debt_payment'"];
     const debtValues = [];
     let dIdx = 1;
     if (activeChartInvoiceType === 'retail') {
-      debtConditions.push(`(branch_id = $${dIdx++} OR branch_id IS NULL)`);
+      debtConditions.push(`branch_id = $${dIdx++}`);
       debtValues.push(1);
     } else if (activeChartInvoiceType === 'wholesale') {
-      debtConditions.push(`(branch_id = $${dIdx++} OR branch_id IS NULL)`);
+      debtConditions.push(`branch_id = $${dIdx++}`);
       debtValues.push(2);
     }
     if (effectiveChartDateFrom) {
-      debtConditions.push(`payment_date >= $${dIdx++}::date`);
+      debtConditions.push(`COALESCE(transaction_date, created_at::date) >= $${dIdx++}::date`);
       debtValues.push(effectiveChartDateFrom);
     }
     if (effectiveChartDateTo) {
-      debtConditions.push(`payment_date <= $${dIdx++}::date`);
+      debtConditions.push(`COALESCE(transaction_date, created_at::date) <= $${dIdx++}::date`);
       debtValues.push(effectiveChartDateTo);
     }
 
-    const debtWhereClause = debtConditions.length > 0 ? `WHERE ${debtConditions.join(" AND ")}` : "";
     const debtsQuery = `
-      WITH all_debts AS (
-        SELECT 
-          dip.id,
-          dip.amount,
-          dip.payment_date::date AS payment_date,
-          co.branch_id
-        FROM debt_installment_payments dip
-        LEFT JOIN cash_out co ON co.id = dip.cash_out_id
-
-        UNION ALL
-
-        SELECT 
-          co.id,
-          co.amount,
-          co.transaction_date AS payment_date,
-          co.branch_id
-        FROM cash_out co
-        WHERE co.entry_type = 'debt_payment'
-          AND NOT EXISTS (SELECT 1 FROM debt_installment_payments dip WHERE dip.cash_out_id = co.id)
-      )
       SELECT 
-        TO_CHAR(payment_date, ${timeGroupFormat}) AS period,
+        TO_CHAR(COALESCE(transaction_date, created_at::date), ${timeGroupFormat}) AS period,
         SUM(amount) AS debt_payments
-      FROM all_debts
-      ${debtWhereClause}
+      FROM cash_out
+      WHERE ${debtConditions.join(" AND ")}
       GROUP BY period
     `;
     const debtsRes = await pool.query(debtsQuery, debtValues);
