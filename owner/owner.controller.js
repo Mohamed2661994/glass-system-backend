@@ -1546,14 +1546,22 @@ async function getOwnerTrends(req, res) {
 
     const finalizeBranchSeries = (bId) => {
       const rows = bucketKeys.map((k) => maps[bId].get(k));
-      let runningCash = openingNet[bId];
+      // Branch 1 (Showroom) carries opening balance daily; Branch 2 (Warehouses) is pure period/daily drawer cash (NO lifetime carryover — matches Pillar 1 & /cash/summary)
+      let runningCash = bId === 1 ? openingNet[1] : 0;
       for (const row of rows) {
         row.sales = round2(row.sales);
         row.cashIn = round2(row.cashIn);
         row.cashOut = round2(row.cashOut);
         row.netFlow = round2(row.cashIn - row.cashOut);
-        runningCash = round2(runningCash + row.netFlow);
-        row.cashBalance = runningCash;
+        if (bId === 1) {
+          runningCash = round2(runningCash + row.netFlow);
+          row.cashBalance = runningCash;
+        } else if (isHourly) {
+          runningCash = round2(runningCash + row.netFlow);
+          row.cashBalance = runningCash;
+        } else {
+          row.cashBalance = row.netFlow;
+        }
       }
 
       if (!isHourly) {
