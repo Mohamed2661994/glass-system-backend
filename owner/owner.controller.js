@@ -26,14 +26,23 @@ let lastBroadcastFn = null;
 // 2. FAST-TRACK PERIOD RESPONSE CACHE (Short TTL, instant write invalidation)
 //    Stores all 3 branch views ({ all, "1", "2" }) per date range in RAM
 // ============================================================================
-const ownerFastCache = new Map(); // `${from}_${to}` -> { ts: number, baseData: object }
+const ownerFastCache = new Map(); // `${from}_${to}` -> { ts: number, pillarsByBranch: object }
 const FAST_CACHE_TTL_MS = 15 * 1000; // 15 seconds
+
+// Historical As-Of-Date Heavy Cache (for yesterday / last_month / custom past dates)
+const ownerHistoricalHeavyCache = new Map(); // `asOfDate` -> { ts: number, data: object }
+const HISTORICAL_HEAVY_TTL_MS = 60 * 1000; // 60 seconds
+
+function getCairoTodayIso() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(new Date());
+}
 
 /**
  * Instantly invalidates fast-track cache on any cash/invoice write (0ms overhead)
  */
 function invalidateOwnerFastCache() {
   ownerFastCache.clear();
+  ownerHistoricalHeavyCache.clear();
 }
 
 /**
@@ -46,6 +55,7 @@ function scheduleOwnerCacheRefresh(broadcastFn) {
   }
   ownerHeavyCache.isDirty = true;
   ownerFastCache.clear();
+  ownerHistoricalHeavyCache.clear();
 
   if (heavyRefreshTimer) clearTimeout(heavyRefreshTimer);
   heavyRefreshTimer = setTimeout(() => {
@@ -426,6 +436,175 @@ async function computeHeavyAggregates(broadcastFn) {
 }
 
 /**
+ * Historical As-Of-Date Heavy Aggregates (Inventory Valuation + Market Debts as of YYYY-MM-DD)
+ * - Inventory: reconstructs exact historical quantities as of `asOfDate` by reversing post-date stock_movements.
+ * - Customer Debts & Supplier Payables: computed cleanly via reportsController with `to = asOfDate`.
+ */
+async function computeHeavyAggregatesAsOf(asOfDate) {
+  const now = Date.now();
+  const cached = ownerHistoricalHeavyCache.get(asOfDate);
+  if (cached && now - cached.ts < HISTORICAL_HEAVY_TTL_MS) {
+    return cached.data;
+  }
+
+  const historicalStockQuery = `
+    WITH future_deltas AS (
+      SELECT
+        sm.warehouse_id,
+        sm.product_id,
+        COALESCE(sm.variant_id, 0) AS variant_id,
+        SUM(
+          CASE
+            WHEN sm.movement_type IN ('purchase', 'transfer_in', 'return_sale', 'adjustment_in', 'in', 'replace_in') THEN sm.quantity
+            WHEN sm.movement_type IN ('sale', 'transfer_out', 'return_purchase', 'adjustment_out', 'replace_out') THEN -sm.quantity
+            ELSE 0
+          END
+        )::numeric AS net_delta
+      FROM stock_movements sm
+      LEFT JOIN invoices i ON i.id = sm.invoice_id
+      WHERE COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date) > $1::date
+        AND (i.id IS NULL OR i.is_void IS NOT TRUE)
+      GROUP BY sm.warehouse_id, sm.product_id, COALESCE(sm.variant_id, 0)
+    ),
+    as_of_stock AS (
+      SELECT
+        COALESCE(s.warehouse_id, fd.warehouse_id) AS warehouse_id,
+        COALESCE(s.product_id, fd.product_id) AS product_id,
+        COALESCE(COALESCE(s.variant_id, 0), fd.variant_id) AS variant_id,
+        (COALESCE(s.quantity, 0) - COALESCE(fd.net_delta, 0))::numeric AS qty
+      FROM stock s
+      FULL OUTER JOIN future_deltas fd
+        ON s.warehouse_id = fd.warehouse_id
+       AND s.product_id = fd.product_id
+       AND COALESCE(s.variant_id, 0) = fd.variant_id
+    )
+    SELECT
+      a.warehouse_id,
+      COUNT(DISTINCT a.product_id)::int AS unique_products_count,
+      COALESCE(SUM(a.qty), 0)::numeric AS total_quantity,
+      COALESCE(
+        SUM(
+          a.qty * CASE
+            WHEN a.warehouse_id = 1 THEN COALESCE(
+              NULLIF(pv.retail_purchase_price, 0),
+              NULLIF(p.retail_purchase_price, 0),
+              NULLIF(pv.purchase_price, 0),
+              NULLIF(p.purchase_price, 0),
+              0
+            )
+            ELSE COALESCE(
+              NULLIF(pv.purchase_price, 0),
+              NULLIF(p.purchase_price, 0),
+              NULLIF(pv.retail_purchase_price, 0),
+              NULLIF(p.retail_purchase_price, 0),
+              0
+            )
+          END
+        ),
+        0
+      )::numeric AS total_purchase_value,
+      COALESCE(
+        SUM(
+          a.qty * CASE
+            WHEN a.warehouse_id = 1 THEN COALESCE(
+              NULLIF(pv.retail_price, 0),
+              NULLIF(p.retail_price, 0),
+              NULLIF(pv.wholesale_price, 0),
+              NULLIF(p.wholesale_price, 0),
+              0
+            )
+            ELSE COALESCE(
+              NULLIF(pv.wholesale_price, 0),
+              NULLIF(p.wholesale_price, 0),
+              NULLIF(pv.retail_price, 0),
+              NULLIF(p.retail_price, 0),
+              0
+            )
+          END
+        ),
+        0
+      )::numeric AS total_selling_value
+    FROM as_of_stock a
+    JOIN products p ON a.product_id = p.id
+    LEFT JOIN product_variants pv ON pv.id = NULLIF(a.variant_id, 0)
+    WHERE a.qty > 0 AND p.is_active = true
+    GROUP BY a.warehouse_id
+  `;
+
+  const reportsController = require("../reports/reports.controller");
+  const callReport = (fn, query) =>
+    new Promise((resolve) => {
+      fn(
+        { query },
+        {
+          setHeader: () => {},
+          json: resolve,
+          status: () => ({ json: () => resolve([]) }),
+        }
+      );
+    }).catch(() => []);
+
+  const [stockRes, custB1Data, custB2Data, supB1Data, supB2Data] = await Promise.all([
+    pool.query(historicalStockQuery, [asOfDate]),
+    callReport(reportsController.getCustomerBalances, { warehouse_id: "1", to: asOfDate }),
+    callReport(reportsController.getCustomerBalances, { warehouse_id: "2", to: asOfDate }),
+    callReport(reportsController.getSupplierBalances, { warehouse_id: "1", to: asOfDate }),
+    callReport(reportsController.getSupplierBalances, { warehouse_id: "2", to: asOfDate }),
+  ]);
+
+  const inventoryByBranch = {
+    1: { purchase_value: 0, selling_value: 0, items_count: 0, total_quantity: 0 },
+    2: { purchase_value: 0, selling_value: 0, items_count: 0, total_quantity: 0 },
+  };
+  for (const r of stockRes.rows) {
+    const bId = Number(r.warehouse_id) || 1;
+    if (!inventoryByBranch[bId]) {
+      inventoryByBranch[bId] = { purchase_value: 0, selling_value: 0, items_count: 0, total_quantity: 0 };
+    }
+    inventoryByBranch[bId].purchase_value = Number(r.total_purchase_value || 0);
+    inventoryByBranch[bId].selling_value = Number(r.total_selling_value || 0);
+    inventoryByBranch[bId].items_count = Number(r.unique_products_count || 0);
+    inventoryByBranch[bId].total_quantity = Number(r.total_quantity || 0);
+  }
+
+  const extractRows = (payload, key) => (Array.isArray(payload) ? payload : payload?.[key] || []);
+  const sumBalanceDue = (rows) =>
+    Math.round(rows.reduce((sum, item) => sum + Number(item.balance_due || 0), 0) * 100) / 100;
+
+  const custB1Rows = extractRows(custB1Data, "customers");
+  const custB2Rows = extractRows(custB2Data, "customers");
+  const supB1Rows = extractRows(supB1Data, "suppliers");
+  const supB2Rows = extractRows(supB2Data, "suppliers");
+
+  const customerDebtsByBranch = {
+    1: { total_remaining: sumBalanceDue(custB1Rows), count_customers: custB1Rows.length },
+    2: { total_remaining: sumBalanceDue(custB2Rows), count_customers: custB2Rows.length },
+  };
+  const supplierPayablesByBranch = {
+    1: { total_remaining: sumBalanceDue(supB1Rows), count_suppliers: supB1Rows.length },
+    2: { total_remaining: sumBalanceDue(supB2Rows), count_suppliers: supB2Rows.length },
+  };
+  const supplierPayablesTotal =
+    Math.round((supplierPayablesByBranch[1].total_remaining + supplierPayablesByBranch[2].total_remaining) * 100) / 100;
+
+  const data = {
+    inventoryByBranch,
+    customerDebtsByBranch,
+    supplierPayablesByBranch,
+    supplierPayablesTotal,
+    asOfDate,
+    computedAt: new Date().toISOString(),
+  };
+
+  if (ownerHistoricalHeavyCache.size > 15) {
+    const firstKey = ownerHistoricalHeavyCache.keys().next().value;
+    if (firstKey) ownerHistoricalHeavyCache.delete(firstKey);
+  }
+  ownerHistoricalHeavyCache.set(asOfDate, { ts: now, data });
+  return data;
+}
+
+/**
  * Force Refresh Cache Endpoint
  * POST /api/owner/refresh-cache
  */
@@ -433,6 +612,7 @@ async function refreshOwnerCache(req, res) {
   try {
     const broadcast = req.app.get("broadcastRealtime");
     ownerFastCache.clear();
+    ownerHistoricalHeavyCache.clear();
     await computeHeavyAggregates(broadcast);
     return res.json({
       ok: true,
@@ -646,21 +826,30 @@ async function getOwnerMetrics(req, res) {
     const broadcast = req.app.get("broadcastRealtime");
 
     const dateRange = resolveDateRange(periodParam, fromParam, toParam);
+    const todayIso = getCairoTodayIso();
+    const isHistorical = Boolean(dateRange.to && dateRange.to < todayIso);
     const cacheKey = `${dateRange.from}_${dateRange.to}`;
     const now = Date.now();
 
-    // 1. HEAVY AGGREGATES: Stale-While-Revalidate (NEVER blocks once warmed!)
+    // 1. HEAVY AGGREGATES:
+    // - Live (today / ending today+): Stale-While-Revalidate from RAM cache (0ms!)
+    // - Historical (ending before today): As-of-date Inventory & Market Debts snapshot!
     if (forceRefresh) {
       ownerFastCache.clear();
-      await computeHeavyAggregates(broadcast);
-    } else if (!ownerHeavyCache.data) {
-      await computeHeavyAggregates(broadcast);
-    } else if (ownerHeavyCache.isDirty || now - ownerHeavyCache.lastUpdated > ownerHeavyCache.ttlMs) {
-      // Serve immediately from RAM & refresh silently in background!
-      computeHeavyAggregates(broadcast).catch(() => {});
+      ownerHistoricalHeavyCache.clear();
+      if (!isHistorical) {
+        await computeHeavyAggregates(broadcast);
+      }
+    } else if (!isHistorical) {
+      if (!ownerHeavyCache.data) {
+        await computeHeavyAggregates(broadcast);
+      } else if (ownerHeavyCache.isDirty || now - ownerHeavyCache.lastUpdated > ownerHeavyCache.ttlMs) {
+        // Serve immediately from RAM & refresh silently in background!
+        computeHeavyAggregates(broadcast).catch(() => {});
+      }
     }
 
-    const heavy = ownerHeavyCache.data || {
+    const fallbackHeavy = {
       inventoryByBranch: {
         1: { purchase_value: 0, selling_value: 0, items_count: 0, total_quantity: 0 },
         2: { purchase_value: 0, selling_value: 0, items_count: 0, total_quantity: 0 },
@@ -668,6 +857,10 @@ async function getOwnerMetrics(req, res) {
       customerDebtsByBranch: {
         1: { total_remaining: 0, count_customers: 0 },
         2: { total_remaining: 0, count_customers: 0 },
+      },
+      supplierPayablesByBranch: {
+        1: { total_remaining: 0, count_suppliers: 0 },
+        2: { total_remaining: 0, count_suppliers: 0 },
       },
       supplierPayablesTotal: 0,
       computedAt: new Date().toISOString(),
@@ -683,7 +876,7 @@ async function getOwnerMetrics(req, res) {
     }
 
     if (!pillarsByBranch) {
-      // Execute ALL 7 lightweight SQL aggregations in PARALLEL for minimal latency
+      // Execute ALL lightweight SQL aggregations (+ historical heavy snapshot if needed) in PARALLEL
       const [
         cashInRes,
         cashOutRes,
@@ -692,6 +885,7 @@ async function getOwnerMetrics(req, res) {
         periodSalesRes,
         periodExpensesRes,
         periodCashInRes,
+        resolvedHeavy,
       ] = await Promise.all([
         pool.query(
           `
@@ -789,7 +983,12 @@ async function getOwnerMetrics(req, res) {
           `,
           [dateRange.from, dateRange.to]
         ),
+        isHistorical
+          ? computeHeavyAggregatesAsOf(dateRange.to)
+          : Promise.resolve(ownerHeavyCache.data || fallbackHeavy),
       ]);
+
+      const heavy = resolvedHeavy || fallbackHeavy;
 
       const makeBreakdown = () => ({
         expenses: 0,
@@ -900,6 +1099,7 @@ async function getOwnerMetrics(req, res) {
         label: dateRange.label,
         from: dateRange.from,
         to: dateRange.to,
+        isHistorical,
       },
       serverTime: new Date().toISOString(),
       cacheInfo: {

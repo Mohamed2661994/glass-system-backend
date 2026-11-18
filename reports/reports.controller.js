@@ -1774,7 +1774,8 @@ exports.getCustomerDebtDetails = async (req, res) => {
 exports.getSupplierBalances = async (req, res) => {
   try {
     await ensureSupplierAdjustmentsTable();
-    const { supplier_name, warehouse_id } = req.query;
+    const { supplier_name, warehouse_id, to } = req.query;
+    const safeTo = to && /^\d{4}-\d{2}-\d{2}$/.test(String(to).trim()) ? String(to).trim() : null;
 
     let conditions = [];
     let invConditions = ["movement_type = 'purchase'", "is_void IS NOT TRUE"];
@@ -1791,6 +1792,16 @@ exports.getSupplierBalances = async (req, res) => {
     ];
     let values = [];
     let idx = 1;
+
+    let toParam = null;
+    if (safeTo) {
+      toParam = `$${idx++}`;
+      invConditions.push(`invoice_date <= ${toParam}::date`);
+      payConditions.push(`COALESCE(transaction_date, created_at::date) <= ${toParam}::date`);
+      adjConditions.push(`adjustment_date <= ${toParam}::date`);
+      cteConditions.push(`invoice_date <= ${toParam}::date`);
+      values.push(safeTo);
+    }
 
     if (supplier_name) {
       const cleanName = String(supplier_name).trim().replace(/\s+/g, " ");
@@ -1819,14 +1830,18 @@ exports.getSupplierBalances = async (req, res) => {
       payConditions.push(`branch_id = ${p}`);
       adjConditions.push(`branch_id = ${p}`);
       cteConditions.push(`branch_id = ${p}`);
-      const verifiedBranchCond = isBranch2
-        ? `\n          OR EXISTS (SELECT 1 FROM supplier_branch_verifications WHERE supplier_id = s.id AND branch_id = 2 AND is_verified = true)`
-        : "";
+      const invToCond = toParam ? ` AND invoice_date <= ${toParam}::date` : "";
+      const payToCond = toParam ? ` AND COALESCE(transaction_date, created_at::date) <= ${toParam}::date` : "";
+      const adjToCond = toParam ? ` AND adjustment_date <= ${toParam}::date` : "";
+      const verifiedBranchCond =
+        isBranch2 && !toParam
+          ? `\n          OR EXISTS (SELECT 1 FROM supplier_branch_verifications WHERE supplier_id = s.id AND branch_id = 2 AND is_verified = true)`
+          : "";
       // Show suppliers that have activity in this branch (plus verified wholesale suppliers in Branch 2)
       conditions.push(
-        `(EXISTS (SELECT 1 FROM invoices WHERE supplier_id = s.id AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = ${p})
-          OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND invoice_id IS NULL AND branch_id = ${p})
-          OR EXISTS (SELECT 1 FROM supplier_adjustments WHERE supplier_id = s.id AND branch_id = ${p})${verifiedBranchCond})`,
+        `(EXISTS (SELECT 1 FROM invoices WHERE supplier_id = s.id AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = ${p}${invToCond})
+          OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND invoice_id IS NULL AND branch_id = ${p}${payToCond})
+          OR EXISTS (SELECT 1 FROM supplier_adjustments WHERE supplier_id = s.id AND branch_id = ${p}${adjToCond})${verifiedBranchCond})`,
       );
       values.push(warehouse_id);
     }
