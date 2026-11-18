@@ -1130,6 +1130,142 @@ async function syncInvoiceCashEntry(
   return { action: "inserted", duplicateIds: [] };
 }
 
+/**
+ * Syncs linked cash_out ('supplier_payment') voucher for Purchase Invoices (Retail & Wholesale).
+ * Exact architectural mirror of syncInvoiceCashEntry for Sales Invoices (cash_in).
+ * - Links via cash_out.invoice_id so supplier balance queries filter (invoice_id IS NULL) to guarantee ZERO double-counting.
+ * - Legacy protection: on edit, never retroactively creates a cash_out row for historical pre-feature invoices that already had paid_amount > 0.
+ */
+async function syncPurchaseInvoiceCashOut(
+  client,
+  {
+    invoiceId,
+    branchId,
+    invoiceType,
+    supplierId = null,
+    supplierName = null,
+    paidAmount = 0,
+    transactionDate = null,
+    isCreate = false,
+    previousPaidAmount = 0,
+  },
+) {
+  const normalizedInvoiceId = Number(invoiceId);
+  const normalizedBranchId = Number(branchId);
+  const normalizedPaidAmount = roundMoney(paidAmount);
+  const normalizedPrevPaid = roundMoney(previousPaidAmount);
+  const normalizedSupplierId = supplierId ? Number(supplierId) : null;
+  const normalizedSupplierName = String(supplierName || "").trim() || "مورد";
+  const resolvedEntryType = normalizedSupplierId ? "supplier_payment" : "purchase";
+  const typeLabel = invoiceType === "wholesale" ? "جملة" : "قطاعي";
+  const todayCairo = getCairoDate();
+  const safeDate =
+    transactionDate && /^\d{4}-\d{2}-\d{2}$/.test(String(transactionDate).slice(0, 10))
+      ? String(transactionDate).slice(0, 10)
+      : todayCairo;
+  const voucherNotes = `دفعة فاتورة شراء ${typeLabel} رقم #${normalizedInvoiceId}`;
+
+  const existingRes = await client.query(
+    `SELECT id, permission_number FROM cash_out WHERE invoice_id = $1 ORDER BY id ASC FOR UPDATE`,
+    [normalizedInvoiceId],
+  );
+  const existingRows = existingRes.rows;
+
+  if (existingRows.length > 0) {
+    if (normalizedPaidAmount <= 0) {
+      await client.query(`DELETE FROM cash_out WHERE invoice_id = $1`, [normalizedInvoiceId]);
+      return { action: "deleted", cashOutId: null, permissionNumber: null };
+    }
+
+    const primary = existingRows[0];
+    const duplicateIds = existingRows.slice(1).map((r) => Number(r.id));
+
+    await client.query(
+      `UPDATE cash_out
+       SET branch_id = $1,
+           name = $2,
+           amount = $3,
+           notes = $4,
+           transaction_date = COALESCE($5::date, transaction_date),
+           entry_type = $6,
+           supplier_id = $7
+       WHERE id = $8`,
+      [
+        normalizedBranchId,
+        normalizedSupplierName,
+        normalizedPaidAmount,
+        voucherNotes,
+        transactionDate ? safeDate : null,
+        resolvedEntryType,
+        normalizedSupplierId,
+        primary.id,
+      ],
+    );
+
+    if (duplicateIds.length > 0) {
+      await client.query(`DELETE FROM cash_out WHERE id = ANY($1::int[])`, [duplicateIds]);
+    }
+
+    return {
+      action: "updated",
+      cashOutId: primary.id,
+      permissionNumber: primary.permission_number || null,
+    };
+  }
+
+  // Legacy protection:
+  // If an old pre-feature purchase invoice already had paid_amount > 0 with no linked cash_out:
+  // - Allow editing unrelated fields (notes/items) untouched (skipped_legacy).
+  // - Block changing paid_amount directly to prevent cash drawer vs supplier balance drift or 5000->0->5000 bypass.
+  if (!isCreate && normalizedPrevPaid > 0) {
+    if (Math.abs(normalizedPaidAmount - normalizedPrevPaid) > 0.009) {
+      const legacyErr = new Error(
+        "هذه فاتورة شراء قديمة غير مربوطة بسند صرف تلقائي — لتسجيل دفعة جديدة استخدم سند صرف (دفعة مورد) منفصل من صفحة المنصرف",
+      );
+      legacyErr.statusCode = 400;
+      throw legacyErr;
+    }
+    return { action: "skipped_legacy", cashOutId: null, permissionNumber: null };
+  }
+
+  if (normalizedPaidAmount <= 0) {
+    return { action: "skipped", cashOutId: null, permissionNumber: null };
+  }
+
+  // Prevent retroactive corruption of closed historical daily cash opening balances:
+  // If paying an older unpaid purchase invoice later via edit, record the cash outflow on TODAY (when cash leaves the drawer).
+  const effectiveVoucherDate =
+    !isCreate && safeDate < todayCairo ? todayCairo : safeDate;
+
+  const datePart = effectiveVoucherDate.replace(/-/g, "").slice(2);
+  const randomPart = Math.floor(1000 + Math.random() * 9000);
+  const permissionNumber = `${datePart}-${randomPart}`;
+
+  const insRes = await client.query(
+    `INSERT INTO cash_out
+      (branch_id, name, amount, notes, transaction_date, permission_number, entry_type, supplier_id, invoice_id)
+     VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8, $9)
+     RETURNING id, permission_number`,
+    [
+      normalizedBranchId,
+      normalizedSupplierName,
+      normalizedPaidAmount,
+      voucherNotes,
+      effectiveVoucherDate,
+      permissionNumber,
+      resolvedEntryType,
+      normalizedSupplierId,
+      normalizedInvoiceId,
+    ],
+  );
+
+  return {
+    action: "inserted",
+    cashOutId: insRes.rows[0].id,
+    permissionNumber: insRes.rows[0].permission_number,
+  };
+}
+
 /* ── Automatic Hourly Backup to Google Drive ── */
 let lastAutoBackup = null;
 
@@ -4595,6 +4731,7 @@ app.get("/suppliers/:id/balance", async (req, res) => {
       FROM cash_out
       WHERE supplier_id = $1
         AND entry_type = 'supplier_payment'
+        AND invoice_id IS NULL
         ${branchCond}
       `,
       params,
@@ -4643,7 +4780,7 @@ app.get("/suppliers/:id/statement", async (req, res) => {
       `,
       [id],
     );
-    // دفعات المورد
+    // دفعات المورد (المستقلة فقط؛ المدفوع داخل الفاتورة محسوب بالفعل ضمن invoices.paid_amount)
     const paymentsResult = await pool.query(
       `
       SELECT id, 'payment' AS type, permission_number,
@@ -4652,6 +4789,7 @@ app.get("/suppliers/:id/statement", async (req, res) => {
       FROM cash_out
       WHERE supplier_id = $1
         AND entry_type = 'supplier_payment'
+        AND invoice_id IS NULL
       ORDER BY transaction_date DESC, id DESC
       `,
       [id],
@@ -5134,11 +5272,17 @@ app.post("/invoices", authMiddleware, async (req, res) => {
 
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
 
-    // 🚀 Parallel pre-fetch: duplicate check, customer resolution, supplier resolution, and normalized items
+    // 🚀 Parallel pre-fetch: duplicate check (works for both NULL customer_name purchase invoices and sale invoices)
     const [checkExisting, customerId, normalizedItems, supplierResolution] = await Promise.all([
       client.query(
-        "SELECT id FROM invoices WHERE customer_name = $1 AND total = $2 AND paid_amount = $3 AND created_at >= NOW() - INTERVAL '5 seconds'",
-        [customer_name, total, paid_amount],
+        `SELECT id FROM invoices
+         WHERE customer_name IS NOT DISTINCT FROM $1
+           AND supplier_name IS NOT DISTINCT FROM $2
+           AND movement_type = $3
+           AND total = $4
+           AND paid_amount = $5
+           AND created_at >= NOW() - INTERVAL '5 seconds'`,
+        [customer_name || null, supplier_name || null, movement_type, total, paid_amount],
       ),
       (async () => {
         const custRes = await resolveCustomerForInvoice(
@@ -5431,9 +5575,40 @@ VALUES
       journal_posted = true;
     }
 
+    // 💸 ترحيل المدفوع في فاتورة الشراء تلقائياً كسند صرف (دفعة مورد) في الخزنة بدون خصم مزدوج
+    let cashOutSync = { action: "skipped", cashOutId: null, permissionNumber: null };
+    const isNetPurchaseReturn = total < 0 && totalWithPrevious <= 0;
+    if (movement_type === "purchase" && !is_return && !isNetPurchaseReturn && Number(paid_amount) > 0) {
+      cashOutSync = await syncPurchaseInvoiceCashOut(client, {
+        invoiceId,
+        branchId: branch_id,
+        invoiceType: invoice_type,
+        supplierId,
+        supplierName: resolvedSupplierName || supplier_name,
+        paidAmount: Number(paid_amount),
+        transactionDate: invoice_date || getCairoDate(),
+        isCreate: true,
+      });
+      if (cashOutSync.action === "inserted") {
+        journal_posted = true;
+      }
+    }
+
     await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
 
     await client.query("COMMIT");
+
+    if (cashOutSync.action === "inserted") {
+      const broadcast = req.app?.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        broadcast("data:cash", {
+          action: "cash_out_created",
+          id: cashOutSync.cashOutId,
+          branch_id,
+          ts: Date.now(),
+        });
+      }
+    }
 
     if (
       invoice_type === "wholesale" &&
@@ -5511,6 +5686,7 @@ VALUES
       paid_amount,
       remaining_amount,
       journal_posted,
+      cash_out_permission_number: cashOutSync.permissionNumber || null,
     });
   } catch (err) {
     console.error("INVOICE SAVE ERROR:", err); // 👈 مهم
@@ -5548,6 +5724,7 @@ app.post("/invoices/retail", async (req, res) => {
     const {
       created_by,
       created_by_name,
+      supplier_id: bodySupplierId,
       supplier_name,
       supplier_phone,
       notes,
@@ -5556,7 +5733,6 @@ app.post("/invoices/retail", async (req, res) => {
     } = req.body;
 
     if (
-      !branch_id ||
       !movement_type ||
       !items ||
       !items.length ||
@@ -5564,6 +5740,9 @@ app.post("/invoices/retail", async (req, res) => {
     ) {
       return res.status(400).json({ error: "بيانات ناقصة" });
     }
+
+    // Enforce Retail branch_id = 1 consistently (matches PUT /invoices/retail/:id)
+    const retailBranchId = 1;
 
     await client.query("BEGIN");
 
@@ -5579,8 +5758,19 @@ app.post("/invoices/retail", async (req, res) => {
 
     const warehouseId = getWarehouseIdByInvoiceType("retail");
 
-    // 🚀 Parallel pre-fetch: resolve customer, supplier, and normalized items simultaneously
-    const [customerId, normalizedItems, supplierResolution] = await Promise.all([
+    // 🚀 Parallel pre-fetch: duplicate submit guard, customer, supplier, and normalized items simultaneously
+    const [checkRetailDup, customerId, normalizedItems, supplierResolution] = await Promise.all([
+      client.query(
+        `SELECT id FROM invoices
+         WHERE invoice_type = 'retail'
+           AND customer_name IS NOT DISTINCT FROM $1
+           AND supplier_name IS NOT DISTINCT FROM $2
+           AND movement_type = $3
+           AND total = $4
+           AND paid_amount = $5
+           AND created_at >= NOW() - INTERVAL '5 seconds'`,
+        [customer_name || null, supplier_name || null, movement_type, Number(final_total), Number(paid_amount || 0)],
+      ),
       (async () => {
         const custRes = await resolveCustomerForInvoice(
           client,
@@ -5594,12 +5784,19 @@ app.post("/invoices/retail", async (req, res) => {
       })(),
       normalizeInvoiceItemsForStorage(items, "retail", client),
       (async () => {
-        if (movement_type !== "purchase" || !supplier_name) {
+        if (movement_type !== "purchase" || (!supplier_name && !bodySupplierId)) {
           return { id: null, name: null };
         }
-        return resolveSupplierForInvoice(client, supplier_name, supplier_phone);
+        return resolveSupplierForInvoice(client, supplier_name, supplier_phone, bodySupplierId);
       })(),
     ]);
+    if (checkRetailDup.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error: "تم حفظ فاتورة مطابقة للتو — يرجى الانتظار بضع ثوانٍ قبل إعادة المحاولة",
+        duplicate_invoice_id: checkRetailDup.rows[0].id,
+      });
+    }
     const supplierId = supplierResolution.id;
     const resolvedSupplierName = supplierResolution.name;
 
@@ -5637,7 +5834,7 @@ app.post("/invoices/retail", async (req, res) => {
       RETURNING id
       `,
       [
-        branch_id,
+        retailBranchId,
         movement_type,
         invoice_date || getCairoDate(),
         customerId,
@@ -5802,9 +5999,40 @@ app.post("/invoices/retail", async (req, res) => {
       journal_posted = true;
     }
 
+    // 💸 ترحيل المدفوع في فاتورة الشراء القطاعي تلقائياً كسند صرف (دفعة مورد) في الخزنة بدون خصم مزدوج
+    let cashOutSync = { action: "skipped", cashOutId: null, permissionNumber: null };
+    const isNetRetailPurchaseReturn = Number(final_total) < 0 && totalWithPrevious <= 0;
+    if (movement_type === "purchase" && !is_return && !isNetRetailPurchaseReturn && Number(paid_amount) > 0) {
+      cashOutSync = await syncPurchaseInvoiceCashOut(client, {
+        invoiceId,
+        branchId: retailBranchId,
+        invoiceType: "retail",
+        supplierId,
+        supplierName: resolvedSupplierName || supplier_name,
+        paidAmount: Number(paid_amount),
+        transactionDate: invoice_date || getCairoDate(),
+        isCreate: true,
+      });
+      if (cashOutSync.action === "inserted") {
+        journal_posted = true;
+      }
+    }
+
     await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
 
     await client.query("COMMIT");
+
+    if (cashOutSync.action === "inserted") {
+      const broadcast = req.app?.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        broadcast("data:cash", {
+          action: "cash_out_created",
+          id: cashOutSync.cashOutId,
+          branch_id: retailBranchId,
+          ts: Date.now(),
+        });
+      }
+    }
 
     if (
       movement_type === "sale" &&
@@ -5841,6 +6069,7 @@ app.post("/invoices/retail", async (req, res) => {
       total: final_total,
       remaining_amount,
       journal_posted,
+      cash_out_permission_number: cashOutSync.permissionNumber || null,
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -5866,7 +6095,8 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
     ================================= */
     const invoiceRes = await client.query(
       `
-      SELECT movement_type, previous_balance, COALESCE(invoice_revision, 0) AS invoice_revision
+      SELECT branch_id, movement_type, previous_balance, COALESCE(paid_amount, 0) AS previous_paid_amount,
+             COALESCE(is_return, false) AS is_return, COALESCE(invoice_revision, 0) AS invoice_revision
       FROM invoices
       WHERE id = $1 AND invoice_type = 'retail'
       FOR UPDATE
@@ -5878,7 +6108,14 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
       throw new Error("فاتورة قطاعي غير موجودة");
     }
 
-    const { movement_type, previous_balance } = invoiceRes.rows[0];
+    const {
+      branch_id: existingBranchId,
+      movement_type,
+      previous_balance,
+      previous_paid_amount,
+      is_return: existingIsReturn,
+    } = invoiceRes.rows[0];
+    const resolvedBranchId = Number(existingBranchId || 1);
     const warehouseId = getWarehouseIdByInvoiceType("retail");
 
     /* ================================
@@ -6157,11 +6394,44 @@ RETURNING invoice_revision
       });
     }
 
+    let cashOutSync = { action: "skipped", cashOutId: null, permissionNumber: null };
+    const isNetRetailPurchaseReturn = Number(total) < 0 && totalWithPrevious <= 0;
+    if (movement_type === "purchase" && !existingIsReturn && !isNetRetailPurchaseReturn) {
+      cashOutSync = await syncPurchaseInvoiceCashOut(client, {
+        invoiceId,
+        branchId: resolvedBranchId,
+        invoiceType: "retail",
+        supplierId,
+        supplierName: resolvedSupplierName || supplier_name,
+        paidAmount: Number(paid_amount || 0),
+        transactionDate: invoice_date || null,
+        isCreate: false,
+        previousPaidAmount: Number(previous_paid_amount || 0),
+      });
+    }
+
     await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
 
     await client.query("COMMIT");
 
-    res.json({ success: true, invoice_revision: currentRevision + 1 });
+    if (["inserted", "updated", "deleted"].includes(cashOutSync.action)) {
+      const broadcast = req.app?.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        broadcast("data:cash", {
+          action: `cash_out_${cashOutSync.action}`,
+          id: cashOutSync.cashOutId,
+          branch_id: resolvedBranchId,
+          ts: Date.now(),
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      invoice_revision: currentRevision + 1,
+      cash_out_action: cashOutSync.action,
+      cash_out_permission_number: cashOutSync.permissionNumber || null,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(err);
@@ -6171,7 +6441,7 @@ RETURNING invoice_revision
         current_revision: err.currentRevision,
       });
     }
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   } finally {
     client.release();
   }
@@ -6974,7 +7244,8 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
     ================================= */
     const invoiceRes = await client.query(
       `
-      SELECT invoice_type, movement_type, COALESCE(invoice_revision, 0) AS invoice_revision
+      SELECT branch_id, invoice_type, movement_type, COALESCE(paid_amount, 0) AS previous_paid_amount,
+             COALESCE(is_return, false) AS is_return, COALESCE(invoice_revision, 0) AS invoice_revision
       FROM invoices
       WHERE id = $1
       FOR UPDATE
@@ -6993,7 +7264,14 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
       throw new Error("هذا المسار مخصص لتعديل فواتير الجملة فقط");
     }
 
-    const { invoice_type, movement_type } = invoiceRes.rows[0];
+    const {
+      branch_id: existingBranchId,
+      invoice_type,
+      movement_type,
+      previous_paid_amount,
+      is_return: existingIsReturn,
+    } = invoiceRes.rows[0];
+    const resolvedBranchId = Number(existingBranchId || 2);
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
 
     /* ================================
@@ -7282,9 +7560,37 @@ SET
       });
     }
 
+    let cashOutSync = { action: "skipped", cashOutId: null, permissionNumber: null };
+    const isNetWholesalePurchaseReturn = Number(total) < 0 && totalWithPrevious <= 0;
+    if (movement_type === "purchase" && !existingIsReturn && !isNetWholesalePurchaseReturn) {
+      cashOutSync = await syncPurchaseInvoiceCashOut(client, {
+        invoiceId,
+        branchId: resolvedBranchId,
+        invoiceType: invoice_type,
+        supplierId,
+        supplierName: resolvedSupplierName || supplier_name,
+        paidAmount: Number(paid_amount || 0),
+        transactionDate: invoice_date || null,
+        isCreate: false,
+        previousPaidAmount: Number(previous_paid_amount || 0),
+      });
+    }
+
     await enqueueInvoiceAggregateSync(client, invoiceId, "upsert");
 
     await client.query("COMMIT");
+
+    if (["inserted", "updated", "deleted"].includes(cashOutSync.action)) {
+      const broadcast = req.app?.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        broadcast("data:cash", {
+          action: `cash_out_${cashOutSync.action}`,
+          id: cashOutSync.cashOutId,
+          branch_id: resolvedBranchId,
+          ts: Date.now(),
+        });
+      }
+    }
 
     if (
       invoice_type === "wholesale" &&
@@ -7347,6 +7653,8 @@ SET
       ),
       remaining,
       payment_status,
+      cash_out_action: cashOutSync.action,
+      cash_out_permission_number: cashOutSync.permissionNumber || null,
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -8391,11 +8699,13 @@ async function fetchDashboardStats(invoice_type) {
          AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
       [invoice_type],
     ),
-    // Today's cash collected
+    // Today's cash collected (SALES ONLY — exclude purchase invoices & voided invoices)
     pool.query(
       `SELECT COALESCE(SUM(paid_amount), 0) AS total_cash
        FROM invoices
        WHERE invoice_type = $1
+         AND movement_type = 'sale'
+         AND is_void IS NOT TRUE
          AND created_at >= CURRENT_DATE
          AND created_at < CURRENT_DATE + INTERVAL '1 day'`,
       [invoice_type],
@@ -8634,7 +8944,7 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
         `SELECT
            co.id, co.permission_number, co.name, co.amount, co.notes,
            to_char(co.transaction_date, 'YYYY-MM-DD') AS transaction_date,
-           co.created_at, co.entry_type, co.supplier_id, s.name AS supplier_name
+           co.created_at, co.entry_type, co.supplier_id, co.invoice_id, s.name AS supplier_name
          FROM cash_out co
          LEFT JOIN suppliers s ON s.id = co.supplier_id
          WHERE co.branch_id = $1
@@ -8736,7 +9046,17 @@ app.delete("/invoices/:id", authMiddleware, async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 0️⃣ مسح قيد اليومية المرتبط بالفاتورة (لو موجود)
+    // 0️⃣ Lock invoice row FIRST (consistent lock order: invoices -> cash_in/cash_out -> prevents deadlocks with PUT)
+    const lockInvRes = await client.query(
+      `SELECT id FROM invoices WHERE id = $1 FOR UPDATE`,
+      [invoiceId],
+    );
+    if (!lockInvRes.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "الفاتورة غير موجودة" });
+    }
+
+    // 0.25️⃣ مسح قيد اليومية المرتبط بالفاتورة (لو موجود)
     const cashDeleted = await client.query(
       `DELETE FROM cash_in WHERE invoice_id = $1 RETURNING id`,
       [invoiceId],
@@ -8744,6 +9064,17 @@ app.delete("/invoices/:id", authMiddleware, async (req, res) => {
     if (cashDeleted.rowCount > 0) {
       console.log(
         `🗑️ تم مسح قيد يومية مرتبط بالفاتورة ${invoiceId} (cash_in id: ${cashDeleted.rows.map((r) => r.id).join(", ")})`,
+      );
+    }
+
+    // 0.5️⃣ مسح سند الصرف المرتبط بفاتورة الشراء (لو موجود)
+    const cashOutDeleted = await client.query(
+      `DELETE FROM cash_out WHERE invoice_id = $1 RETURNING id, branch_id`,
+      [invoiceId],
+    );
+    if (cashOutDeleted.rowCount > 0) {
+      console.log(
+        `🗑️ تم مسح سند صرف مرتبط بفاتورة الشراء ${invoiceId} (cash_out id: ${cashOutDeleted.rows.map((r) => r.id).join(", ")})`,
       );
     }
 
@@ -8819,6 +9150,19 @@ app.delete("/invoices/:id", authMiddleware, async (req, res) => {
     await enqueueInvoiceAggregateSync(client, invoiceId, "delete");
 
     await client.query("COMMIT");
+    if (cashOutDeleted.rowCount > 0) {
+      const broadcast = req.app?.get("broadcastRealtime");
+      if (typeof broadcast === "function") {
+        cashOutDeleted.rows.forEach((r) => {
+          broadcast("data:cash", {
+            action: "cash_out_deleted",
+            id: r.id,
+            branch_id: r.branch_id,
+            ts: Date.now(),
+          });
+        });
+      }
+    }
     if (r2KeysToDelete.length > 0) {
       void deleteAttachmentsFromR2BestEffort(r2KeysToDelete);
     }
@@ -11685,6 +12029,17 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "يجب اختيار المديونية المراد السداد لها" });
     }
 
+    // 🔒 Prevent direct edits to cash_out vouchers auto-linked to purchase invoices
+    const linkedInvCheck = await pool.query(
+      `SELECT invoice_id FROM cash_out WHERE id = $1 AND branch_id = $2`,
+      [id, branch_id],
+    );
+    if (linkedInvCheck.rows[0]?.invoice_id) {
+      return res.status(400).json({
+        error: `هذا السند مرتبط تلقائياً بفاتورة شراء رقم #${linkedInvCheck.rows[0].invoice_id} — يرجى تعديل المدفوع من صفحة الفاتورة لضمان تطابق الخزنة وحساب المورد`,
+      });
+    }
+
     // Revert previous debt payment linked to this cash_out if any
     try {
       await debtsController.revertDebtPaymentFromCashOut({ cashOutId: id });
@@ -11704,7 +12059,7 @@ app.put("/cash/out/:id", authMiddleware, async (req, res) => {
         supplier_id=$6,
         debt_id=$7,
         installment_id=$8
-      WHERE id=$9 AND branch_id=$10
+      WHERE id=$9 AND branch_id=$10 AND invoice_id IS NULL
       RETURNING *
       `,
       [
@@ -11893,6 +12248,7 @@ app.get("/cash/out", authMiddleware, async (req, res) => {
         co.created_at,
         co.entry_type,
         co.supplier_id,
+        co.invoice_id,
         co.debt_id,
         co.installment_id,
         ed.title AS debt_title,
@@ -12028,6 +12384,7 @@ app.get("/cash/out/:id", authMiddleware, async (req, res) => {
         to_char(co.transaction_date, 'YYYY-MM-DD') AS transaction_date,
         co.entry_type,
         co.supplier_id,
+        co.invoice_id,
         s.name AS supplier_name
       FROM cash_out co
       LEFT JOIN suppliers s ON s.id = co.supplier_id
@@ -12060,6 +12417,24 @@ app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
     const { id } = req.params;
 
     await client.query("BEGIN");
+
+    // 0. Lock target cash_out row FIRST & block direct delete if auto-linked to a purchase invoice
+    const targetCashOutCheck = await client.query(
+      `SELECT id, invoice_id FROM cash_out WHERE id = $1 AND branch_id = $2 FOR UPDATE`,
+      [id, branch_id],
+    );
+    if (!targetCashOutCheck.rows.length) {
+      await client.query("ROLLBACK");
+      client.release();
+      return res.status(403).json({ error: "غير مسموح بالحذف أو السند غير موجود" });
+    }
+    if (targetCashOutCheck.rows[0].invoice_id) {
+      await client.query("ROLLBACK");
+      client.release();
+      return res.status(400).json({
+        error: `هذا السند مرتبط تلقائياً بفاتورة شراء رقم #${targetCashOutCheck.rows[0].invoice_id} — يرجى تصفير المدفوع أو حذف الفاتورة من صفحة الفواتير لضمان تطابق الخزنة وحساب المورد`,
+      });
+    }
 
     // 1. Check if linked to payroll_records (salary disbursement)
     const linkedPayroll = await client.query(
@@ -12098,16 +12473,10 @@ app.delete("/cash/out/:id", authMiddleware, async (req, res) => {
       [id],
     );
 
-    // 2.6 Delete linked warehouse_rent_payments ONLY if cash_out belongs to current branch
-    const targetCashOutCheck = await client.query(
-      `SELECT id FROM cash_out WHERE id = $1 AND branch_id = $2 FOR UPDATE`,
-      [id, branch_id],
-    );
-    if (targetCashOutCheck.rows.length > 0) {
-      await client
-        .query(`DELETE FROM warehouse_rent_payments WHERE cash_out_id = $1`, [id])
-        .catch(() => {});
-    }
+    // 2.6 Delete linked warehouse_rent_payments if present
+    await client
+      .query(`DELETE FROM warehouse_rent_payments WHERE cash_out_id = $1`, [id])
+      .catch(() => {});
 
     // 3. Delete the cash_out record
     const result = await client.query(
@@ -16577,6 +16946,13 @@ async function runStartupMigrations() {
       sql: `
         ALTER TABLE cash_in ADD COLUMN IF NOT EXISTS cash_out_id INTEGER;
         CREATE INDEX IF NOT EXISTS idx_cash_in_cash_out_id ON cash_in(cash_out_id);
+      `,
+    },
+    {
+      name: "cash_out.invoice_id.link",
+      sql: `
+        ALTER TABLE cash_out ADD COLUMN IF NOT EXISTS invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_out_invoice_id ON cash_out(invoice_id) WHERE invoice_id IS NOT NULL;
       `,
     },
   ];

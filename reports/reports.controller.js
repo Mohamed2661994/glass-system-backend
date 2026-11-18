@@ -78,8 +78,8 @@ async function computeSupplierBranchBalance(clientOrPool, supplierId, branchId) 
     ? `supplier_id = $1 AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = $2`
     : `supplier_id = $1 AND movement_type = 'purchase' AND is_void IS NOT TRUE`;
   const payWhere = branchId
-    ? `supplier_id = $1 AND entry_type = 'supplier_payment' AND branch_id = $2`
-    : `supplier_id = $1 AND entry_type = 'supplier_payment'`;
+    ? `supplier_id = $1 AND entry_type = 'supplier_payment' AND invoice_id IS NULL AND branch_id = $2`
+    : `supplier_id = $1 AND entry_type = 'supplier_payment' AND invoice_id IS NULL`;
   const adjWhere = branchId
     ? `supplier_id = $1 AND branch_id = $2`
     : `supplier_id = $1`;
@@ -1781,6 +1781,7 @@ exports.getSupplierBalances = async (req, res) => {
     let payConditions = [
       "entry_type = 'supplier_payment'",
       "supplier_id IS NOT NULL",
+      "invoice_id IS NULL",
     ];
     let adjConditions = ["supplier_id IS NOT NULL"];
     let cteConditions = [
@@ -1824,7 +1825,7 @@ exports.getSupplierBalances = async (req, res) => {
       // Show suppliers that have activity in this branch (plus verified wholesale suppliers in Branch 2)
       conditions.push(
         `(EXISTS (SELECT 1 FROM invoices WHERE supplier_id = s.id AND movement_type = 'purchase' AND is_void IS NOT TRUE AND branch_id = ${p})
-          OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND branch_id = ${p})
+          OR EXISTS (SELECT 1 FROM cash_out WHERE supplier_id = s.id AND entry_type = 'supplier_payment' AND invoice_id IS NULL AND branch_id = ${p})
           OR EXISTS (SELECT 1 FROM supplier_adjustments WHERE supplier_id = s.id AND branch_id = ${p})${verifiedBranchCond})`,
       );
       values.push(warehouse_id);
@@ -2126,6 +2127,7 @@ exports.getSupplierDebtDetails = async (req, res) => {
     let paymentConditions = [
       "co.supplier_id = $1",
       "co.entry_type = 'supplier_payment'",
+      "co.invoice_id IS NULL",
     ];
     let adjustmentConditions = ["sa.supplier_id = $1"];
     let values = [supplier_id];
