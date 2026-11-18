@@ -1325,14 +1325,14 @@ async function getOwnerTrends(req, res) {
          GROUP BY branch_id, bucket`,
         [windowFrom, windowTo]
       ),
-      // 5. Cash Out per bucket
+      // 5. Cash Out per bucket (with entry_type breakdown for rich hover tooltip!)
       pool.query(
-        `SELECT branch_id, ${coBucketExpr} AS bucket,
+        `SELECT branch_id, entry_type, ${coBucketExpr} AS bucket,
                 COALESCE(SUM(amount), 0)::numeric AS cash_out
          FROM cash_out
          WHERE COALESCE(transaction_date, created_at::date) >= $1::date
            AND COALESCE(transaction_date, created_at::date) <= $2::date
-         GROUP BY branch_id, bucket`,
+         GROUP BY branch_id, entry_type, bucket`,
         [windowFrom, windowTo]
       ),
       // 6. Previous window sales for period-over-period growth %
@@ -1476,6 +1476,14 @@ async function getOwnerTrends(req, res) {
           invoicesCount: 0,
           cashIn: 0,
           cashOut: 0,
+          outBreakdown: {
+            expenses: 0,
+            debtPayments: 0,
+            purchases: 0,
+            supplierPayments: 0,
+            warehouseSettlement: 0,
+            showroomSettlement: 0,
+          },
           netFlow: 0,
           cashBalance: 0,
           inventoryCost: 0,
@@ -1507,7 +1515,17 @@ async function getOwnerTrends(req, res) {
     for (const r of cashOutSeriesRes.rows) {
       const b = Number(r.branch_id);
       const entry = maps[b]?.get(resolveBucketKey(r.bucket));
-      if (entry) entry.cashOut += Number(r.cash_out || 0);
+      if (entry) {
+        const amt = Number(r.cash_out || 0);
+        entry.cashOut += amt;
+        const t = r.entry_type;
+        if (t === "purchase") entry.outBreakdown.purchases += amt;
+        else if (t === "supplier_payment") entry.outBreakdown.supplierPayments += amt;
+        else if (t === "warehouse_settlement") entry.outBreakdown.warehouseSettlement += amt;
+        else if (t === "showroom_settlement") entry.outBreakdown.showroomSettlement += amt;
+        else if (t === "debt_payment") entry.outBreakdown.debtPayments += amt;
+        else entry.outBreakdown.expenses += amt;
+      }
     }
     for (const r of stockDeltaRes.rows) {
       const b = Number(r.branch_id);
@@ -1552,6 +1570,14 @@ async function getOwnerTrends(req, res) {
         row.sales = round2(row.sales);
         row.cashIn = round2(row.cashIn);
         row.cashOut = round2(row.cashOut);
+        row.outBreakdown = {
+          expenses: round2(row.outBreakdown.expenses),
+          debtPayments: round2(row.outBreakdown.debtPayments),
+          purchases: round2(row.outBreakdown.purchases),
+          supplierPayments: round2(row.outBreakdown.supplierPayments),
+          warehouseSettlement: round2(row.outBreakdown.warehouseSettlement),
+          showroomSettlement: round2(row.outBreakdown.showroomSettlement),
+        };
         row.netFlow = round2(row.cashIn - row.cashOut);
         if (bId === 1) {
           runningCash = round2(runningCash + row.netFlow);
@@ -1591,6 +1617,14 @@ async function getOwnerTrends(req, res) {
       invoicesCount: series1[idx].invoicesCount + series2[idx].invoicesCount,
       cashIn: round2(series1[idx].cashIn + series2[idx].cashIn),
       cashOut: round2(series1[idx].cashOut + series2[idx].cashOut),
+      outBreakdown: {
+        expenses: round2(series1[idx].outBreakdown.expenses + series2[idx].outBreakdown.expenses),
+        debtPayments: round2(series1[idx].outBreakdown.debtPayments + series2[idx].outBreakdown.debtPayments),
+        purchases: round2(series1[idx].outBreakdown.purchases + series2[idx].outBreakdown.purchases),
+        supplierPayments: round2(series1[idx].outBreakdown.supplierPayments + series2[idx].outBreakdown.supplierPayments),
+        warehouseSettlement: round2(series1[idx].outBreakdown.warehouseSettlement + series2[idx].outBreakdown.warehouseSettlement),
+        showroomSettlement: round2(series1[idx].outBreakdown.showroomSettlement + series2[idx].outBreakdown.showroomSettlement),
+      },
       netFlow: round2(series1[idx].netFlow + series2[idx].netFlow),
       cashBalance: round2(series1[idx].cashBalance + series2[idx].cashBalance),
       inventoryCost: round2(series1[idx].inventoryCost + series2[idx].inventoryCost),
