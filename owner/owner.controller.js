@@ -33,6 +33,10 @@ const FAST_CACHE_TTL_MS = 15 * 1000; // 15 seconds
 const ownerHistoricalHeavyCache = new Map(); // `asOfDate` -> { ts: number, data: object }
 const HISTORICAL_HEAVY_TTL_MS = 60 * 1000; // 60 seconds
 
+// Trends / Curves Cache (60s TTL, cleared immediately on writes)
+const ownerTrendsCache = new Map(); // `${from}_${to}_${mode}` -> { ts: number, payload: object }
+const TRENDS_CACHE_TTL_MS = 60 * 1000;
+
 function getCairoTodayIso() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(new Date());
 }
@@ -43,6 +47,7 @@ function getCairoTodayIso() {
 function invalidateOwnerFastCache() {
   ownerFastCache.clear();
   ownerHistoricalHeavyCache.clear();
+  ownerTrendsCache.clear();
 }
 
 /**
@@ -56,6 +61,7 @@ function scheduleOwnerCacheRefresh(broadcastFn) {
   ownerHeavyCache.isDirty = true;
   ownerFastCache.clear();
   ownerHistoricalHeavyCache.clear();
+  ownerTrendsCache.clear();
 
   if (heavyRefreshTimer) clearTimeout(heavyRefreshTimer);
   heavyRefreshTimer = setTimeout(() => {
@@ -613,6 +619,7 @@ async function refreshOwnerCache(req, res) {
     const broadcast = req.app.get("broadcastRealtime");
     ownerFastCache.clear();
     ownerHistoricalHeavyCache.clear();
+    ownerTrendsCache.clear();
     await computeHeavyAggregates(broadcast);
     return res.json({
       ok: true,
@@ -1117,11 +1124,600 @@ async function getOwnerMetrics(req, res) {
   }
 }
 
+// ============================================================================
+// 5. EXECUTIVE TRENDS & CURVES ENDPOINT (GET /api/owner/trends)
+//    Returns ALL 3 branch curves ({ all, "1", "2" }) in 1 parallel call for 0ms switching!
+// ============================================================================
+function shiftIsoDate(isoDate, deltaDays) {
+  const [y, m, d] = String(isoDate).split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return dt.toISOString().slice(0, 10);
+}
+
+function diffIsoDays(startIso, endIso) {
+  const [y1, m1, d1] = String(startIso).split("-").map(Number);
+  const [y2, m2, d2] = String(endIso).split("-").map(Number);
+  return Math.round((Date.UTC(y2, m2 - 1, d2) - Date.UTC(y1, m1 - 1, d1)) / 86400000);
+}
+
+function round2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+function formatArabicBucketLabel(key, granularity) {
+  if (granularity === "hour") return key; // "00:00" .. "23:00"
+  if (granularity === "month") {
+    const [y, m] = key.split("-");
+    return `${m}/${y.slice(2)}`;
+  }
+  const parts = key.split("-");
+  return parts.length === 3 ? `${parts[2]}/${parts[1]}` : key;
+}
+
+function generateBucketKeys(windowFrom, windowTo, granularity) {
+  const keys = [];
+  if (granularity === "hour") {
+    for (let h = 0; h < 24; h++) {
+      keys.push(`${String(h).padStart(2, "0")}:00`);
+    }
+    return keys;
+  }
+  if (granularity === "month") {
+    let [y, m] = windowFrom.split("-").map(Number);
+    const [ey, em] = windowTo.split("-").map(Number);
+    let guard = 0;
+    while ((y < ey || (y === ey && m <= em)) && guard < 48) {
+      keys.push(`${y}-${String(m).padStart(2, "0")}`);
+      m++;
+      if (m > 12) {
+        m = 1;
+        y++;
+      }
+      guard++;
+    }
+    return keys;
+  }
+  // day or week (daily buckets for clean continuous curves; week buckets every 7 days)
+  const step = granularity === "week" ? 7 : 1;
+  const totalDays = Math.min(365, Math.max(0, diffIsoDays(windowFrom, windowTo)));
+  for (let offset = 0; offset <= totalDays; offset += step) {
+    keys.push(shiftIsoDate(windowFrom, offset));
+  }
+  if (keys[keys.length - 1] !== windowTo && step === 1) {
+    keys.push(windowTo);
+  }
+  return keys;
+}
+
+async function getOwnerTrends(req, res) {
+  try {
+    const periodParam = req.query.period || "today";
+    const fromParam = req.query.from || null;
+    const toParam = req.query.to || null;
+    const modeParam = req.query.mode === "hourly" ? "hourly" : "daily";
+    const forceRefresh = req.query.force_refresh === "true";
+
+    const dateRange = resolveDateRange(periodParam, fromParam, toParam);
+    const todayIso = getCairoTodayIso();
+    const isSingleDay = dateRange.from === dateRange.to;
+
+    let granularity = "day";
+    let windowFrom = dateRange.from;
+    let windowTo = dateRange.to;
+
+    if (isSingleDay) {
+      if (modeParam === "hourly") {
+        granularity = "hour";
+      } else {
+        granularity = "day";
+        windowFrom = shiftIsoDate(dateRange.to, -13); // Trailing 14-day curve ending on selected day
+        windowTo = dateRange.to;
+      }
+    } else {
+      const spanDays = Math.max(1, diffIsoDays(dateRange.from, dateRange.to) + 1);
+      if (spanDays > 180) granularity = "month";
+      else if (spanDays > 65) granularity = "week";
+      else granularity = "day";
+    }
+
+    const cacheKey = `${windowFrom}_${windowTo}_${granularity}_${dateRange.from}_${dateRange.to}`;
+    const now = Date.now();
+    if (!forceRefresh) {
+      const cached = ownerTrendsCache.get(cacheKey);
+      if (cached && now - cached.ts < TRENDS_CACHE_TTL_MS) {
+        return res.json({ ...cached.payload, cacheHit: true });
+      }
+    }
+
+    const isWindowEndHistorical = windowTo < todayIso;
+    const spanForComparison = Math.max(1, diffIsoDays(windowFrom, windowTo) + 1);
+    const prevFrom = shiftIsoDate(windowFrom, -spanForComparison);
+    const prevTo = shiftIsoDate(windowFrom, -1);
+
+    // Ensure baseline heavy data for windowTo is ready
+    let endHeavyPromise;
+    if (isWindowEndHistorical) {
+      endHeavyPromise = computeHeavyAggregatesAsOf(windowTo);
+    } else if (ownerHeavyCache.data) {
+      endHeavyPromise = Promise.resolve(ownerHeavyCache.data);
+    } else {
+      endHeavyPromise = computeHeavyAggregates().then(() => ownerHeavyCache.data);
+    }
+
+    const bucketKeys = generateBucketKeys(windowFrom, windowTo, granularity);
+    const isHourly = granularity === "hour";
+
+    const invBucketExpr = isHourly
+      ? `to_char((created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo'), 'HH24') || ':00'`
+      : granularity === "month"
+      ? `to_char(invoice_date, 'YYYY-MM')`
+      : `to_char(invoice_date, 'YYYY-MM-DD')`;
+
+    const ciBucketExpr = isHourly
+      ? `to_char((created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo'), 'HH24') || ':00'`
+      : granularity === "month"
+      ? `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM')`
+      : `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM-DD')`;
+
+    const coBucketExpr = isHourly
+      ? `to_char((created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo'), 'HH24') || ':00'`
+      : granularity === "month"
+      ? `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM')`
+      : `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM-DD')`;
+
+    const smBucketExpr = granularity === "month"
+      ? `to_char(COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date), 'YYYY-MM')`
+      : `to_char(COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date), 'YYYY-MM-DD')`;
+
+    const [
+      openingInRes,
+      openingOutRes,
+      salesSeriesRes,
+      cashInSeriesRes,
+      cashOutSeriesRes,
+      prevSalesRes,
+      periodOutBreakdownRes,
+      periodBranchSalesRes,
+      stockDeltaRes,
+      marketDeltaInvRes,
+      marketDeltaCustPayRes,
+      marketDeltaSupPayRes,
+      marketDeltaSupAdjRes,
+      endHeavy,
+    ] = await Promise.all([
+      // 1. Opening cash in before windowFrom
+      pool.query(
+        `SELECT branch_id,
+                COALESCE(SUM(CASE WHEN source_type = 'invoice' THEN COALESCE(paid_amount, 0) ELSE COALESCE(amount, 0) END), 0)::numeric AS total_in
+         FROM cash_in
+         WHERE COALESCE(transaction_date, created_at::date) < $1::date
+           AND (notes IS NULL OR notes NOT LIKE '%{{discount_diff}}%')
+         GROUP BY branch_id`,
+        [windowFrom]
+      ),
+      // 2. Opening cash out before windowFrom
+      pool.query(
+        `SELECT branch_id, COALESCE(SUM(amount), 0)::numeric AS total_out
+         FROM cash_out
+         WHERE COALESCE(transaction_date, created_at::date) < $1::date
+         GROUP BY branch_id`,
+        [windowFrom]
+      ),
+      // 3. Sales per bucket
+      pool.query(
+        `SELECT branch_id, ${invBucketExpr} AS bucket,
+                COUNT(*)::int AS invoices_count,
+                COALESCE(SUM(total), 0)::numeric AS sales
+         FROM invoices
+         WHERE movement_type = 'sale' AND is_void IS NOT TRUE AND is_return = false
+           AND invoice_date >= $1::date AND invoice_date <= $2::date
+         GROUP BY branch_id, bucket`,
+        [windowFrom, windowTo]
+      ),
+      // 4. Cash In per bucket
+      pool.query(
+        `SELECT branch_id, ${ciBucketExpr} AS bucket,
+                COALESCE(SUM(CASE WHEN source_type = 'invoice' THEN COALESCE(paid_amount, 0) ELSE COALESCE(amount, 0) END), 0)::numeric AS cash_in
+         FROM cash_in
+         WHERE COALESCE(transaction_date, created_at::date) >= $1::date
+           AND COALESCE(transaction_date, created_at::date) <= $2::date
+           AND (notes IS NULL OR notes NOT LIKE '%{{discount_diff}}%')
+         GROUP BY branch_id, bucket`,
+        [windowFrom, windowTo]
+      ),
+      // 5. Cash Out per bucket
+      pool.query(
+        `SELECT branch_id, ${coBucketExpr} AS bucket,
+                COALESCE(SUM(amount), 0)::numeric AS cash_out
+         FROM cash_out
+         WHERE COALESCE(transaction_date, created_at::date) >= $1::date
+           AND COALESCE(transaction_date, created_at::date) <= $2::date
+         GROUP BY branch_id, bucket`,
+        [windowFrom, windowTo]
+      ),
+      // 6. Previous window sales for period-over-period growth %
+      pool.query(
+        `SELECT branch_id, COALESCE(SUM(total), 0)::numeric AS prev_sales
+         FROM invoices
+         WHERE movement_type = 'sale' AND is_void IS NOT TRUE AND is_return = false
+           AND invoice_date >= $1::date AND invoice_date <= $2::date
+         GROUP BY branch_id`,
+        [prevFrom, prevTo]
+      ),
+      // 7. Expense breakdown for the exact selected dateRange (for Donut Chart)
+      pool.query(
+        `SELECT branch_id, entry_type, COALESCE(SUM(amount), 0)::numeric AS total
+         FROM cash_out
+         WHERE COALESCE(transaction_date, created_at::date) >= $1::date
+           AND COALESCE(transaction_date, created_at::date) <= $2::date
+         GROUP BY branch_id, entry_type`,
+        [dateRange.from, dateRange.to]
+      ),
+      // 8. Branch comparison totals for the exact selected dateRange
+      pool.query(
+        `SELECT branch_id,
+                COALESCE(SUM(total), 0)::numeric AS sales,
+                COALESCE(SUM(paid_amount), 0)::numeric AS paid
+         FROM invoices
+         WHERE movement_type = 'sale' AND is_void IS NOT TRUE AND is_return = false
+           AND invoice_date >= $1::date AND invoice_date <= $2::date
+         GROUP BY branch_id`,
+        [dateRange.from, dateRange.to]
+      ),
+      // 9. Inventory cost delta per bucket (for fast O(1) backward-walk Assets Curve; skipped in hourly mode)
+      isHourly
+        ? Promise.resolve({ rows: [] })
+        : pool.query(
+            `SELECT
+               sm.warehouse_id AS branch_id,
+               ${smBucketExpr} AS bucket,
+               COALESCE(SUM(
+                 (CASE
+                   WHEN sm.movement_type IN ('purchase', 'transfer_in', 'return_sale', 'adjustment_in', 'in', 'replace_in') THEN sm.quantity
+                   WHEN sm.movement_type IN ('sale', 'transfer_out', 'return_purchase', 'adjustment_out', 'replace_out') THEN -sm.quantity
+                   ELSE 0
+                 END) * CASE
+                   WHEN sm.warehouse_id = 1 THEN COALESCE(NULLIF(pv.retail_purchase_price, 0), NULLIF(p.retail_purchase_price, 0), NULLIF(pv.purchase_price, 0), NULLIF(p.purchase_price, 0), 0)
+                   ELSE COALESCE(NULLIF(pv.purchase_price, 0), NULLIF(p.purchase_price, 0), NULLIF(pv.retail_purchase_price, 0), NULLIF(p.retail_purchase_price, 0), 0)
+                 END
+               ), 0)::numeric AS cost_delta
+             FROM stock_movements sm
+             JOIN products p ON p.id = sm.product_id
+             LEFT JOIN product_variants pv ON pv.id = NULLIF(COALESCE(sm.variant_id, 0), 0)
+             LEFT JOIN invoices i ON i.id = sm.invoice_id
+             WHERE COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date) >= $1::date
+               AND COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date) <= $2::date
+               AND (i.id IS NULL OR i.is_void IS NOT TRUE)
+               AND p.is_active = true
+             GROUP BY sm.warehouse_id, bucket`,
+            [windowFrom, windowTo]
+          ),
+      // 10. Daily net invoice delta for Customer Debts & Supplier Payables (for backward walk)
+      isHourly
+        ? Promise.resolve({ rows: [] })
+        : pool.query(
+            `SELECT branch_id, movement_type, ${invBucketExpr} AS bucket,
+                    COALESCE(SUM(total - COALESCE(paid_amount, 0)), 0)::numeric AS net_unpaid
+             FROM invoices
+             WHERE is_void IS NOT TRUE
+               AND movement_type IN ('sale', 'purchase')
+               AND invoice_date >= $1::date AND invoice_date <= $2::date
+             GROUP BY branch_id, movement_type, bucket`,
+            [windowFrom, windowTo]
+          ),
+      // 11. Daily customer_payment cash_in delta
+      isHourly
+        ? Promise.resolve({ rows: [] })
+        : pool.query(
+            `SELECT branch_id, ${ciBucketExpr} AS bucket, COALESCE(SUM(amount), 0)::numeric AS cust_paid
+             FROM cash_in
+             WHERE source_type = 'customer_payment'
+               AND COALESCE(transaction_date, created_at::date) >= $1::date
+               AND COALESCE(transaction_date, created_at::date) <= $2::date
+             GROUP BY branch_id, bucket`,
+            [windowFrom, windowTo]
+          ),
+      // 12. Daily standalone supplier_payment cash_out delta (invoice_id IS NULL)
+      isHourly
+        ? Promise.resolve({ rows: [] })
+        : pool.query(
+            `SELECT branch_id, ${coBucketExpr} AS bucket, COALESCE(SUM(amount), 0)::numeric AS sup_paid
+             FROM cash_out
+             WHERE entry_type = 'supplier_payment' AND invoice_id IS NULL
+               AND COALESCE(transaction_date, created_at::date) >= $1::date
+               AND COALESCE(transaction_date, created_at::date) <= $2::date
+             GROUP BY branch_id, bucket`,
+            [windowFrom, windowTo]
+          ),
+      // 13. Daily supplier adjustments delta
+      isHourly
+        ? Promise.resolve({ rows: [] })
+        : pool
+            .query(
+              `SELECT branch_id,
+                      ${granularity === "month" ? `to_char(adjustment_date, 'YYYY-MM')` : `to_char(adjustment_date, 'YYYY-MM-DD')`} AS bucket,
+                      COALESCE(SUM(amount), 0)::numeric AS sup_adj
+               FROM supplier_adjustments
+               WHERE adjustment_date >= $1::date AND adjustment_date <= $2::date
+               GROUP BY branch_id, bucket`,
+              [windowFrom, windowTo]
+            )
+            .catch(() => ({ rows: [] })),
+      endHeavyPromise,
+    ]);
+
+    // Helper: snap date key into week bucket if granularity === 'week'
+    const resolveBucketKey = (rawKey) => {
+      if (granularity !== "week") return rawKey;
+      const d = diffIsoDays(windowFrom, rawKey);
+      if (d < 0) return bucketKeys[0];
+      const idx = Math.min(bucketKeys.length - 1, Math.floor(d / 7));
+      return bucketKeys[idx];
+    };
+
+    const openingNet = { 1: 0, 2: 0 };
+    for (const r of openingInRes.rows) {
+      const b = Number(r.branch_id);
+      if (openingNet[b] !== undefined) openingNet[b] += Number(r.total_in || 0);
+    }
+    for (const r of openingOutRes.rows) {
+      const b = Number(r.branch_id);
+      if (openingNet[b] !== undefined) openingNet[b] -= Number(r.total_out || 0);
+    }
+
+    // Initialize per-branch bucket maps
+    const initMap = () => {
+      const m = new Map();
+      for (const k of bucketKeys) {
+        m.set(k, {
+          key: k,
+          label: formatArabicBucketLabel(k, granularity),
+          sales: 0,
+          invoicesCount: 0,
+          cashIn: 0,
+          cashOut: 0,
+          netFlow: 0,
+          cashBalance: 0,
+          inventoryCost: 0,
+          customerDebts: 0,
+          supplierPayables: 0,
+          _costDelta: 0,
+          _custDelta: 0,
+          _supDelta: 0,
+        });
+      }
+      return m;
+    };
+
+    const maps = { 1: initMap(), 2: initMap() };
+
+    for (const r of salesSeriesRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (entry) {
+        entry.sales += Number(r.sales || 0);
+        entry.invoicesCount += Number(r.invoices_count || 0);
+      }
+    }
+    for (const r of cashInSeriesRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (entry) entry.cashIn += Number(r.cash_in || 0);
+    }
+    for (const r of cashOutSeriesRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (entry) entry.cashOut += Number(r.cash_out || 0);
+    }
+    for (const r of stockDeltaRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (entry) entry._costDelta += Number(r.cost_delta || 0);
+    }
+    for (const r of marketDeltaInvRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (!entry) continue;
+      if (r.movement_type === "sale") entry._custDelta += Number(r.net_unpaid || 0);
+      else if (r.movement_type === "purchase") entry._supDelta += Number(r.net_unpaid || 0);
+    }
+    for (const r of marketDeltaCustPayRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (entry) entry._custDelta -= Number(r.cust_paid || 0);
+    }
+    for (const r of marketDeltaSupPayRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (entry) entry._supDelta -= Number(r.sup_paid || 0);
+    }
+    for (const r of marketDeltaSupAdjRes.rows) {
+      const b = Number(r.branch_id);
+      const entry = maps[b]?.get(resolveBucketKey(r.bucket));
+      if (entry) entry._supDelta += Number(r.sup_adj || 0);
+    }
+
+    // Forward walk for cumulative cashBalance + Backward walk for exact Assets & Market Debts curves
+    const heavyRef = endHeavy || {
+      inventoryByBranch: { 1: { purchase_value: 0 }, 2: { purchase_value: 0 } },
+      customerDebtsByBranch: { 1: { total_remaining: 0 }, 2: { total_remaining: 0 } },
+      supplierPayablesByBranch: { 1: { total_remaining: 0 }, 2: { total_remaining: 0 } },
+    };
+
+    const finalizeBranchSeries = (bId) => {
+      const rows = bucketKeys.map((k) => maps[bId].get(k));
+      let runningCash = openingNet[bId];
+      for (const row of rows) {
+        row.sales = round2(row.sales);
+        row.cashIn = round2(row.cashIn);
+        row.cashOut = round2(row.cashOut);
+        row.netFlow = round2(row.cashIn - row.cashOut);
+        runningCash = round2(runningCash + row.netFlow);
+        row.cashBalance = runningCash;
+      }
+
+      if (!isHourly) {
+        let invVal = Number(heavyRef.inventoryByBranch?.[bId]?.purchase_value || 0);
+        let custVal = Number(heavyRef.customerDebtsByBranch?.[bId]?.total_remaining || 0);
+        let supVal = Number(heavyRef.supplierPayablesByBranch?.[bId]?.total_remaining || 0);
+
+        for (let i = rows.length - 1; i >= 0; i--) {
+          rows[i].inventoryCost = Math.max(0, round2(invVal));
+          rows[i].customerDebts = Math.max(0, round2(custVal));
+          rows[i].supplierPayables = Math.max(0, round2(supVal));
+          invVal -= rows[i]._costDelta;
+          custVal -= rows[i]._custDelta;
+          supVal -= rows[i]._supDelta;
+        }
+      }
+
+      return rows.map(({ _costDelta, _custDelta, _supDelta, ...clean }) => clean);
+    };
+
+    const series1 = finalizeBranchSeries(1);
+    const series2 = finalizeBranchSeries(2);
+    const seriesAll = bucketKeys.map((k, idx) => ({
+      key: k,
+      label: series1[idx].label,
+      sales: round2(series1[idx].sales + series2[idx].sales),
+      invoicesCount: series1[idx].invoicesCount + series2[idx].invoicesCount,
+      cashIn: round2(series1[idx].cashIn + series2[idx].cashIn),
+      cashOut: round2(series1[idx].cashOut + series2[idx].cashOut),
+      netFlow: round2(series1[idx].netFlow + series2[idx].netFlow),
+      cashBalance: round2(series1[idx].cashBalance + series2[idx].cashBalance),
+      inventoryCost: round2(series1[idx].inventoryCost + series2[idx].inventoryCost),
+      customerDebts: round2(series1[idx].customerDebts + series2[idx].customerDebts),
+      supplierPayables: round2(series1[idx].supplierPayables + series2[idx].supplierPayables),
+    }));
+
+    const prevSalesByBranch = { 1: 0, 2: 0 };
+    for (const r of prevSalesRes.rows) {
+      const b = Number(r.branch_id);
+      if (prevSalesByBranch[b] !== undefined) prevSalesByBranch[b] = Number(r.prev_sales || 0);
+    }
+    const prevSalesAll = round2(prevSalesByBranch[1] + prevSalesByBranch[2]);
+
+    const buildStats = (rows, prevSales) => {
+      const totalSales = round2(rows.reduce((s, r) => s + r.sales, 0));
+      const totalCashIn = round2(rows.reduce((s, r) => s + r.cashIn, 0));
+      const totalCashOut = round2(rows.reduce((s, r) => s + r.cashOut, 0));
+      const avgSales = rows.length ? round2(totalSales / rows.length) : 0;
+      let peakPoint = rows[0] || null;
+      let minCash = rows[0] || null;
+      let maxCash = rows[0] || null;
+      for (const r of rows) {
+        if (!peakPoint || r.sales > peakPoint.sales) peakPoint = r;
+        if (!minCash || r.cashBalance < minCash.cashBalance) minCash = r;
+        if (!maxCash || r.cashBalance > maxCash.cashBalance) maxCash = r;
+      }
+      const salesGrowthPct =
+        prevSales > 0 ? round2(((totalSales - prevSales) / prevSales) * 100) : null;
+      return {
+        totalSales,
+        totalCashIn,
+        totalCashOut,
+        avgSales,
+        prevSales: round2(prevSales),
+        salesGrowthPct,
+        peakSalesLabel: peakPoint?.label || "-",
+        peakSalesValue: peakPoint?.sales || 0,
+        minCashLabel: minCash?.label || "-",
+        minCashValue: minCash?.cashBalance || 0,
+        maxCashLabel: maxCash?.label || "-",
+        maxCashValue: maxCash?.cashBalance || 0,
+      };
+    };
+
+    // Expense breakdown for Donut Chart (per branch + combined)
+    const initBreakdown = () => ({
+      supplierPayments: 0,
+      expenses: 0,
+      purchases: 0,
+      settlements: 0,
+      debtPayments: 0,
+    });
+    const expBk = { 1: initBreakdown(), 2: initBreakdown(), all: initBreakdown() };
+    for (const r of periodOutBreakdownRes.rows) {
+      const b = Number(r.branch_id);
+      const amt = Number(r.total || 0);
+      const key =
+        r.entry_type === "supplier_payment"
+          ? "supplierPayments"
+          : r.entry_type === "purchase"
+          ? "purchases"
+          : r.entry_type === "debt_payment"
+          ? "debtPayments"
+          : r.entry_type === "warehouse_settlement" || r.entry_type === "showroom_settlement"
+          ? "settlements"
+          : "expenses";
+      if (expBk[b]) expBk[b][key] = round2(expBk[b][key] + amt);
+      expBk.all[key] = round2(expBk.all[key] + amt);
+    }
+
+    // Branch Comparison totals (for selected dateRange)
+    const compSales = { 1: 0, 2: 0 };
+    for (const r of periodBranchSalesRes.rows) {
+      const b = Number(r.branch_id);
+      if (compSales[b] !== undefined) compSales[b] = round2(r.sales);
+    }
+    const compIn = { 1: 0, 2: 0 };
+    const compOut = { 1: 0, 2: 0 };
+    if (isSingleDay && !isHourly) {
+      const targetKey = dateRange.to;
+      const p1 = series1.find((r) => r.key === targetKey);
+      const p2 = series2.find((r) => r.key === targetKey);
+      compIn[1] = p1?.cashIn || 0;
+      compIn[2] = p2?.cashIn || 0;
+      compOut[1] = p1?.cashOut || 0;
+      compOut[2] = p2?.cashOut || 0;
+    } else {
+      compIn[1] = round2(series1.reduce((s, r) => s + r.cashIn, 0));
+      compIn[2] = round2(series2.reduce((s, r) => s + r.cashIn, 0));
+      compOut[1] = round2(series1.reduce((s, r) => s + r.cashOut, 0));
+      compOut[2] = round2(series2.reduce((s, r) => s + r.cashOut, 0));
+    }
+
+    const branchComparison = [
+      { branch: "المعرض (القطاعي)", branchId: "1", sales: compSales[1], cashIn: compIn[1], cashOut: compOut[1] },
+      { branch: "المخازن (الجملة)", branchId: "2", sales: compSales[2], cashIn: compIn[2], cashOut: compOut[2] },
+    ];
+
+    const payload = {
+      ok: true,
+      granularity,
+      isSingleDay,
+      selectedDayKey: isSingleDay ? dateRange.to : null,
+      window: { from: windowFrom, to: windowTo },
+      dateRange,
+      seriesByBranch: { all: seriesAll, "1": series1, "2": series2 },
+      statsByBranch: {
+        all: buildStats(seriesAll, prevSalesAll),
+        "1": buildStats(series1, prevSalesByBranch[1]),
+        "2": buildStats(series2, prevSalesByBranch[2]),
+      },
+      expenseBreakdownByBranch: { all: expBk.all, "1": expBk[1], "2": expBk[2] },
+      branchComparison,
+    };
+
+    if (ownerTrendsCache.size > 20) {
+      const firstKey = ownerTrendsCache.keys().next().value;
+      if (firstKey) ownerTrendsCache.delete(firstKey);
+    }
+    ownerTrendsCache.set(cacheKey, { ts: now, payload });
+
+    return res.json({ ...payload, cacheHit: false });
+  } catch (err) {
+    console.error("getOwnerTrends error:", err);
+    return res.status(500).json({ error: "فشل تحميل منحنيات لوحة المالك", details: err.message });
+  }
+}
+
 module.exports = {
   unlockOwnerSession,
   requireOwnerSession,
   checkOwnerSession,
   getOwnerMetrics,
+  getOwnerTrends,
   refreshOwnerCache,
   invalidateOwnerFastCache,
   scheduleOwnerCacheRefresh,

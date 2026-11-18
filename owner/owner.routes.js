@@ -9,6 +9,9 @@ router.get("/auth/status", controller.requireOwnerSession, controller.checkOwner
 // 2. Metrics & KPI Cockpit (Gated by Ephemeral Owner Session)
 router.get("/metrics", controller.requireOwnerSession, controller.getOwnerMetrics);
 
+// 2.5 Interactive Executive Curves & Trends
+router.get("/trends", controller.requireOwnerSession, controller.getOwnerTrends);
+
 // 3. Force Refresh Heavy Cache
 router.post("/refresh-cache", controller.requireOwnerSession, controller.refreshOwnerCache);
 
