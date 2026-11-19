@@ -247,54 +247,100 @@ exports.getProductMovement = async (req, res) => {
         .json({ error: "product_id أو product_name مطلوب" });
     }
 
-    const conditions = [];
-    const values = [];
+    const baseConditions = [];
+    const baseValues = [];
     let idx = 1;
 
     if (product_id) {
-      conditions.push(`sm.product_id = $${idx++}`);
-      values.push(Number(product_id));
+      baseConditions.push(`sm.product_id = $${idx++}`);
+      baseValues.push(Number(product_id));
     } else {
-      conditions.push(`LOWER(p.name) LIKE LOWER($${idx++})`);
-      values.push(`%${product_name}%`);
+      baseConditions.push(`LOWER(p.name) LIKE LOWER($${idx++})`);
+      baseValues.push(`%${product_name}%`);
     }
 
-    // 🏬 فلترة المخزن
+    // 🏬 فلترة المخزن في الـ base CTE لضمان حساب الرصيد التراكمي لكل مخزن بدقة تامة
     if (warehouse_id) {
-      conditions.push(`sm.warehouse_id = $${idx++}`);
-      values.push(warehouse_id);
+      baseConditions.push(`sm.warehouse_id = $${idx++}`);
+      baseValues.push(Number(warehouse_id));
     }
 
-    // 📅 من تاريخ
+    const outerConditions = [];
+    const outerValues = [...baseValues];
+
+    // 📅 من تاريخ (تطبق بعد حساب الرصيد التراكمي التاريخي اللحظي)
     if (from) {
-      conditions.push(`DATE(sm.created_at) >= $${idx++}`);
-      values.push(from);
+      outerConditions.push(`DATE(fm.created_at) >= $${idx++}`);
+      outerValues.push(from);
     }
 
     // 📅 إلى تاريخ
     if (to) {
-      conditions.push(`DATE(sm.created_at) <= $${idx++}`);
-      values.push(to);
+      outerConditions.push(`DATE(fm.created_at) <= $${idx++}`);
+      outerValues.push(to);
     }
 
     // 👤 فلترة باسم العميل / المورد
     if (party_name) {
-      conditions.push(`LOWER(i.customer_name) LIKE LOWER($${idx++})`);
-      values.push(`%${party_name}%`);
+      outerConditions.push(`LOWER(i.customer_name) LIKE LOWER($${idx++})`);
+      outerValues.push(`%${party_name}%`);
     }
+
+    const whereClause =
+      outerConditions.length > 0 ? `WHERE ${outerConditions.join(" AND ")}` : "";
 
     const result = await pool.query(
       `
+      WITH full_movements AS (
+        SELECT
+          sm.id,
+          sm.created_at,
+          sm.product_id,
+          sm.warehouse_id,
+          sm.movement_type,
+          sm.quantity,
+          sm.note,
+          sm.invoice_id,
+          sm.variant_id,
+          w.name AS warehouse_name,
+          p.name AS product_name,
+          p.manufacturer AS manufacturer_name,
+          p.wholesale_package,
+          p.retail_package,
+          SUM(
+            CASE
+              WHEN sm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'initial_stock', 'adjustment_add', 'in') THEN sm.quantity
+              WHEN sm.movement_type IN ('sale', 'transfer_out', 'return_purchase', 'replace_out', 'adjustment_sub', 'out') THEN -sm.quantity
+              ELSE 0
+            END
+          ) OVER (
+            PARTITION BY sm.warehouse_id, sm.variant_id
+            ORDER BY sm.created_at ASC, sm.id ASC
+          ) AS balance_after
+        FROM stock_movements sm
+        JOIN products p ON p.id = sm.product_id
+        JOIN warehouses w ON w.id = sm.warehouse_id
+        WHERE ${baseConditions.join(" AND ")}
+      )
       SELECT
-        sm.created_at,
-        p.name AS product_name,
-        p.manufacturer AS manufacturer_name,
-        w.name AS warehouse_name,
-        sm.movement_type,
-        sm.quantity,
-        sm.note,
-        sm.invoice_id,
-        sm.variant_id,
+        fm.id,
+        fm.created_at,
+        fm.product_name,
+        fm.manufacturer_name,
+        fm.warehouse_name,
+        fm.movement_type,
+        fm.quantity,
+        fm.balance_after,
+        (fm.balance_after - (
+          CASE
+            WHEN fm.movement_type IN ('purchase', 'transfer_in', 'replace_in', 'return_sale', 'initial_stock', 'adjustment_add', 'in') THEN fm.quantity
+            WHEN fm.movement_type IN ('sale', 'transfer_out', 'return_purchase', 'replace_out', 'adjustment_sub', 'out') THEN -fm.quantity
+            ELSE 0
+          END
+        )) AS balance_before,
+        fm.note,
+        fm.invoice_id,
+        fm.variant_id,
 
         -- اسم العميل أو المورد من الفاتورة
         i.customer_name AS party_name,
@@ -308,21 +354,19 @@ exports.getProductMovement = async (req, res) => {
         -- العبوة: من الفاتورة أو من العبوة الفرعية أو من المنتج الأساسي
         COALESCE(
           ii.package,
-          CASE WHEN sm.variant_id > 0 THEN pv.wholesale_package END,
-          p.wholesale_package
+          CASE WHEN fm.variant_id > 0 THEN pv.wholesale_package END,
+          fm.wholesale_package
         ) AS package_name
 
-      FROM stock_movements sm
-      JOIN products p ON p.id = sm.product_id
-      JOIN warehouses w ON w.id = sm.warehouse_id
-      LEFT JOIN invoices i ON i.id = sm.invoice_id
-      LEFT JOIN invoice_items ii ON ii.invoice_id = sm.invoice_id AND ii.product_id = sm.product_id AND ii.variant_id = sm.variant_id
-      LEFT JOIN product_variants pv ON pv.id = sm.variant_id
+      FROM full_movements fm
+      LEFT JOIN invoices i ON i.id = fm.invoice_id
+      LEFT JOIN invoice_items ii ON ii.invoice_id = fm.invoice_id AND ii.product_id = fm.product_id AND ii.variant_id = fm.variant_id
+      LEFT JOIN product_variants pv ON pv.id = fm.variant_id
 
-      WHERE ${conditions.join(" AND ")}
-      ORDER BY sm.created_at ASC
+      ${whereClause}
+      ORDER BY fm.created_at ASC, fm.id ASC
       `,
-      values,
+      outerValues,
     );
 
     res.json(result.rows);
