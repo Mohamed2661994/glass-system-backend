@@ -259,64 +259,118 @@ async function isFirstWhatsAppForPhone(cleanPhone) {
 
 /**
  * Build smart financial text block conditionally:
- * - If discount > 0: Shows original invoice subtotal & discount on line 1, then net total & payment status on line 2
- * - If no discount: Compact single line with Total & payment status
- * - Handles fully paid ("خالصة بالكامل ✅"), partial payment, and unpaid ("آجل ⏳")
+ * - If discount > 0: Shows original invoice subtotal & discount on line 1
+ * - If previousBalance !== 0: Shows previous balance line (رصيد سابق لك / حساب سابق عليك)
+ * - If additionalAmount > 0: Shows additional charges line (إضافات)
+ * - Line 3: Shows final grand total & payment status (خالصة بالكامل / جزئي / آجل)
+ * - 100% mathematically balanced and crystal clear for customers and accountants.
  */
 function buildFinancialBlock({
   subtotal,
   discount,
+  manualDiscount,
   previousBalance,
+  additionalAmount,
   amount,
+  totalWithPrevious,
   paidAmount,
   remainingAmount,
   currency = 'ج.م',
 }) {
-  const numTotal = Number(amount || 0);
   const numSubtotal = subtotal !== undefined && subtotal !== null ? Number(subtotal) : 0;
-  const numDiscount = Math.max(0, Number(discount || 0));
+  let numDiscount = Math.max(0, Number(discount || 0));
+  const numManualDiscount = Math.max(0, Number(manualDiscount || 0));
   const numPrevious = Number(previousBalance || 0);
+  const numAdditional = Number(additionalAmount || 0);
+  const numInvoiceTotal = Number(amount || 0);
   const numPaid = Number(paidAmount || 0);
-  const numRemaining = remainingAmount !== undefined && remainingAmount !== null
-    ? Number(remainingAmount)
-    : (numTotal - numPaid);
 
-  const formattedTotal = formatAmount(numTotal);
+  // Auto-resolve discount if subtotal and invoiceTotal are available and don't match numDiscount:
+  // If subtotal minus discount does not match invoice total, but subtotal minus manualDiscount does (Retail pattern where subtotal is already net of line items discounts),
+  // use manualDiscount. If invoice total equals subtotal (e.g. no extra discount), discount is 0.
+  if (numSubtotal > 0 && numInvoiceTotal > 0) {
+    if (Math.abs(numSubtotal - numInvoiceTotal) <= 0.01) {
+      numDiscount = 0;
+    } else if (
+      numManualDiscount > 0 &&
+      Math.abs(numSubtotal - numManualDiscount - numInvoiceTotal) <= 0.01
+    ) {
+      numDiscount = numManualDiscount;
+    } else if (Math.abs(numSubtotal - numDiscount - numInvoiceTotal) > 0.01 && numSubtotal >= numInvoiceTotal) {
+      numDiscount = Math.round((numSubtotal - numInvoiceTotal) * 100) / 100;
+    }
+  }
+
+  // Grand total required from customer (including previous debt or credit, and any additions)
+  const grandTotal =
+    totalWithPrevious !== undefined && totalWithPrevious !== null
+      ? Number(totalWithPrevious)
+      : Math.round((numInvoiceTotal + numPrevious + numAdditional) * 100) / 100;
+
+  const numRemaining =
+    remainingAmount !== undefined && remainingAmount !== null
+      ? Number(remainingAmount)
+      : Math.round((grandTotal - numPaid) * 100) / 100;
+
+  const hasDiscount = numDiscount > 0;
+  const hasPrevious = Math.abs(numPrevious) >= 0.01;
+  const hasAdditional = numAdditional > 0;
+
+  const effectiveSubtotal = hasDiscount
+    ? numSubtotal > 0
+      ? numSubtotal
+      : Math.max(0, numInvoiceTotal + numDiscount)
+    : numSubtotal > 0
+      ? numSubtotal
+      : numInvoiceTotal;
+
+  const lines = [];
+
+  // Line 1: Subtotal & Discount
+  if (hasDiscount) {
+    lines.push(
+      `🧾 *قيمة الفاتورة:* ${formatAmount(effectiveSubtotal)} ${currency} | 🏷️ *الخصم:* ${formatAmount(numDiscount)} ${currency}`
+    );
+  } else if (hasPrevious || hasAdditional) {
+    lines.push(`🧾 *قيمة الفاتورة:* ${formatAmount(effectiveSubtotal)} ${currency}`);
+  }
+
+  // Line 2: Previous balance (if any)
+  if (hasPrevious) {
+    if (numPrevious < 0) {
+      lines.push(`⚖️ *رصيد سابق (لك):* ${formatAmount(Math.abs(numPrevious))} ${currency}`);
+    } else {
+      lines.push(`⚖️ *حساب سابق (عليك):* ${formatAmount(numPrevious)} ${currency}`);
+    }
+  }
+
+  // Line 2b: Additional amount (if any, e.g. wholesale delivery)
+  if (hasAdditional) {
+    lines.push(`📦 *إضافات:* ${formatAmount(numAdditional)} ${currency}`);
+  }
+
+  // Line 3: Grand Total & Payment status
+  const totalLabel =
+    hasPrevious || hasAdditional
+      ? 'الإجمالي النهائي'
+      : hasDiscount
+        ? 'الصافي'
+        : 'الإجمالي';
+  const formattedGrandTotal = formatAmount(grandTotal);
   const formattedPaid = formatAmount(numPaid);
   const formattedRemaining = formatAmount(Math.max(0, numRemaining));
 
-  const hasDiscount = numDiscount > 0;
-  const effectiveSubtotal = hasDiscount
-    ? (numSubtotal > 0 ? numSubtotal : Math.max(0, numTotal - numPrevious + numDiscount))
-    : numSubtotal;
-
-  const hasPreviousIncluded =
-    hasDiscount &&
-    numPrevious > 0 &&
-    numTotal > (effectiveSubtotal - numDiscount + 0.01);
-
-  const totalLabel = hasDiscount
-    ? (hasPreviousIncluded ? 'الإجمالي (شامل السابق)' : 'الصافي')
-    : 'الإجمالي';
-
   let paymentLine;
-  // Case 1: Fully paid
-  if (numRemaining <= 0 || (numTotal > 0 && numPaid >= numTotal)) {
-    paymentLine = `💰 *${totalLabel}:* ${formattedTotal} ${currency} *(خالصة بالكامل ✅)*`;
+  if (numRemaining <= 0 || (grandTotal > 0 && numPaid >= grandTotal)) {
+    paymentLine = `💰 *${totalLabel}:* ${formattedGrandTotal} ${currency} *(خالصة بالكامل ✅)*`;
   } else if (numPaid > 0 && numRemaining > 0) {
-    // Case 2: Partial payment
-    paymentLine = `💰 *${totalLabel}:* ${formattedTotal} ${currency} | 💵 *المدفوع:* ${formattedPaid} ${currency} | ⏳ *المتبقي:* ${formattedRemaining} ${currency}`;
+    paymentLine = `💰 *${totalLabel}:* ${formattedGrandTotal} ${currency} | 💵 *المدفوع:* ${formattedPaid} ${currency} | ⏳ *المتبقي:* ${formattedRemaining} ${currency}`;
   } else {
-    // Case 3: Fully credit / Unpaid
-    paymentLine = `💰 *${totalLabel}:* ${formattedTotal} ${currency} *(آجل ⏳)*`;
+    paymentLine = `💰 *${totalLabel}:* ${formattedGrandTotal} ${currency} *(آجل ⏳)*`;
   }
+  lines.push(paymentLine);
 
-  if (hasDiscount) {
-    const subtotalLine = `🧾 *قيمة الفاتورة:* ${formatAmount(effectiveSubtotal)} ${currency} | 🏷️ *الخصم:* ${formatAmount(numDiscount)} ${currency}`;
-    return `${subtotalLine}\n${paymentLine}`;
-  }
-
-  return paymentLine;
+  return lines.join('\n');
 }
 
 /**
@@ -351,8 +405,11 @@ function buildInvoiceMessage({
   customerName,
   subtotal,
   discount,
+  manualDiscount,
   previousBalance,
+  additionalAmount,
   amount,
+  totalWithPrevious,
   paidAmount,
   remainingAmount,
   invoiceType = 'retail',
@@ -372,8 +429,11 @@ function buildInvoiceMessage({
   const financialBlock = buildFinancialBlock({
     subtotal,
     discount,
+    manualDiscount,
     previousBalance,
+    additionalAmount,
     amount,
+    totalWithPrevious,
     paidAmount,
     remainingAmount,
     currency,
@@ -425,8 +485,11 @@ async function dispatchInvoiceWhatsApp({
   customerName,
   subtotal,
   discount,
+  manualDiscount,
   previousBalance,
+  additionalAmount,
   amount,
+  totalWithPrevious,
   paidAmount,
   remainingAmount,
   invoiceType,
@@ -456,8 +519,11 @@ async function dispatchInvoiceWhatsApp({
   let targetName = customerName;
   let targetSubtotal = subtotal;
   let targetDiscount = discount;
+  let targetManualDiscount = manualDiscount;
   let targetPreviousBalance = previousBalance;
+  let targetAdditionalAmount = additionalAmount;
   let targetAmount = amount;
+  let targetTotalWithPrevious = totalWithPrevious;
   let targetPaid = paidAmount;
   let targetRemaining = remainingAmount;
   let targetInvoiceType = invoiceType;
@@ -474,7 +540,7 @@ async function dispatchInvoiceWhatsApp({
     try {
       const invRes = await pool.query(
         `SELECT customer_phone, customer_name, subtotal, discount_total, manual_discount, previous_balance,
-                total, paid_amount, remaining_amount, invoice_type, branch_id
+                additional_amount, total, paid_amount, remaining_amount, invoice_type, branch_id, apply_items_discount
          FROM invoices WHERE id = $1`,
         [id]
       );
@@ -483,11 +549,20 @@ async function dispatchInvoiceWhatsApp({
         targetPhone = targetPhone || row.customer_phone;
         targetName = targetName || row.customer_name;
         if (targetSubtotal === undefined || targetSubtotal === null) targetSubtotal = row.subtotal;
+        if (targetManualDiscount === undefined || targetManualDiscount === null) {
+          targetManualDiscount = row.manual_discount ?? 0;
+        }
         if (targetDiscount === undefined || targetDiscount === null) {
-          targetDiscount = row.discount_total ?? row.manual_discount ?? 0;
+          const isRetail = (targetInvoiceType || row.invoice_type || (row.branch_id === 2 ? 'wholesale' : 'retail')) === 'retail';
+          targetDiscount = (isRetail || row.apply_items_discount)
+            ? Number(row.manual_discount || 0)
+            : Number(row.discount_total ?? row.manual_discount ?? 0);
         }
         if (targetPreviousBalance === undefined || targetPreviousBalance === null) {
           targetPreviousBalance = row.previous_balance ?? 0;
+        }
+        if (targetAdditionalAmount === undefined || targetAdditionalAmount === null) {
+          targetAdditionalAmount = row.additional_amount ?? 0;
         }
         if (targetAmount === undefined || targetAmount === null) targetAmount = row.total;
         if (targetPaid === undefined || targetPaid === null) targetPaid = row.paid_amount;
@@ -499,6 +574,16 @@ async function dispatchInvoiceWhatsApp({
     } catch (dbErr) {
       console.error(`[QuazLink] Error fetching invoice #${id} details for WhatsApp:`, dbErr.message);
     }
+  }
+
+  if (targetTotalWithPrevious === undefined || targetTotalWithPrevious === null) {
+    targetTotalWithPrevious =
+      Math.round(
+        (Number(targetAmount || 0) +
+          Number(targetPreviousBalance || 0) +
+          Number(targetAdditionalAmount || 0)) *
+          100
+      ) / 100;
   }
 
   // Normalize phone number
@@ -522,7 +607,7 @@ async function dispatchInvoiceWhatsApp({
   // 🆕 Check if this is the customer's very first successful WhatsApp message (new customer only)
   const isNewCustomer = await isFirstWhatsAppForPhone(cleanPhone);
 
-  const formattedAmount = formatAmount(targetAmount);
+  const formattedAmount = formatAmount(targetTotalWithPrevious || targetAmount);
   const isWholesale = targetInvoiceType === 'wholesale';
 
   // 🚀 Compose Compact Dynamic Message (with subtotal/discount & first-time channel invite)
@@ -531,8 +616,11 @@ async function dispatchInvoiceWhatsApp({
     customerName: targetName,
     subtotal: targetSubtotal,
     discount: targetDiscount,
+    manualDiscount: targetManualDiscount,
     previousBalance: targetPreviousBalance,
+    additionalAmount: targetAdditionalAmount,
     amount: targetAmount,
+    totalWithPrevious: targetTotalWithPrevious,
     paidAmount: targetPaid,
     remainingAmount: targetRemaining,
     invoiceType: targetInvoiceType || 'retail',
@@ -629,7 +717,7 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
 
   const invRes = await pool.query(
     `SELECT id, customer_phone, customer_name, subtotal, discount_total, manual_discount, previous_balance,
-            total, paid_amount, remaining_amount, invoice_type, branch_id
+            additional_amount, total, paid_amount, remaining_amount, invoice_type, branch_id, apply_items_discount
      FROM invoices WHERE id = $1`,
     [id]
   );
@@ -642,17 +730,31 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
     throw new Error('لا يوجد رقم هاتف مسجل لهذه الفاتورة');
   }
 
+  const resolvedType = invoice.invoice_type || (invoice.branch_id === 2 ? 'wholesale' : 'retail');
+  const isRetail = resolvedType === 'retail';
+  const effectiveDiscount = (isRetail || invoice.apply_items_discount)
+    ? Number(invoice.manual_discount || 0)
+    : Number(invoice.discount_total ?? invoice.manual_discount ?? 0);
+
+  const prevBal = Number(invoice.previous_balance || 0);
+  const addAmt = Number(invoice.additional_amount || 0);
+  const invTotal = Number(invoice.total || 0);
+  const totalWithPrevious = Math.round((invTotal + prevBal + addAmt) * 100) / 100;
+
   const result = await dispatchInvoiceWhatsApp({
     invoiceId: invoice.id,
     customerPhone: invoice.customer_phone,
     customerName: invoice.customer_name,
     subtotal: invoice.subtotal,
-    discount: invoice.discount_total ?? invoice.manual_discount ?? 0,
-    previousBalance: invoice.previous_balance ?? 0,
-    amount: invoice.total,
+    discount: effectiveDiscount,
+    manualDiscount: invoice.manual_discount,
+    previousBalance: prevBal,
+    additionalAmount: addAmt,
+    amount: invTotal,
+    totalWithPrevious: totalWithPrevious,
     paidAmount: invoice.paid_amount,
     remainingAmount: invoice.remaining_amount,
-    invoiceType: invoice.invoice_type || (invoice.branch_id === 2 ? 'wholesale' : 'retail'),
+    invoiceType: resolvedType,
     currency: 'ج.م',
     force: true, // Bypass debounce for manual user resend
   });
