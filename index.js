@@ -15281,6 +15281,47 @@ app.post("/login", loginLimiter, async (req, res) => {
 });
 
 /* =========================
+   🔐 VERIFY ADMIN PASSWORD (FOR SENSITIVE OVERRIDES)
+========================= */
+app.post("/auth/verify-password", authMiddleware, async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) {
+      return res.status(400).json({ valid: false, error: "كلمة المرور مطلوبة" });
+    }
+
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ valid: false, error: "غير مصرح" });
+    }
+
+    const result = await pool.query(
+      `SELECT id, username, password, role FROM users WHERE id = $1`,
+      [userId],
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ valid: false, error: "المستخدم غير موجود" });
+    }
+
+    const user = result.rows[0];
+    if (user.role !== "admin") {
+      return res.status(403).json({ valid: false, error: "هذه الصلاحية متاحة للمديرين فقط" });
+    }
+
+    const isMatch = await bcrypt.compare(String(password), user.password);
+    if (!isMatch) {
+      return res.status(400).json({ valid: false, error: "كلمة المرور غير صحيحة" });
+    }
+
+    return res.json({ valid: true, message: "تم التحقق بنجاح" });
+  } catch (err) {
+    console.error("VERIFY PASSWORD ERR:", err.message);
+    res.status(500).json({ valid: false, error: "حدث خطأ أثناء التحقق" });
+  }
+});
+
+/* =========================
    📝 LOG LOGOUT
 ========================= */
 app.post("/logout", authMiddleware, async (req, res) => {
