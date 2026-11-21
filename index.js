@@ -8985,7 +8985,7 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
         return { rows: [] };
       }),
 
-      // 8. Pending Wholesale (Branch 1 only)
+      // 8. Pending Wholesale (Branch 1 only - wholesale invoices created by the current user from retail showroom)
       effectiveBranchId === 1
         ? pool.query(
             `SELECT
@@ -8999,8 +8999,10 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
              WHERE invoice_type = 'wholesale'
                AND payment_status != 'paid'
                AND is_void IS NOT TRUE
+               AND created_by = $1
              ORDER BY id DESC
              LIMIT 50`,
+            [req.user?.id],
           ).catch((err) => {
             console.error("Dashboard Aggregate Pending Wholesale Error:", err);
             return { rows: [] };
