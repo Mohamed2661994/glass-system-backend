@@ -8997,12 +8997,15 @@ app.get("/dashboard/aggregate", authMiddleware, async (req, res) => {
                external_order_id, notes
              FROM invoices
              WHERE invoice_type = 'wholesale'
-               AND payment_status != 'paid'
                AND is_void IS NOT TRUE
                AND created_by = $1
+               AND (
+                 COALESCE(invoice_date, created_at::date) = $2::date
+                 OR payment_status != 'paid'
+               )
              ORDER BY id DESC
-             LIMIT 50`,
-            [req.user?.id],
+             LIMIT 100`,
+            [req.user?.id, date],
           ).catch((err) => {
             console.error("Dashboard Aggregate Pending Wholesale Error:", err);
             return { rows: [] };
