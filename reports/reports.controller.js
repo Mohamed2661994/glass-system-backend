@@ -65,6 +65,7 @@ async function ensureSupplierVerificationsTable() {
 function normalizeSupplierSearchArabic(value) {
   return String(value || "")
     .trim()
+    .replace(/[-\u2013\u2014]/g, " ")
     .replace(/\s+/g, " ")
     .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
     .replace(/[أإآٱ]/g, "ا")
@@ -1818,7 +1819,7 @@ exports.getCustomerDebtDetails = async (req, res) => {
 exports.getSupplierBalances = async (req, res) => {
   try {
     await ensureSupplierAdjustmentsTable();
-    const { supplier_name, warehouse_id, to } = req.query;
+    const { supplier_id, supplier_name, warehouse_id, to } = req.query;
     const safeTo = to && /^\d{4}-\d{2}-\d{2}$/.test(String(to).trim()) ? String(to).trim() : null;
 
     let conditions = [];
@@ -1847,8 +1848,12 @@ exports.getSupplierBalances = async (req, res) => {
       values.push(safeTo);
     }
 
-    if (supplier_name) {
-      const cleanName = String(supplier_name).trim().replace(/\s+/g, " ");
+    if (supplier_id) {
+      const pId = `$${idx++}`;
+      conditions.push(`s.id = ${pId}`);
+      values.push(Number(supplier_id));
+    } else if (supplier_name) {
+      const cleanName = String(supplier_name).trim().replace(/[-\u2013\u2014]/g, " ").replace(/\s+/g, " ");
       if (cleanName) {
         const escapedNorm = normalizeSupplierSearchArabic(cleanName).replace(
           /[\\%_]/g,
@@ -1858,7 +1863,7 @@ exports.getSupplierBalances = async (req, res) => {
         const pNorm = `$${idx++}`;
         const pRaw = `$${idx++}`;
         conditions.push(
-          `(translate(regexp_replace(BTRIM(s.name), '\\s+', ' ', 'g'), 'أإآٱىة', 'اااايه') ILIKE ${pNorm} ESCAPE '\\' OR s.name ILIKE ${pRaw} ESCAPE '\\')`,
+          `(translate(regexp_replace(regexp_replace(BTRIM(s.name), '[-\\u2013\\u2014]', ' ', 'g'), '\\s+', ' ', 'g'), 'أإآٱىة', 'اااايه') ILIKE ${pNorm} ESCAPE '\\' OR s.name ILIKE ${pRaw} ESCAPE '\\')`,
         );
         values.push(`%${escapedNorm}%`, `%${escapedRaw}%`);
       }
