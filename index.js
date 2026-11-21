@@ -6858,7 +6858,7 @@ app.get("/invoices/:id/edit", async (req, res) => {
     const result = await pool.query(
       `
       WITH target_invoice AS (
-        SELECT * FROM invoices WHERE id = $1
+        SELECT ti.*, (SELECT u.branch_id FROM users u WHERE u.id = ti.created_by) AS creator_branch_id FROM invoices ti WHERE ti.id = $1
       ),
       viewer AS (
         SELECT COALESCE(
@@ -6979,6 +6979,8 @@ app.get("/invoices/:id/edit", async (req, res) => {
 
       notes: invoice.notes,
 
+      branch_id: invoice.branch_id ? Number(invoice.branch_id) : null,
+      creator_branch_id: invoice.creator_branch_id ? Number(invoice.creator_branch_id) : null,
       created_by: invoice.created_by,
       created_by_name: invoice.created_by_name,
       updated_by: invoice.updated_by,
@@ -7013,7 +7015,7 @@ app.get("/invoices/:id", async (req, res) => {
     const result = await pool.query(
       `
       WITH target_invoice AS (
-        SELECT * FROM invoices WHERE id = $1
+        SELECT ti.*, (SELECT u.branch_id FROM users u WHERE u.id = ti.created_by) AS creator_branch_id FROM invoices ti WHERE ti.id = $1
       ),
       invoice_lines AS (
         SELECT
@@ -8425,7 +8427,9 @@ app.get("/invoices", async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        id,
+        invoices.id,
+        invoices.branch_id,
+        (SELECT u.branch_id FROM users u WHERE u.id = invoices.created_by) AS creator_branch_id,
         invoice_type,
         movement_type,
         is_return,
