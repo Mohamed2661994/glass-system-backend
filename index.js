@@ -1680,7 +1680,15 @@ pool
   )
 `,
   )
-  .then(() => console.log("✅ user_activity table ready"))
+  .then(() => {
+    console.log("✅ user_activity table ready");
+    return pool.query(`
+      ALTER TABLE user_activity
+        ADD COLUMN IF NOT EXISTS user_agent TEXT,
+        ADD COLUMN IF NOT EXISTS device_info VARCHAR(150);
+    `);
+  })
+  .then(() => console.log("✅ user_activity device columns ready"))
   .catch((e) => console.error("❌ user_activity table error:", e.message));
 
 // � أعمدة تتبع اليوزر في الفواتير
@@ -15229,6 +15237,82 @@ app.get("/system/backup/download/:file", authMiddleware, (req, res) => {
 
 const jwt = require("jsonwebtoken");
 
+/**
+ * 📱 Helper: Parse User-Agent into clean device type, OS, and browser
+ */
+function parseDeviceDetails(ua) {
+  if (!ua || typeof ua !== "string") {
+    return {
+      deviceType: "unknown",
+      deviceLabel: "غير معروف",
+      os: "—",
+      browser: "—",
+      formatted: "غير معروف",
+    };
+  }
+
+  let deviceType = "desktop";
+  let os = "نظام غير معروف";
+  let browser = "متصفح غير معروف";
+
+  // 1. Detect Device & OS
+  if (/iPad/i.test(ua)) {
+    deviceType = "tablet";
+    os = "iPadOS";
+  } else if (/iPhone/i.test(ua)) {
+    deviceType = "mobile";
+    os = "iOS (iPhone)";
+  } else if (/Android/i.test(ua)) {
+    deviceType = /Mobile/i.test(ua) ? "mobile" : "tablet";
+    os = "Android";
+  } else if (/Windows NT 10\.0/i.test(ua)) {
+    deviceType = "desktop";
+    os = "Windows 10/11";
+  } else if (/Windows NT 6\.3/i.test(ua)) {
+    deviceType = "desktop";
+    os = "Windows 8.1";
+  } else if (/Windows NT 6\.1/i.test(ua)) {
+    deviceType = "desktop";
+    os = "Windows 7";
+  } else if (/Windows/i.test(ua)) {
+    deviceType = "desktop";
+    os = "Windows";
+  } else if (/Macintosh|Mac OS X/i.test(ua)) {
+    deviceType = "desktop";
+    os = "macOS";
+  } else if (/Linux/i.test(ua)) {
+    deviceType = "desktop";
+    os = "Linux";
+  }
+
+  // 2. Detect Browser
+  if (/Edg\//i.test(ua)) {
+    browser = "Edge";
+  } else if (/OPR\/|Opera/i.test(ua)) {
+    browser = "Opera";
+  } else if (/Chrome\//i.test(ua) && !/Chromium/i.test(ua)) {
+    browser = /Mobile/i.test(ua) ? "Chrome Mobile" : "Chrome";
+  } else if (/Safari\//i.test(ua) && !/Chrome/i.test(ua)) {
+    browser = /Mobile/i.test(ua) ? "Safari Mobile" : "Safari";
+  } else if (/Firefox\//i.test(ua)) {
+    browser = "Firefox";
+  }
+
+  let deviceLabel = "كمبيوتر";
+  if (deviceType === "mobile") deviceLabel = "موبايل";
+  if (deviceType === "tablet") deviceLabel = "تابلت";
+
+  const formatted = `${deviceLabel} (${os}) • ${browser}`;
+
+  return {
+    deviceType,
+    deviceLabel,
+    os,
+    browser,
+    formatted,
+  };
+}
+
 app.post("/login", loginLimiter, async (req, res) => {
   try {
     const { username: rawUsername, password } = req.body;
@@ -15246,6 +15330,8 @@ app.post("/login", loginLimiter, async (req, res) => {
       req.headers["cf-connecting-ip"] ||
       (req.headers["x-forwarded-for"] ? String(req.headers["x-forwarded-for"]).split(",")[0].trim() : null) ||
       req.ip;
+    const userAgent = req.headers["user-agent"] || "";
+    const deviceInfo = parseDeviceDetails(userAgent).formatted;
 
     const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [
       username,
@@ -15255,9 +15341,9 @@ app.post("/login", loginLimiter, async (req, res) => {
       // 🛡️ تسجيل محاولة دخول فاشلة (مستخدم غير معروف)
       pool
         .query(
-          `INSERT INTO user_activity (user_id, username, action, ip_address)
-           VALUES ($1, $2, 'failed_login', $3)`,
-          [0, username.slice(0, 100), clientIp],
+          `INSERT INTO user_activity (user_id, username, action, ip_address, user_agent, device_info)
+           VALUES ($1, $2, 'failed_login', $3, $4, $5)`,
+          [0, username.slice(0, 100), clientIp, userAgent, deviceInfo],
         )
         .catch(() => {});
 
@@ -15280,9 +15366,9 @@ app.post("/login", loginLimiter, async (req, res) => {
       // 🛡️ تسجيل محاولة دخول فاشلة (كلمة مرور غير صحيحة)
       pool
         .query(
-          `INSERT INTO user_activity (user_id, username, action, ip_address)
-           VALUES ($1, $2, 'failed_login', $3)`,
-          [user.id, user.username, clientIp],
+          `INSERT INTO user_activity (user_id, username, action, ip_address, user_agent, device_info)
+           VALUES ($1, $2, 'failed_login', $3, $4, $5)`,
+          [user.id, user.username, clientIp, userAgent, deviceInfo],
         )
         .catch(() => {});
 
@@ -15317,9 +15403,9 @@ app.post("/login", loginLimiter, async (req, res) => {
     // 📝 تسجيل دخول اليوزر الناجح (بدون انتظار)
     pool
       .query(
-        `INSERT INTO user_activity (user_id, username, action, ip_address)
-       VALUES ($1, $2, 'login', $3)`,
-        [user.id, user.username, clientIp],
+        `INSERT INTO user_activity (user_id, username, action, ip_address, user_agent, device_info)
+       VALUES ($1, $2, 'login', $3, $4, $5)`,
+        [user.id, user.username, clientIp, userAgent, deviceInfo],
       )
       .catch((e) => console.error("LOG LOGIN ERR:", e.message));
   } catch (err) {
@@ -15374,13 +15460,22 @@ app.post("/auth/verify-password", authMiddleware, async (req, res) => {
 ========================= */
 app.post("/logout", authMiddleware, async (req, res) => {
   try {
+    const clientIp =
+      req.headers["cf-connecting-ip"] ||
+      (req.headers["x-forwarded-for"] ? String(req.headers["x-forwarded-for"]).split(",")[0].trim() : null) ||
+      req.ip;
+    const userAgent = req.headers["user-agent"] || "";
+    const deviceInfo = parseDeviceDetails(userAgent).formatted;
+
     await pool.query(
-      `INSERT INTO user_activity (user_id, username, action, ip_address)
-       VALUES ($1, $2, 'logout', $3)`,
+      `INSERT INTO user_activity (user_id, username, action, ip_address, user_agent, device_info)
+       VALUES ($1, $2, 'logout', $3, $4, $5)`,
       [
         req.user.id,
         req.user.username,
-        req.headers["x-forwarded-for"] || req.ip,
+        clientIp,
+        userAgent,
+        deviceInfo,
       ],
     );
     res.json({ success: true });
@@ -15402,7 +15497,7 @@ app.get("/user-activity", authMiddleware, async (req, res) => {
     const { limit = 100, action, search } = req.query;
     const params = [];
     let query = `
-      SELECT id, user_id, username, action, ip_address, created_at
+      SELECT id, user_id, username, action, ip_address, user_agent, device_info, created_at
       FROM user_activity
       WHERE 1=1
     `;
@@ -15414,7 +15509,7 @@ app.get("/user-activity", authMiddleware, async (req, res) => {
 
     if (search && String(search).trim()) {
       params.push(`%${String(search).trim()}%`);
-      query += ` AND (username ILIKE $${params.length} OR ip_address ILIKE $${params.length} OR action ILIKE $${params.length})`;
+      query += ` AND (username ILIKE $${params.length} OR ip_address ILIKE $${params.length} OR action ILIKE $${params.length} OR device_info ILIKE $${params.length})`;
     }
 
     params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
@@ -15428,7 +15523,9 @@ app.get("/user-activity", authMiddleware, async (req, res) => {
           COUNT(CASE WHEN action = 'failed_login' THEN 1 END)::int as failed_logins,
           COUNT(CASE WHEN action = 'login' THEN 1 END)::int as successful_logins,
           COUNT(CASE WHEN action = 'logout' THEN 1 END)::int as logouts,
-          COUNT(DISTINCT ip_address)::int as unique_ips
+          COUNT(DISTINCT ip_address)::int as unique_ips,
+          COUNT(CASE WHEN device_info ILIKE '%موبايل%' OR device_info ILIKE '%mobile%' THEN 1 END)::int as mobile_count,
+          COUNT(CASE WHEN device_info ILIKE '%كمبيوتر%' OR device_info ILIKE '%desktop%' OR device_info ILIKE '%windows%' OR device_info ILIKE '%mac%' THEN 1 END)::int as desktop_count
         FROM user_activity
       `),
     ]);
