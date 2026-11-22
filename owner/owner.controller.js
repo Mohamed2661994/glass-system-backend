@@ -104,14 +104,16 @@ function isOwnerAuthorized(user) {
   );
 }
 
+function shiftIsoDate(isoDate, deltaDays) {
+  const [y, m, d] = String(isoDate).split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return dt.toISOString().slice(0, 10);
+}
+
 /**
  * Resolves Date Range from predefined period or custom inputs
  */
 function resolveDateRange(period, customFrom, customTo) {
-  const now = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-
   if (customFrom && customTo) {
     return {
       period: "custom",
@@ -121,32 +123,64 @@ function resolveDateRange(period, customFrom, customTo) {
     };
   }
 
-  const todayStr = fmt(now);
+  const todayStr = getCairoTodayIso();
 
   if (period === "yesterday") {
-    const y = new Date(now);
-    y.setDate(y.getDate() - 1);
-    const yStr = fmt(y);
+    const yStr = shiftIsoDate(todayStr, -1);
     return { period: "yesterday", from: yStr, to: yStr, label: "أمس" };
   }
 
   if (period === "this_week") {
+    const now = new Date();
     const day = now.getDay(); // 6=Sat, 0=Sun, ...
     const daysSinceSat = (day + 1) % 7;
-    const sat = new Date(now);
-    sat.setDate(now.getDate() - daysSinceSat);
-    return { period: "this_week", from: fmt(sat), to: todayStr, label: "هذا الأسبوع" };
+    return { period: "this_week", from: shiftIsoDate(todayStr, -daysSinceSat), to: todayStr, label: "هذا الأسبوع" };
   }
 
   if (period === "this_month") {
-    const mStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    return { period: "this_month", from: fmt(mStart), to: todayStr, label: "هذا الشهر" };
+    const [y, m] = todayStr.split("-");
+    const mStart = `${y}-${m}-01`;
+    return { period: "this_month", from: mStart, to: todayStr, label: "هذا الشهر" };
   }
 
   if (period === "last_month") {
-    const prevMStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const prevMEnd = new Date(now.getFullYear(), now.getMonth(), 0);
-    return { period: "last_month", from: fmt(prevMStart), to: fmt(prevMEnd), label: "الشهر السابق" };
+    let [y, m] = todayStr.split("-").map(Number);
+    m -= 1;
+    if (m === 0) {
+      m = 12;
+      y -= 1;
+    }
+    const pad = (n) => String(n).padStart(2, "0");
+    const prevMStart = `${y}-${pad(m)}-01`;
+    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    const prevMEnd = `${y}-${pad(m)}-${pad(lastDay)}`;
+    return { period: "last_month", from: prevMStart, to: prevMEnd, label: "الشهر السابق" };
+  }
+
+  // Quick Multi-Horizon Trend Presets (7d, 14d, 30d, 2m, 3m, 6m, 9m, 1y)
+  if (period === "7d" || period === "last_7_days") {
+    return { period: "7d", from: shiftIsoDate(todayStr, -6), to: todayStr, label: "آخر 7 أيام" };
+  }
+  if (period === "14d" || period === "last_14_days") {
+    return { period: "14d", from: shiftIsoDate(todayStr, -13), to: todayStr, label: "آخر 14 يوم" };
+  }
+  if (period === "30d" || period === "last_30_days") {
+    return { period: "30d", from: shiftIsoDate(todayStr, -29), to: todayStr, label: "آخر 30 يوم" };
+  }
+  if (period === "2m" || period === "last_2_months") {
+    return { period: "2m", from: shiftIsoDate(todayStr, -59), to: todayStr, label: "آخر شهرين" };
+  }
+  if (period === "3m" || period === "last_3_months") {
+    return { period: "3m", from: shiftIsoDate(todayStr, -89), to: todayStr, label: "آخر 3 شهور" };
+  }
+  if (period === "6m" || period === "last_6_months") {
+    return { period: "6m", from: shiftIsoDate(todayStr, -179), to: todayStr, label: "آخر 6 شهور" };
+  }
+  if (period === "9m" || period === "last_9_months") {
+    return { period: "9m", from: shiftIsoDate(todayStr, -269), to: todayStr, label: "آخر 9 شهور" };
+  }
+  if (period === "1y" || period === "last_1_year") {
+    return { period: "1y", from: shiftIsoDate(todayStr, -364), to: todayStr, label: "آخر سنة" };
   }
 
   // Default: today
@@ -1128,12 +1162,6 @@ async function getOwnerMetrics(req, res) {
 // 5. EXECUTIVE TRENDS & CURVES ENDPOINT (GET /api/owner/trends)
 //    Returns ALL 3 branch curves ({ all, "1", "2" }) in 1 parallel call for 0ms switching!
 // ============================================================================
-function shiftIsoDate(isoDate, deltaDays) {
-  const [y, m, d] = String(isoDate).split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
-  return dt.toISOString().slice(0, 10);
-}
-
 function diffIsoDays(startIso, endIso) {
   const [y1, m1, d1] = String(startIso).split("-").map(Number);
   const [y2, m2, d2] = String(endIso).split("-").map(Number);
@@ -1216,7 +1244,7 @@ async function getOwnerTrends(req, res) {
     } else {
       const spanDays = Math.max(1, diffIsoDays(dateRange.from, dateRange.to) + 1);
       if (spanDays > 180) granularity = "month";
-      else if (spanDays > 65) granularity = "week";
+      else if (spanDays > 90) granularity = "week";
       else granularity = "day";
     }
 
