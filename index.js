@@ -11804,7 +11804,10 @@ function createAccessError(message, statusCode = 500) {
 }
 
 function isSuperAdmin(user) {
-  return Number(user?.id) === 7;
+  if (!user) return false;
+  const superUsernames = ["Mohamed", "hadysa", "hady", "خالد"];
+  const superIds = [5, 7, 11, 16];
+  return superIds.includes(Number(user.id)) || superUsernames.includes(user.username);
 }
 
 function isAdminUser(user) {
