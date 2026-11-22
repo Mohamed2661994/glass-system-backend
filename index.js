@@ -15231,25 +15231,61 @@ const jwt = require("jsonwebtoken");
 
 app.post("/login", loginLimiter, async (req, res) => {
   try {
-    
+    const { username: rawUsername, password } = req.body;
 
-    const { username, password } = req.body;
+    if (!rawUsername || !password || typeof rawUsername !== "string" || typeof password !== "string") {
+      return res.status(400).json({ error: "يرجى إدخال اسم المستخدم وكلمة المرور" });
+    }
+
+    const username = rawUsername.trim();
+    if (!username || username.length > 100 || password.length > 256) {
+      return res.status(400).json({ error: "بيانات الدخول غير صحيحة" });
+    }
+
+    const clientIp =
+      req.headers["cf-connecting-ip"] ||
+      (req.headers["x-forwarded-for"] ? String(req.headers["x-forwarded-for"]).split(",")[0].trim() : null) ||
+      req.ip;
 
     const result = await pool.query(`SELECT * FROM users WHERE username = $1`, [
       username,
     ]);
 
     if (!result.rows.length) {
+      // 🛡️ تسجيل محاولة دخول فاشلة (مستخدم غير معروف)
+      pool
+        .query(
+          `INSERT INTO user_activity (user_id, username, action, ip_address)
+           VALUES ($1, $2, 'failed_login', $3)`,
+          [0, username.slice(0, 100), clientIp],
+        )
+        .catch(() => {});
+
       return res.status(400).json({ error: "بيانات الدخول غير صحيحة" });
     }
 
     const user = result.rows[0];
+
+    // 🛡️ فحص الحسابات المعطلة إن وُجدت
+    if (user.is_active === false) {
+      return res.status(403).json({ error: "هذا الحساب معطل، يرجى مراجعة الإدارة" });
+    }
+
     const role = user.role === "admin" ? "admin" : "user";
     const permissions = normalizeUserPermissions(user.permissions);
 
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
+      // 🛡️ تسجيل محاولة دخول فاشلة (كلمة مرور غير صحيحة)
+      pool
+        .query(
+          `INSERT INTO user_activity (user_id, username, action, ip_address)
+           VALUES ($1, $2, 'failed_login', $3)`,
+          [user.id, user.username, clientIp],
+        )
+        .catch(() => {});
+
       return res.status(400).json({ error: "بيانات الدخول غير صحيحة" });
     }
 
@@ -15278,12 +15314,12 @@ app.post("/login", loginLimiter, async (req, res) => {
       },
     });
 
-    // 📝 تسجيل دخول اليوزر (بدون انتظار)
+    // 📝 تسجيل دخول اليوزر الناجح (بدون انتظار)
     pool
       .query(
         `INSERT INTO user_activity (user_id, username, action, ip_address)
        VALUES ($1, $2, 'login', $3)`,
-        [user.id, user.username, req.headers["x-forwarded-for"] || req.ip],
+        [user.id, user.username, clientIp],
       )
       .catch((e) => console.error("LOG LOGIN ERR:", e.message));
   } catch (err) {
