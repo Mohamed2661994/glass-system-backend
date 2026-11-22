@@ -15391,19 +15391,52 @@ app.post("/logout", authMiddleware, async (req, res) => {
 });
 
 /* =========================
-   📋 GET USER ACTIVITY LOG
+   📋 GET USER ACTIVITY LOG (DEV DEBUGGING & AUDIT)
 ========================= */
 app.get("/user-activity", authMiddleware, async (req, res) => {
   try {
-    const { limit = 50 } = req.query;
-    const result = await pool.query(
-      `SELECT id, user_id, username, action, ip_address, created_at
-       FROM user_activity
-       ORDER BY created_at DESC
-       LIMIT $1`,
-      [Number(limit)],
-    );
-    res.json(result.rows);
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ error: "غير مصرح - للمديرين فقط" });
+    }
+
+    const { limit = 100, action, search } = req.query;
+    const params = [];
+    let query = `
+      SELECT id, user_id, username, action, ip_address, created_at
+      FROM user_activity
+      WHERE 1=1
+    `;
+
+    if (action && action !== "all") {
+      params.push(action);
+      query += ` AND action = $${params.length}`;
+    }
+
+    if (search && String(search).trim()) {
+      params.push(`%${String(search).trim()}%`);
+      query += ` AND (username ILIKE $${params.length} OR ip_address ILIKE $${params.length} OR action ILIKE $${params.length})`;
+    }
+
+    params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
+    query += ` ORDER BY created_at DESC LIMIT $${params.length}`;
+
+    const [logsResult, statsResult] = await Promise.all([
+      pool.query(query, params),
+      pool.query(`
+        SELECT 
+          COUNT(*)::int as total_logs,
+          COUNT(CASE WHEN action = 'failed_login' THEN 1 END)::int as failed_logins,
+          COUNT(CASE WHEN action = 'login' THEN 1 END)::int as successful_logins,
+          COUNT(CASE WHEN action = 'logout' THEN 1 END)::int as logouts,
+          COUNT(DISTINCT ip_address)::int as unique_ips
+        FROM user_activity
+      `),
+    ]);
+
+    res.json({
+      logs: logsResult.rows,
+      stats: statsResult.rows[0] || {},
+    });
   } catch (err) {
     console.error("GET ACTIVITY ERR:", err);
     res.status(500).json({ error: "فشل تحميل سجل النشاط" });
