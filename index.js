@@ -8238,25 +8238,43 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
   try {
     const customerId = req.params.id;
     const { invoice_type } = req.query;
-    const branch_id = req.user.branch_id;
 
     if (!invoice_type) {
       return res.status(400).json({ error: "invoice_type مطلوب" });
     }
+
+    // Branch scoping:
+    // Wholesale invoices strictly belong to Branch 2 (Wholesale / Main warehouse).
+    // Retail invoices strictly belong to Branch 1 (Showroom).
+    // Allow explicit branch_id override from query if provided.
+    const branch_id = req.query.branch_id
+      ? Number(req.query.branch_id)
+      : invoice_type === "wholesale"
+      ? 2
+      : invoice_type === "retail"
+      ? 1
+      : Number(req.user?.branch_id || 1);
+
+    // Get customer name for payment matching and fallback invoice matching
+    const customerRes = await pool.query(
+      `SELECT name FROM customers WHERE id = $1`,
+      [customerId],
+    );
+    const customerName = customerRes.rows[0]?.name;
 
     // remaining_amount من آخر فاتورة
     const result = await pool.query(
       `
       SELECT remaining_amount
       FROM invoices
-      WHERE customer_id = $1
+      WHERE (customer_id = $1 OR ($4::text IS NOT NULL AND customer_name = $4))
         AND branch_id = $2
         AND invoice_type = $3
         AND is_void = false
       ORDER BY created_at DESC
       LIMIT 1
       `,
-      [customerId, branch_id, invoice_type],
+      [customerId, branch_id, invoice_type, customerName || null],
     );
 
     const lastRemaining = result.rows.length
@@ -8264,12 +8282,6 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
       : 0;
 
     // طرح سندات الدفع بعد آخر فاتورة
-    const customerRes = await pool.query(
-      `SELECT name FROM customers WHERE id = $1`,
-      [customerId],
-    );
-    const customerName = customerRes.rows[0]?.name;
-
     let totalPayments = 0;
     if (customerName) {
       const paymentsRes = await pool.query(
@@ -8282,7 +8294,7 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
           AND created_at > (
             SELECT COALESCE(MAX(created_at), '1970-01-01')
             FROM invoices
-            WHERE customer_id = $3
+            WHERE (customer_id = $3 OR customer_name = $1)
               AND branch_id = $2
               AND invoice_type = $4
               AND is_void = false
