@@ -1,12 +1,20 @@
 const crypto = require("crypto");
 const path = require("path");
-const {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-  DeleteObjectCommand,
-  HeadBucketCommand,
-} = require("@aws-sdk/client-s3");
+let s3Sdk = null;
+function getS3Sdk() {
+  if (!s3Sdk) {
+    try {
+      s3Sdk = require("@aws-sdk/client-s3");
+    } catch (e) {
+      const err = new Error(
+        "خدمة التخزين السحابي غير متاحة: حزمة @aws-sdk/client-s3 غير مثبتة على السيرفر بعد",
+      );
+      err.statusCode = 503;
+      throw err;
+    }
+  }
+  return s3Sdk;
+}
 
 let cachedClient = null;
 let cachedConfigSignature = "";
@@ -48,6 +56,7 @@ function createR2NotConfiguredError() {
 }
 
 function getR2Client() {
+  const { S3Client } = getS3Sdk();
   const cfg = readR2Config();
   if (!cfg.endpoint || !cfg.accessKeyId || !cfg.secretAccessKey || !cfg.bucket) {
     throw createR2NotConfiguredError();
@@ -147,12 +156,14 @@ function computeSha256(buffer) {
 }
 
 async function verifyR2BucketConnection() {
+  const { HeadBucketCommand } = getS3Sdk();
   const { client, bucket } = getR2Client();
   await client.send(new HeadBucketCommand({ Bucket: bucket }));
   return { ok: true, bucket };
 }
 
 async function uploadAttachmentToR2({ objectKey, buffer, contentType, metadata = {} }) {
+  const { PutObjectCommand } = getS3Sdk();
   const { client, bucket } = getR2Client();
   const safeMetadata = {};
   for (const [k, v] of Object.entries(metadata || {})) {
@@ -177,6 +188,7 @@ async function uploadAttachmentToR2({ objectKey, buffer, contentType, metadata =
 }
 
 async function getAttachmentFromR2(objectKey) {
+  const { GetObjectCommand } = getS3Sdk();
   const { client, bucket } = getR2Client();
   const out = await client.send(
     new GetObjectCommand({
@@ -189,6 +201,7 @@ async function getAttachmentFromR2(objectKey) {
 
 async function deleteAttachmentFromR2(objectKey) {
   if (!objectKey) return;
+  const { DeleteObjectCommand } = getS3Sdk();
   const { client, bucket } = getR2Client();
   await client.send(
     new DeleteObjectCommand({
