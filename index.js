@@ -47,10 +47,14 @@ const {
   toEnglishDigits,
   normalizeCustomerSearchText,
   compactText: compactCustomerText,
+  getCustomerCanonicalKey,
   normalizePhoneDigits,
   prepareCustomerForSearch,
   searchAndRankCustomers,
 } = require("./utils/customer-search");
+
+const CUSTOMER_NAME_CANONICAL_SQL = (col) =>
+  `lower(regexp_replace(translate(BTRIM(COALESCE(${col}, '')), 'أإآٱىئؤة', 'ااااييوه'), '[[:space:]/\\\\\\-_,.()ًٌٍَُِّْـ]+', '', 'g'))`;
 
 // VAPID keys for Web Push
 const VAPID_PUBLIC_KEY =
@@ -3767,12 +3771,72 @@ async function getPreparedCustomersForSearch() {
   return customerSearchCachePromise;
 }
 
+/**
+ * Finds a single canonical customer across whitespace, Arabic spelling variants, or preferred ID.
+ */
+async function findCanonicalCustomer(
+  client,
+  rawName,
+  preferredCustomerId = null,
+  excludeCustomerId = null,
+) {
+  const cleanName = normalizeCustomerWhitespace(rawName);
+  if (!cleanName) return null;
+
+  const canonicalKey = getCustomerCanonicalKey(cleanName);
+  const preferredId = Number(preferredCustomerId || 0);
+  const excludeId = Number(excludeCustomerId || 0);
+
+  if (Number.isInteger(preferredId) && preferredId > 0 && preferredId !== excludeId) {
+    const prefRes = await client.query(
+      `SELECT id, name FROM customers WHERE id = $1 LIMIT 1`,
+      [preferredId],
+    );
+    if (
+      prefRes.rows.length > 0 &&
+      canonicalKey &&
+      getCustomerCanonicalKey(prefRes.rows[0].name) === canonicalKey
+    ) {
+      return prefRes.rows[0];
+    }
+  }
+
+  const exactRes = await client.query(
+    `
+    SELECT id, name
+    FROM customers
+    WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1
+      AND ($2::int = 0 OR id <> $2::int)
+    ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END, id ASC
+    LIMIT 1
+    `,
+    [cleanName, Number.isInteger(excludeId) && excludeId > 0 ? excludeId : 0],
+  );
+  if (exactRes.rows.length > 0) {
+    return exactRes.rows[0];
+  }
+
+  if (canonicalKey) {
+    const allRes = await client.query(
+      `SELECT id, name FROM customers WHERE ($1::int = 0 OR id <> $1::int) ORDER BY id ASC`,
+      [Number.isInteger(excludeId) && excludeId > 0 ? excludeId : 0],
+    );
+    const matched = allRes.rows.find(
+      (row) => getCustomerCanonicalKey(row.name) === canonicalKey,
+    );
+    if (matched) return matched;
+  }
+
+  return null;
+}
+
 async function resolveCustomerForInvoice(
   client,
   rawName,
   customerPhone,
   invoiceType,
   applyItemsDiscount = null,
+  preferredCustomerId = null,
 ) {
   const cleanName = normalizeCustomerWhitespace(rawName);
   const cleanPhone = normalizeCustomerWhitespace(toEnglishDigits(customerPhone || ""));
@@ -3781,25 +3845,39 @@ async function resolveCustomerForInvoice(
     return { id: null, name: null, isNew: false };
   }
 
+  const canonicalKey = getCustomerCanonicalKey(cleanName);
   let customerId = null;
   let resolvedName = cleanName;
   let isNew = false;
 
-  const existingCustomer = await client.query(
-    `
-    SELECT id, name
-    FROM customers
-    WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1
-    ORDER BY CASE WHEN name = $1 THEN 0 ELSE 1 END, id ASC
-    LIMIT 1
-    `,
-    [cleanName],
+  let existingRow = await findCanonicalCustomer(
+    client,
+    cleanName,
+    preferredCustomerId,
   );
 
-  if (existingCustomer.rows.length > 0) {
-    customerId = existingCustomer.rows[0].id;
-    resolvedName =
-      normalizeCustomerWhitespace(existingCustomer.rows[0].name) || cleanName;
+  // Serialize creation per canonical key inside transaction to avoid concurrent duplicate rows
+  if (!existingRow && canonicalKey) {
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('cust_norm:' || $1))`,
+      [canonicalKey],
+    );
+    existingRow = await findCanonicalCustomer(
+      client,
+      cleanName,
+      preferredCustomerId,
+    );
+  }
+
+  if (existingRow) {
+    customerId = existingRow.id;
+    resolvedName = normalizeCustomerWhitespace(existingRow.name) || cleanName;
+    if (existingRow.name !== resolvedName) {
+      await client.query(`UPDATE customers SET name = $1 WHERE id = $2`, [
+        resolvedName,
+        customerId,
+      ]);
+    }
     if (applyItemsDiscount !== undefined && applyItemsDiscount !== null) {
       await client.query(
         `UPDATE customers SET apply_items_discount = $1 WHERE id = $2`,
@@ -4026,13 +4104,10 @@ app.put("/customers/:id", async (req, res) => {
       if (!cleanName) {
         return res.status(400).json({ error: "الاسم مطلوب" });
       }
-      const dupCheck = await pool.query(
-        `SELECT id, name FROM customers WHERE regexp_replace(BTRIM(name), '\\s+', ' ', 'g') = $1 AND id <> $2 LIMIT 1`,
-        [cleanName, id],
-      );
-      if (dupCheck.rows.length > 0) {
+      const dupCustomer = await findCanonicalCustomer(pool, cleanName, null, id);
+      if (dupCustomer) {
         return res.status(409).json({
-          error: `يوجد عميل آخر مسجل بنفس الاسم (${dupCheck.rows[0].name})`,
+          error: `يوجد عميل آخر مسجل بنفس الاسم (${dupCustomer.name})`,
         });
       }
       params.push(cleanName);
@@ -4054,6 +4129,8 @@ app.put("/customers/:id", async (req, res) => {
       params,
     );
     invalidateCustomerSearchCache();
+    invalidateCustomerBalancesCache();
+    ownerController.invalidateOwnerFastCache();
     res.json({ success: true });
   } catch (err) {
     console.error(err);
@@ -5281,7 +5358,7 @@ app.post("/invoices", authMiddleware, async (req, res) => {
     const warehouseId = getWarehouseIdByInvoiceType(invoice_type);
 
     // 🚀 Parallel pre-fetch: duplicate check (works for both NULL customer_name purchase invoices and sale invoices)
-    const [checkExisting, customerId, normalizedItems, supplierResolution] = await Promise.all([
+    const [checkExisting, customerResolution, normalizedItems, supplierResolution] = await Promise.all([
       client.query(
         `SELECT id FROM invoices
          WHERE customer_name IS NOT DISTINCT FROM $1
@@ -5299,9 +5376,10 @@ app.post("/invoices", authMiddleware, async (req, res) => {
           customer_phone,
           invoice_type,
           apply_items_discount,
+          req.body.customer_id || null,
         );
         if (custRes.isNew) res.locals.emitCustomersUpdate = true;
-        return custRes.id;
+        return custRes;
       })(),
       normalizeInvoiceItemsForStorage(items, invoice_type, client),
       (async () => {
@@ -5317,6 +5395,8 @@ app.post("/invoices", authMiddleware, async (req, res) => {
         );
       })(),
     ]);
+    const customerId = customerResolution.id;
+    const resolvedCustomerName = customerResolution.name || customer_name || null;
     const supplierId = supplierResolution.id;
     const resolvedSupplierName = supplierResolution.name;
 
@@ -5364,7 +5444,7 @@ VALUES
         movement_type,
         invoice_date || getCairoDate(),
         customerId,
-        customer_name,
+        resolvedCustomerName,
         customer_phone,
         Number(previous_balance) || 0,
         Number(additional_amount) || 0,
@@ -5567,12 +5647,13 @@ VALUES
         : `فاتورة جملة رقم #${invoiceId}`;
       await client.query(
         `INSERT INTO cash_in 
-         (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'invoice', $8)`,
+         (branch_id, invoice_id, customer_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'invoice', $9)`,
         [
           branch_id,
           invoiceId,
-          customer_name || "عميل نقدي",
+          customerId,
+          resolvedCustomerName || "عميل نقدي",
           total,
           paid_amount,
           remaining_amount,
@@ -5770,7 +5851,7 @@ app.post("/invoices/retail", async (req, res) => {
     const warehouseId = getWarehouseIdByInvoiceType("retail");
 
     // 🚀 Parallel pre-fetch: duplicate submit guard, customer, supplier, and normalized items simultaneously
-    const [checkRetailDup, customerId, normalizedItems, supplierResolution] = await Promise.all([
+    const [checkRetailDup, customerResolution, normalizedItems, supplierResolution] = await Promise.all([
       client.query(
         `SELECT id FROM invoices
          WHERE invoice_type = 'retail'
@@ -5789,9 +5870,10 @@ app.post("/invoices/retail", async (req, res) => {
           customer_phone,
           "retail",
           apply_items_discount,
+          req.body.customer_id || null,
         );
         if (custRes.isNew) res.locals.emitCustomersUpdate = true;
-        return custRes.id;
+        return custRes;
       })(),
       normalizeInvoiceItemsForStorage(items, "retail", client),
       (async () => {
@@ -5808,6 +5890,8 @@ app.post("/invoices/retail", async (req, res) => {
         duplicate_invoice_id: checkRetailDup.rows[0].id,
       });
     }
+    const customerId = customerResolution.id;
+    const resolvedCustomerName = customerResolution.name || customer_name || null;
     const supplierId = supplierResolution.id;
     const resolvedSupplierName = supplierResolution.name;
 
@@ -5849,7 +5933,7 @@ app.post("/invoices/retail", async (req, res) => {
         movement_type,
         invoice_date || getCairoDate(),
         customerId,
-        customer_name,
+        resolvedCustomerName,
         customer_phone,
         Number(previous_balance) || 0,
         Number(total_before_discount),
@@ -5994,12 +6078,13 @@ app.post("/invoices/retail", async (req, res) => {
         : `فاتورة قطاعي رقم #${invoiceId}`;
       await client.query(
         `INSERT INTO cash_in 
-         (branch_id, invoice_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'invoice', $8)`,
+         (branch_id, invoice_id, customer_id, customer_name, amount, paid_amount, remaining_amount, description, source_type, transaction_date)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'invoice', $9)`,
         [
           branch_id,
           invoiceId,
-          customer_name || "عميل نقدي",
+          customerId,
+          resolvedCustomerName || "عميل نقدي",
           Number(final_total),
           Number(paid_amount),
           remaining_amount,
@@ -6311,6 +6396,7 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
       remaining_amount <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
     let customerId = null;
+    let resolvedCustomerName = customer_name;
     if (customer_name?.trim()) {
       const custRes = await resolveCustomerForInvoice(
         client,
@@ -6318,8 +6404,10 @@ app.put("/invoices/retail/:id", authMiddleware, async (req, res) => {
         customer_phone,
         "retail",
         apply_items_discount,
+        req.body.customer_id || null,
       );
       customerId = custRes.id;
+      resolvedCustomerName = custRes.name || customer_name;
       if (custRes.isNew) res.locals.emitCustomersUpdate = true;
     }
 
@@ -6365,7 +6453,7 @@ WHERE id = $14
 RETURNING invoice_revision
       `,
       [
-        customer_name,
+        resolvedCustomerName,
         customer_phone || null,
         prevBalance,
         subtotal,
@@ -6400,7 +6488,7 @@ RETURNING invoice_revision
         branchId: 1,
         invoiceType: "retail",
         customerId,
-        customerName: customer_name,
+        customerName: resolvedCustomerName,
         totalAmount: totalWithPrevious,
         paidAmount: Number(paid_amount || 0),
         remainingAmount: remaining_amount,
@@ -7470,6 +7558,7 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
       remaining <= 0 ? "paid" : paid_amount > 0 ? "partial" : "unpaid";
 
     let customerId = null;
+    let resolvedCustomerName = customer_name;
     if (customer_name?.trim()) {
       const custRes = await resolveCustomerForInvoice(
         client,
@@ -7477,8 +7566,10 @@ app.put("/invoices/:id", authMiddleware, async (req, res) => {
         customer_phone,
         invoice_type,
         apply_items_discount,
+        req.body.customer_id || null,
       );
       customerId = custRes.id;
+      resolvedCustomerName = custRes.name || customer_name;
       if (custRes.isNew) res.locals.emitCustomersUpdate = true;
     }
 
@@ -7532,7 +7623,7 @@ SET
       RETURNING invoice_revision
   `,
       [
-        customer_name,
+        resolvedCustomerName,
         customer_phone || null,
         Number(previous_balance || 0),
         Number(additional_amount || 0),
@@ -7568,7 +7659,7 @@ SET
         branchId: 2,
         invoiceType: invoice_type,
         customerId,
-        customerName: customer_name,
+        customerName: resolvedCustomerName,
         totalAmount: totalWithPrevious,
         paidAmount: Number(paid_amount || 0),
         remainingAmount: remaining,
@@ -8190,16 +8281,28 @@ app.get("/customers/:id/last-balance", async (req, res) => {
   const { id } = req.params;
 
   try {
+    const customerRes = await pool.query(
+      `SELECT name FROM customers WHERE id = $1`,
+      [id],
+    );
+    const customerName = customerRes.rows[0]?.name || null;
+    const customerCanonicalKey = customerName
+      ? getCustomerCanonicalKey(customerName)
+      : "";
+
     const result = await pool.query(
       `
       SELECT remaining_amount
       FROM invoices
-      WHERE customer_id = $1
+      WHERE (
+          customer_id = $1
+          OR ($2::text <> '' AND ${CUSTOMER_NAME_CANONICAL_SQL("customer_name")} = $2)
+        )
         AND is_void = false
       ORDER BY created_at DESC
       LIMIT 1
       `,
-      [id],
+      [id, customerCanonicalKey],
     );
 
     const lastRemaining = result.rows.length
@@ -8207,28 +8310,29 @@ app.get("/customers/:id/last-balance", async (req, res) => {
       : 0;
 
     // طرح سندات الدفع بعد آخر فاتورة
-    const customerRes = await pool.query(
-      `SELECT name FROM customers WHERE id = $1`,
-      [id],
-    );
-    const customerName = customerRes.rows[0]?.name;
-
     let totalPayments = 0;
-    if (customerName) {
+    if (customerName || customerCanonicalKey) {
       const paymentsRes = await pool.query(
         `
         SELECT COALESCE(SUM(amount), 0) AS total_payments
         FROM cash_in
         WHERE source_type = 'customer_payment'
-          AND customer_name = $1
+          AND (
+            customer_id = $2
+            OR ($1::text IS NOT NULL AND customer_name = $1)
+            OR ($3::text <> '' AND ${CUSTOMER_NAME_CANONICAL_SQL("customer_name")} = $3)
+          )
           AND created_at > (
             SELECT COALESCE(MAX(created_at), '1970-01-01')
             FROM invoices
-            WHERE customer_id = $2
+            WHERE (
+                customer_id = $2
+                OR ($3::text <> '' AND ${CUSTOMER_NAME_CANONICAL_SQL("customer_name")} = $3)
+              )
               AND is_void = false
           )
         `,
-        [customerName, id],
+        [customerName, id, customerCanonicalKey],
       );
       totalPayments = Number(paymentsRes.rows[0].total_payments);
     }
@@ -8268,21 +8372,28 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
       `SELECT name FROM customers WHERE id = $1`,
       [customerId],
     );
-    const customerName = customerRes.rows[0]?.name;
+    const customerName = customerRes.rows[0]?.name || null;
+    const customerCanonicalKey = customerName
+      ? getCustomerCanonicalKey(customerName)
+      : "";
 
     // remaining_amount من آخر فاتورة
     const result = await pool.query(
       `
       SELECT remaining_amount
       FROM invoices
-      WHERE (customer_id = $1 OR ($4::text IS NOT NULL AND customer_name = $4))
+      WHERE (
+          customer_id = $1
+          OR ($4::text IS NOT NULL AND customer_name = $4)
+          OR ($5::text <> '' AND ${CUSTOMER_NAME_CANONICAL_SQL("customer_name")} = $5)
+        )
         AND branch_id = $2
         AND invoice_type = $3
         AND is_void = false
       ORDER BY created_at DESC
       LIMIT 1
       `,
-      [customerId, branch_id, invoice_type, customerName || null],
+      [customerId, branch_id, invoice_type, customerName, customerCanonicalKey],
     );
 
     const lastRemaining = result.rows.length
@@ -8291,24 +8402,32 @@ app.get("/customers/:id/balance", authMiddleware, async (req, res) => {
 
     // طرح سندات الدفع بعد آخر فاتورة
     let totalPayments = 0;
-    if (customerName) {
+    if (customerName || customerCanonicalKey) {
       const paymentsRes = await pool.query(
         `
         SELECT COALESCE(SUM(amount), 0) AS total_payments
         FROM cash_in
         WHERE source_type = 'customer_payment'
-          AND customer_name = $1
+          AND (
+            customer_id = $3
+            OR ($1::text IS NOT NULL AND customer_name = $1)
+            OR ($5::text <> '' AND ${CUSTOMER_NAME_CANONICAL_SQL("customer_name")} = $5)
+          )
           AND branch_id = $2
           AND created_at > (
             SELECT COALESCE(MAX(created_at), '1970-01-01')
             FROM invoices
-            WHERE (customer_id = $3 OR customer_name = $1)
+            WHERE (
+                customer_id = $3
+                OR ($1::text IS NOT NULL AND customer_name = $1)
+                OR ($5::text <> '' AND ${CUSTOMER_NAME_CANONICAL_SQL("customer_name")} = $5)
+              )
               AND branch_id = $2
               AND invoice_type = $4
               AND is_void = false
           )
         `,
-        [customerName, branch_id, customerId, invoice_type],
+        [customerName, branch_id, customerId, invoice_type, customerCanonicalKey],
       );
       totalPayments = Number(paymentsRes.rows[0].total_payments);
     }
@@ -12362,8 +12481,8 @@ app.get("/cash/opening-balance", authMiddleware, async (req, res) => {
              AND (
                $3::boolean = false 
                OR ci.customer_name IS NULL 
-               OR REPLACE(LOWER(TRIM(ci.customer_name)), ' ', '') NOT IN (
-                 SELECT REPLACE(LOWER(TRIM(name)), ' ', '') FROM customers WHERE is_market_customer = true
+               OR ${CUSTOMER_NAME_CANONICAL_SQL("ci.customer_name")} NOT IN (
+                 SELECT ${CUSTOMER_NAME_CANONICAL_SQL("name")} FROM customers WHERE is_market_customer = true
                )
              )
           ), 0
@@ -12665,6 +12784,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     const branch_id = req.user.branch_id; // 🔐
     const {
       transaction_date,
+      customer_id: bodyCustomerId,
       customer_name,
       description,
       amount,
@@ -12679,6 +12799,24 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
         .json({ error: "بيانات غير مكتملة", body: req.body });
     }
 
+    let resolvedCustomerId = null;
+    let resolvedCustomerName =
+      normalizeCustomerWhitespace(customer_name) ||
+      (source_type === "warehouse_settlement" ? "سداد للمعرض" : "وارد يدوي");
+
+    if (source_type === "customer_payment" && customer_name?.trim()) {
+      const matchedCust = await findCanonicalCustomer(
+        pool,
+        customer_name,
+        bodyCustomerId || null,
+      );
+      if (matchedCust) {
+        resolvedCustomerId = matchedCust.id;
+        resolvedCustomerName =
+          normalizeCustomerWhitespace(matchedCust.name) || resolvedCustomerName;
+      }
+    }
+
     const result = await pool.query(
       `
   INSERT INTO cash_in
@@ -12686,6 +12824,7 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     branch_id,
     transaction_date,
     source_type,
+    customer_id,
     customer_name,
     description,
     amount,
@@ -12698,12 +12837,13 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
     $1::integer,
     $2::date,
     $3::varchar,
-    $4::varchar,
-    $5::text,
-    $6::numeric,
+    $4::integer,
+    $5::varchar,
+    $6::text,
     $7::numeric,
     $8::numeric,
-    $9::text
+    $9::numeric,
+    $10::text
   )
   RETURNING id
   `,
@@ -12711,12 +12851,13 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
         Number(branch_id), // 1
         transaction_date || getCairoDate(), // 2
         source_type || "manual", // 3
-        customer_name || (source_type === "warehouse_settlement" ? "سداد للمعرض" : "وارد يدوي"), // 4
-        description || "", // 5
-        Number(amount), // 6
+        resolvedCustomerId, // 4
+        resolvedCustomerName, // 5
+        description || "", // 6
         Number(amount), // 7
-        Number(branch_id) === 1 && remaining_amount !== undefined ? Number(remaining_amount) : 0, // 8
-        notes || null, // 9
+        Number(amount), // 8
+        Number(branch_id) === 1 && remaining_amount !== undefined ? Number(remaining_amount) : 0, // 9
+        notes || null, // 10
       ],
     );
 
@@ -12877,10 +13018,21 @@ app.put("/cash-in/:id", authMiddleware, async (req, res) => {
         [transaction_date, id, branch_id],
       );
     } else {
+      let resolvedCustomerId = null;
+      let resolvedCustomerName = normalizeCustomerWhitespace(customer_name) || customer_name;
+      if (sourceType === "customer_payment" && customer_name?.trim()) {
+        const matchedCust = await findCanonicalCustomer(client, customer_name);
+        if (matchedCust) {
+          resolvedCustomerId = matchedCust.id;
+          resolvedCustomerName =
+            normalizeCustomerWhitespace(matchedCust.name) || resolvedCustomerName;
+        }
+      }
       await client.query(
         `
         UPDATE cash_in
         SET
+          customer_id = COALESCE($7, customer_id),
           customer_name = $1,
           description = $2,
           amount = $3,
@@ -12889,12 +13041,13 @@ app.put("/cash-in/:id", authMiddleware, async (req, res) => {
         WHERE id = $5 AND branch_id = $6
         `,
         [
-          customer_name,
+          resolvedCustomerName,
           description,
           Number(amount),
           transaction_date,
           id,
           branch_id,
+          resolvedCustomerId,
         ],
       );
     }

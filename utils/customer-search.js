@@ -32,6 +32,14 @@ function compactText(normalized) {
   return String(normalized || "").replace(/\s+/g, "");
 }
 
+/**
+ * Canonical deduplication key for customer names across branches and Arabic spellings.
+ * Normalizes letters (أإآٱ->ا, ىئ->ي, ة->ه, ؤ->و), strips diacritics & punctuation, and removes spaces.
+ */
+function getCustomerCanonicalKey(value) {
+  return compactText(normalizeCustomerSearchText(value));
+}
+
 function normalizePhoneDigits(value) {
   return toEnglishDigits(value).replace(/[^\d]/g, "");
 }
@@ -438,6 +446,7 @@ module.exports = {
   toEnglishDigits,
   normalizeCustomerSearchText,
   compactText,
+  getCustomerCanonicalKey,
   normalizePhoneDigits,
   enToArKeyboard,
   damerauLevenshtein,

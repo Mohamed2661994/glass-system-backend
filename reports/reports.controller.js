@@ -4,6 +4,7 @@ const {
   getLowStockReorderSummary,
   getLowStockReorderList,
 } = require("../services/lowStockReorder.service");
+const { getCustomerCanonicalKey } = require("../utils/customer-search");
 
 async function ensureInvoiceItemsCostPriceColumn() {
   // Column cost_price already exists in schema - avoid unnecessary DDL locks/permission errors
@@ -1320,8 +1321,10 @@ const normalizeArabic = (text) => {
     .replace(/[\u064B-\u065F]/g, "");
 };
 
-const getCustomerLookupKey = (value) =>
-  normalizeArabic((value || "").toLowerCase().replace(/\s+/g, ""));
+const getCustomerLookupKey = (value) => getCustomerCanonicalKey(value);
+
+const sqlCustomerCanonicalExpr = (col) =>
+  `lower(regexp_replace(translate(BTRIM(COALESCE(${col}, '')), 'أإآٱىئؤة', 'ااااييوه'), '[[:space:]/\\\\\\-_,.()ًٌٍَُِّْـ]+', '', 'g'))`;
 
 const toNumber = (v) => {
   const n = Number(v ?? 0);
@@ -1636,17 +1639,26 @@ exports.getCustomerDebtDetails = async (req, res) => {
       return res.status(400).json({ error: "customer_name مطلوب" });
     }
 
+    const targetKey = getCustomerLookupKey(customer_name);
+    if (!targetKey) {
+      return res.json([]);
+    }
+
     let invoiceConditions = [
-      "(i.customer_name = $1 OR REPLACE(REPLACE(TRIM(i.customer_name), 'ى', 'ي'), 'ة', 'ه') = REPLACE(REPLACE(TRIM($1), 'ى', 'ي'), 'ة', 'ه'))",
+      "i.customer_name IS NOT NULL",
+      "BTRIM(i.customer_name) <> ''",
+      `(${sqlCustomerCanonicalExpr("i.customer_name")} = $1)`,
       "i.movement_type = 'sale'",
       "i.is_void = false",
     ];
     let paymentConditions = [
       "cp.source_type = 'customer_payment'",
-      "(cp.customer_name = $1 OR REPLACE(REPLACE(TRIM(cp.customer_name), 'ى', 'ي'), 'ة', 'ه') = REPLACE(REPLACE(TRIM($1), 'ى', 'ي'), 'ة', 'ه'))",
+      "cp.customer_name IS NOT NULL",
+      "BTRIM(cp.customer_name) <> ''",
+      `(${sqlCustomerCanonicalExpr("cp.customer_name")} = $1)`,
     ];
 
-    let values = [customer_name];
+    let values = [targetKey];
     let idx = 2;
 
     if (from) {
