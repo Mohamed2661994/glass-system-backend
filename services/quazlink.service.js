@@ -16,6 +16,7 @@
 
 const https = require('https');
 const pool = require('../db');
+const { getCustomerCanonicalKey } = require('../utils/customer-search');
 
 const QUAZLINK_CONFIG = {
   apiUrl: process.env.QUAZLINK_API_URL || 'https://api.quazlink.site/api/integrations/whatsapp/send',
@@ -27,8 +28,29 @@ const QUAZLINK_CONFIG = {
   channelUrl: process.env.QUAZLINK_CHANNEL_URL || 'https://whatsapp.com/channel/0029Vavz4EY6GcGG3Sl9Ez21',
 };
 
-// Memory cache for debounce/anti-spam (stores invoiceId -> lastSentTimestamp)
+// Memory cache for debounce/anti-spam (stores invoiceId / paymentId -> lastSentTimestamp)
 const recentSendsCache = new Map();
+const recentPaymentSendsCache = new Map();
+let cashInWhatsappColsReady = false;
+
+const CUSTOMER_NAME_CANONICAL_SQL = (col) =>
+  `lower(regexp_replace(translate(BTRIM(COALESCE(${col}, '')), 'أإآٱىئؤة', 'ااااييوه'), '[[:space:]/\\\\\\-_,.()ًٌٍَُِّْـ]+', '', 'g'))`;
+
+async function ensureCashInWhatsAppColumns() {
+  if (cashInWhatsappColsReady) return;
+  try {
+    await pool.query(`
+      ALTER TABLE cash_in
+        ADD COLUMN IF NOT EXISTS whatsapp_status VARCHAR(20),
+        ADD COLUMN IF NOT EXISTS whatsapp_phone VARCHAR(30),
+        ADD COLUMN IF NOT EXISTS whatsapp_sent_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS whatsapp_error TEXT
+    `);
+    cashInWhatsappColsReady = true;
+  } catch (err) {
+    console.warn('[QuazLink] Could not ensure cash_in WhatsApp columns:', err.message);
+  }
+}
 
 /**
  * Mask phone number for secure logging (e.g. 01019078440 -> 0101***8440)
@@ -397,6 +419,196 @@ function buildLinksBlock({ isNewCustomer, isWholesale, website, channelUrl }) {
   return `🌐 تصفح أحدث تشكيلاتنا على موقعنا:\n${targetWebsite}`;
 }
 
+function formatCustomerDisplayName(customerName) {
+  if (customerName && customerName.trim()) {
+    const rawName = customerName.trim();
+    const cleanedName = rawName.replace(
+      /^(أ\s*[\/\.]|أستاذ\s*[\/\.]?|الاستاذ\s*[\/\.]?|الأستاذ\s*[\/\.]?)\s*/i,
+      ''
+    );
+    return `أ / ${cleanedName}`;
+  }
+  return 'عميلنا العزيز';
+}
+
+function formatPaymentDateForDisplay(dateVal) {
+  if (!dateVal) {
+    return new Date().toLocaleDateString('en-GB', { timeZone: 'Africa/Cairo' });
+  }
+  const str = String(dateVal).trim().substring(0, 10);
+  const parts = str.split('-');
+  if (parts.length === 3) {
+    return `${parts[2]}/${parts[1]}/${parts[0]}`;
+  }
+  return str;
+}
+
+const RETAIL_PAYMENT_TEMPLATES = [
+  (displayName, paymentBlock, linksBlock) => `*آل عاشور عدس | House of Glass* ✨
+أهلاً بك يا ${displayName}، تم استلام دفعتك بنجاح! 🤝
+
+${paymentBlock}
+
+${linksBlock}
+
+شكراً لثقتك وتعاملك الدائم معنا! 🌟`,
+
+  (displayName, paymentBlock, linksBlock) => `*آل عاشور عدس | House of Glass* 💐
+شكراً لك يا ${displayName}، تم قيد دفعتك في حسابك بنجاح! ✅
+
+${paymentBlock}
+
+${linksBlock}
+
+سعداء بخدمتك دائماً ونتطلع لزيارتك القادمة! ✨`,
+
+  (displayName, paymentBlock, linksBlock) => `*آل عاشور عدس | House of Glass* 💎
+تحياتنا يا ${displayName}، إليك تفاصيل سند الدفع وتحديث حسابك:
+
+${paymentBlock}
+
+${linksBlock}
+
+في خدمتك دائماً بكل سرور! 🌟`,
+];
+
+const WHOLESALE_PAYMENT_TEMPLATES = [
+  (displayName, paymentBlock, linksBlock) => `*آل عاشور عدس | كبار العملاء والجملة* 🤝
+تحياتنا لك يا ${displayName}، تم إضافة دفعتك في كشف الحساب بنجاح:
+
+${paymentBlock}
+
+${linksBlock}
+
+بالبركة إن شاء الله، وفي خدمتك دائماً لأي طلبيات! 🚚`,
+
+  (displayName, paymentBlock, linksBlock) => `*آل عاشور عدس | قسم الجملة* 💎
+أهلاً بك يا ${displayName}، تم استلام وتأكيد دفعتك بنجاح:
+
+${paymentBlock}
+
+${linksBlock}
+
+شاكرين لتعاملكم الراقي وثقتكم الدائمة بنا! 🤝`,
+
+  (displayName, paymentBlock, linksBlock) => `*آل عاشور عدس | كبار العملاء والجملة* 📋
+بيان سند دفع للعميل: ${displayName} 💐
+
+${paymentBlock}
+
+${linksBlock}
+
+نتمنى لك موسماً مباركاً ومبيعات موفقة! ✨`,
+];
+
+function buildCustomerPaymentBlock({
+  cashInId,
+  branchId,
+  transactionDate,
+  previousBalance,
+  paidAmount,
+  remainingBalance,
+  description,
+  currency = 'ج.م',
+}) {
+  const numPaid = Math.max(0, Number(paidAmount || 0));
+  const branchLabel = Number(branchId) === 2 ? 'فرع الجملة' : 'فرع القطاعي';
+  const formattedDate = formatPaymentDateForDisplay(transactionDate);
+
+  const lines = [
+    `🧾 *سند دفع عميل:* #${cashInId} (${branchLabel})`,
+    `📅 *التاريخ:* ${formattedDate}`,
+  ];
+
+  const hasPrevious =
+    previousBalance !== undefined &&
+    previousBalance !== null &&
+    Number.isFinite(Number(previousBalance));
+  const numPrevious = hasPrevious ? Number(previousBalance) : 0;
+
+  if (hasPrevious && Math.abs(numPrevious) > 0.01) {
+    if (numPrevious > 0) {
+      lines.push(`⚖️ *الحساب السابق (عليك):* ${formatAmount(numPrevious)} ${currency}`);
+    } else {
+      lines.push(`⚖️ *رصيد سابق (لك):* ${formatAmount(Math.abs(numPrevious))} ${currency}`);
+    }
+  }
+
+  lines.push(`💵 *المبلغ المدفوع:* ${formatAmount(numPaid)} ${currency}`);
+
+  const hasRemaining =
+    remainingBalance !== undefined &&
+    remainingBalance !== null &&
+    Number.isFinite(Number(remainingBalance));
+  if (hasRemaining) {
+    const numRemaining = Math.round(Number(remainingBalance) * 100) / 100;
+    if (numRemaining > 0.01) {
+      lines.push(`⏳ *المتبقي عليك:* ${formatAmount(numRemaining)} ${currency}`);
+    } else if (numRemaining < -0.01) {
+      lines.push(`💚 *رصيد دائن (لك):* ${formatAmount(Math.abs(numRemaining))} ${currency}`);
+    } else {
+      lines.push(`✅ *حالة الحساب:* خالص بالكامل (المتبقي: 0 ${currency})`);
+    }
+  }
+
+  const cleanDesc = String(description || '')
+    .replace(/\{\{discount_diff\}\}/gi, '')
+    .trim();
+  if (cleanDesc) {
+    lines.push(`📝 *البيان:* ${cleanDesc}`);
+  }
+
+  return lines.join('\n');
+}
+
+function buildCustomerPaymentMessage({
+  cashInId,
+  branchId = 1,
+  customerName,
+  transactionDate,
+  previousBalance,
+  paidAmount,
+  remainingBalance,
+  description,
+  currency = 'ج.م',
+  isNewCustomer = false,
+  templateIndex = null,
+}) {
+  const displayName = formatCustomerDisplayName(customerName);
+  const isWholesale = Number(branchId) === 2;
+  const paymentBlock = buildCustomerPaymentBlock({
+    cashInId,
+    branchId,
+    transactionDate,
+    previousBalance,
+    paidAmount,
+    remainingBalance,
+    description,
+    currency,
+  });
+
+  const linksBlock = buildLinksBlock({
+    isNewCustomer,
+    isWholesale,
+    website: QUAZLINK_CONFIG.websiteUrl,
+    channelUrl: QUAZLINK_CONFIG.channelUrl,
+  });
+
+  const poolTemplates = isWholesale ? WHOLESALE_PAYMENT_TEMPLATES : RETAIL_PAYMENT_TEMPLATES;
+  const selectedIndex =
+    templateIndex !== null && templateIndex >= 0 && templateIndex < poolTemplates.length
+      ? templateIndex
+      : Math.floor(Math.random() * poolTemplates.length);
+  const selectedTemplate = poolTemplates[selectedIndex];
+
+  return {
+    voucherNumber: `PAY-${cashInId}`,
+    displayName,
+    templateIndex: selectedIndex,
+    message: selectedTemplate(displayName, paymentBlock, linksBlock),
+  };
+}
+
 /**
  * Pure helper to compose the complete WhatsApp message (also usable for dry-run previews/tests).
  */
@@ -418,12 +630,7 @@ function buildInvoiceMessage({
   templateIndex = null,
 }) {
   const invoiceNumber = `INV-${invoiceId}`;
-  let displayName = 'عميلنا العزيز';
-  if (customerName && customerName.trim()) {
-    const rawName = customerName.trim();
-    const cleanedName = rawName.replace(/^(أ\s*[\/\.]|أستاذ\s*[\/\.]?|الاستاذ\s*[\/\.]?|الأستاذ\s*[\/\.]?)\s*/i, '');
-    displayName = `أ / ${cleanedName}`;
-  }
+  const displayName = formatCustomerDisplayName(customerName);
 
   const isWholesale = invoiceType === 'wholesale';
   const financialBlock = buildFinancialBlock({
@@ -762,9 +969,431 @@ async function resendInvoiceWhatsApp(invoiceId, userId = null) {
   return result;
 }
 
+async function resolveCustomerPhone({ customerId, customerName, explicitPhone }) {
+  const direct = normalizeEgyptianPhone(explicitPhone);
+  if (direct) return direct;
+
+  let resolvedCustId = customerId ? Number(customerId) : null;
+
+  if (resolvedCustId) {
+    try {
+      const cRes = await pool.query(
+        `SELECT phone FROM customers WHERE id = $1 LIMIT 1`,
+        [resolvedCustId]
+      );
+      const fromCol = normalizeEgyptianPhone(cRes.rows[0]?.phone);
+      if (fromCol) return fromCol;
+
+      const cpRes = await pool.query(
+        `SELECT phone FROM customer_phones WHERE customer_id = $1 ORDER BY id ASC`,
+        [resolvedCustId]
+      );
+      for (const r of cpRes.rows) {
+        const clean = normalizeEgyptianPhone(r.phone);
+        if (clean) return clean;
+      }
+    } catch (e) {
+      // continue to name lookup
+    }
+  }
+
+  const canonicalKey = getCustomerCanonicalKey(customerName);
+  if (canonicalKey) {
+    try {
+      const nameCustRes = await pool.query(
+        `SELECT id, phone FROM customers WHERE ${CUSTOMER_NAME_CANONICAL_SQL('name')} = $1 ORDER BY id ASC LIMIT 1`,
+        [canonicalKey]
+      );
+      if (nameCustRes.rows.length > 0) {
+        resolvedCustId = resolvedCustId || Number(nameCustRes.rows[0].id);
+        const fromCol = normalizeEgyptianPhone(nameCustRes.rows[0].phone);
+        if (fromCol) return fromCol;
+
+        const cpRes = await pool.query(
+          `SELECT phone FROM customer_phones WHERE customer_id = $1 ORDER BY id ASC`,
+          [nameCustRes.rows[0].id]
+        );
+        for (const r of cpRes.rows) {
+          const clean = normalizeEgyptianPhone(r.phone);
+          if (clean) return clean;
+        }
+      }
+
+      const invPhoneRes = await pool.query(
+        `SELECT customer_phone FROM invoices
+         WHERE ${CUSTOMER_NAME_CANONICAL_SQL('customer_name')} = $1
+           AND customer_phone IS NOT NULL
+           AND BTRIM(customer_phone) <> ''
+         ORDER BY id DESC LIMIT 5`,
+        [canonicalKey]
+      );
+      for (const r of invPhoneRes.rows) {
+        const clean = normalizeEgyptianPhone(r.customer_phone);
+        if (clean) return clean;
+      }
+    } catch (e) {
+      // ignore non-critical lookup failures
+    }
+  }
+
+  return null;
+}
+
+async function computePaymentAccountSnapshot({ branchId, customerName, cashInId }) {
+  const canonicalKey = getCustomerCanonicalKey(customerName);
+  if (!canonicalKey) return null;
+
+  try {
+    const isBranch1 = Number(branchId) === 1;
+    const prevBalCol = isBranch1 ? 'i.previous_balance' : '0 AS previous_balance';
+    const branchFilterInv = branchId ? 'AND i.branch_id = $2' : '';
+    const branchFilterPay = branchId ? 'AND cp.branch_id = $2' : '';
+    const params = branchId ? [canonicalKey, Number(branchId)] : [canonicalKey];
+
+    const res = await pool.query(
+      `
+      SELECT
+        'invoice' AS record_type,
+        i.id AS record_id,
+        to_char(i.invoice_date, 'YYYY-MM-DD') AS record_date,
+        i.paid_amount,
+        i.remaining_amount,
+        ${prevBalCol},
+        to_char(i.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+      FROM invoices i
+      WHERE i.customer_name IS NOT NULL
+        AND BTRIM(i.customer_name) <> ''
+        AND ${CUSTOMER_NAME_CANONICAL_SQL('i.customer_name')} = $1
+        AND i.movement_type = 'sale'
+        AND i.is_void = false
+        ${branchFilterInv}
+
+      UNION ALL
+
+      SELECT
+        'payment' AS record_type,
+        cp.id AS record_id,
+        to_char(COALESCE(cp.transaction_date, cp.created_at::date), 'YYYY-MM-DD') AS record_date,
+        cp.amount AS paid_amount,
+        0 AS remaining_amount,
+        0 AS previous_balance,
+        to_char(cp.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+      FROM cash_in cp
+      WHERE cp.source_type = 'customer_payment'
+        AND cp.customer_name IS NOT NULL
+        AND BTRIM(cp.customer_name) <> ''
+        AND ${CUSTOMER_NAME_CANONICAL_SQL('cp.customer_name')} = $1
+        ${branchFilterPay}
+      `,
+      params
+    );
+
+    const toNum = (v) => {
+      const n = Number(v ?? 0);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const balancesMatch = (a, b) => Math.abs(toNum(a) - toNum(b)) <= 0.01;
+
+    const indexed = res.rows.map((row, index) => ({ row, index }));
+    indexed.sort((a, b) => {
+      const d = (a.row.record_date || '').localeCompare(b.row.record_date || '');
+      if (d !== 0) return d;
+      const t = (a.row.created_at || '').localeCompare(b.row.created_at || '');
+      if (t !== 0) return t;
+      return a.index - b.index;
+    });
+
+    let currentBalance = 0;
+    let start = 0;
+    while (start < indexed.length) {
+      const dayKey = (indexed[start].row.record_date || '').substring(0, 10);
+      let end = start;
+      while (end < indexed.length && (indexed[end].row.record_date || '').substring(0, 10) === dayKey) {
+        end++;
+      }
+
+      const dayRows = indexed.slice(start, end).map((e) => e.row);
+      while (dayRows.length > 0) {
+        let nextIdx = dayRows.findIndex(
+          (r) => r.record_type === 'invoice' && balancesMatch(r.previous_balance, currentBalance)
+        );
+        if (nextIdx === -1) {
+          nextIdx = dayRows.findIndex(
+            (r) =>
+              r.record_type !== 'invoice' &&
+              dayRows.some(
+                (c) =>
+                  c.record_type === 'invoice' &&
+                  balancesMatch(c.previous_balance, currentBalance - toNum(r.paid_amount))
+              )
+          );
+        }
+        if (nextIdx === -1) nextIdx = 0;
+        const [row] = dayRows.splice(nextIdx, 1);
+
+        if (row.record_type === 'invoice') {
+          currentBalance =
+            row.previous_balance != null ? toNum(row.remaining_amount) : currentBalance + toNum(row.remaining_amount);
+        } else {
+          const paid = toNum(row.paid_amount);
+          const before = Math.round(currentBalance * 100) / 100;
+          currentBalance -= paid;
+          const after = Math.round(currentBalance * 100) / 100;
+          if (Number(row.record_id) === Number(cashInId)) {
+            return {
+              previousBalance: before,
+              paidAmount: paid,
+              remainingBalance: after,
+            };
+          }
+        }
+      }
+      start = end;
+    }
+  } catch (err) {
+    console.warn(`[QuazLink] Could not compute payment balance snapshot for cash_in #${cashInId}:`, err.message);
+  }
+  return null;
+}
+
+/**
+ * Dispatches WhatsApp confirmation & account balance details for a Customer Payment (سند دفع عميل).
+ */
+async function dispatchCustomerPaymentWhatsApp({
+  cashInId,
+  branchId,
+  customerId,
+  customerName,
+  customerPhone,
+  amount,
+  transactionDate,
+  description,
+  previousBalance,
+  remainingBalance,
+  currency = 'ج.م',
+  force = false,
+}) {
+  if (!QUAZLINK_CONFIG.enabled) {
+    console.log(`[QuazLink] Service disabled by configuration. Skipping payment #${cashInId}`);
+    return { success: false, reason: 'disabled', error: 'خدمة QuazLink معطلة' };
+  }
+
+  const id = Number(cashInId);
+  if (!id) {
+    return { success: false, reason: 'invalid_payment_id', error: 'معرف السند غير صحيح' };
+  }
+
+  const now = Date.now();
+  const lastSent = recentPaymentSendsCache.get(id);
+  if (!force && lastSent && (now - lastSent) < 30000) {
+    console.log(`[QuazLink] Anti-spam debounce triggered for payment #${id}. Skipping duplicate send.`);
+    return { success: false, reason: 'debounced' };
+  }
+
+  let targetBranchId = branchId;
+  let targetCustomerId = customerId;
+  let targetName = customerName;
+  let targetAmount = amount;
+  let targetDate = transactionDate;
+  let targetDesc = description;
+  let targetSourceType = 'customer_payment';
+
+  if (
+    !targetBranchId ||
+    !targetName ||
+    targetAmount === undefined ||
+    targetAmount === null ||
+    !targetDate
+  ) {
+    const rowRes = await pool.query(
+      `SELECT id, branch_id, customer_id, customer_name, amount, paid_amount, remaining_amount,
+              to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM-DD') AS tx_date,
+              COALESCE(notes, description) AS desc_text, source_type
+       FROM cash_in WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    if (rowRes.rows.length === 0) {
+      return { success: false, reason: 'not_found', error: 'السند غير موجود' };
+    }
+    const row = rowRes.rows[0];
+    targetSourceType = row.source_type;
+    targetBranchId = targetBranchId || Number(row.branch_id);
+    targetCustomerId = targetCustomerId || row.customer_id;
+    targetName = targetName || row.customer_name;
+    if (targetAmount === undefined || targetAmount === null) {
+      targetAmount = Number(row.paid_amount ?? row.amount ?? 0);
+    }
+    targetDate = targetDate || row.tx_date;
+    if (targetDesc === undefined || targetDesc === null) {
+      targetDesc = row.desc_text;
+    }
+  }
+
+  if (targetSourceType !== 'customer_payment' || String(targetDesc || '').includes('{{discount_diff}}')) {
+    return { success: false, reason: 'not_customer_payment', error: 'هذا القيد ليس سند دفع عميل' };
+  }
+
+  const cleanPhone = await resolveCustomerPhone({
+    customerId: targetCustomerId,
+    customerName: targetName,
+    explicitPhone: customerPhone,
+  });
+
+  await ensureCashInWhatsAppColumns();
+
+  if (!cleanPhone) {
+    console.log(`[QuazLink] Payment #${id} for "${targetName}" has no valid mobile phone. Skipping.`);
+    try {
+      await pool.query(
+        `UPDATE cash_in
+         SET whatsapp_status = 'skipped',
+             whatsapp_error = 'لا يوجد رقم هاتف صالح مسجل لهذا العميل'
+         WHERE id = $1`,
+        [id]
+      );
+    } catch {
+      // ignore non-critical column update error
+    }
+    return {
+      success: false,
+      reason: 'no_valid_phone',
+      error: 'لا يوجد رقم هاتف مسجل لهذا العميل لإرسال رسالة واتساب',
+    };
+  }
+
+  let resolvedPrevious =
+    previousBalance !== undefined && previousBalance !== null && Number.isFinite(Number(previousBalance))
+      ? Number(previousBalance)
+      : undefined;
+  let resolvedRemaining =
+    remainingBalance !== undefined && remainingBalance !== null && Number.isFinite(Number(remainingBalance))
+      ? Number(remainingBalance)
+      : undefined;
+
+  if (resolvedPrevious === undefined || resolvedRemaining === undefined) {
+    const snap = await computePaymentAccountSnapshot({
+      branchId: targetBranchId,
+      customerName: targetName,
+      cashInId: id,
+    });
+    if (snap) {
+      if (resolvedPrevious === undefined) resolvedPrevious = snap.previousBalance;
+      if (resolvedRemaining === undefined) resolvedRemaining = snap.remainingBalance;
+    } else if (resolvedPrevious !== undefined && resolvedRemaining === undefined) {
+      resolvedRemaining = Math.round((resolvedPrevious - Number(targetAmount || 0)) * 100) / 100;
+    }
+  }
+
+  const isNewCustomer = await isFirstWhatsAppForPhone(cleanPhone);
+  const { voucherNumber, displayName, templateIndex, message: customMessage } = buildCustomerPaymentMessage({
+    cashInId: id,
+    branchId: targetBranchId,
+    customerName: targetName,
+    transactionDate: targetDate,
+    previousBalance: resolvedPrevious,
+    paidAmount: targetAmount,
+    remainingBalance: resolvedRemaining,
+    description: targetDesc,
+    currency,
+    isNewCustomer,
+  });
+
+  const isWholesale = Number(targetBranchId) === 2;
+  const senderStoreName = isWholesale
+    ? 'معرض آل عاشور عدس - كبار العملاء والتوزيع'
+    : QUAZLINK_CONFIG.storeName;
+  const formattedPaid = formatAmount(targetAmount);
+
+  console.log(
+    `[QuazLink] 🚀 Dispatching WhatsApp payment #${id} (branch=${targetBranchId}, template #${templateIndex + 1}) to ${maskPhone(cleanPhone)} (${displayName}, ${formattedPaid} ${currency})...`
+  );
+
+  try {
+    const result = await postToQuazLink({
+      phone: cleanPhone,
+      customerName: displayName,
+      invoiceNumber: voucherNumber,
+      amount: formattedPaid,
+      currency,
+      message: customMessage,
+      storeName: senderStoreName,
+      companyName: senderStoreName,
+      company: senderStoreName,
+      store: senderStoreName,
+    });
+
+    if (result.statusCode >= 200 && result.statusCode < 300 && result.data?.success) {
+      console.log(`[QuazLink] ✅ Payment #${id} successfully dispatched to WhatsApp! Job ID: ${result.data.jobId}`);
+      recentPaymentSendsCache.set(id, now);
+
+      try {
+        await pool.query(
+          `UPDATE cash_in
+           SET whatsapp_status = 'sent',
+               whatsapp_phone = $1,
+               whatsapp_sent_at = NOW(),
+               whatsapp_error = NULL
+           WHERE id = $2`,
+          [cleanPhone, id]
+        );
+      } catch {
+        // ignore non-critical column update error
+      }
+
+      return {
+        success: true,
+        jobId: result.data.jobId,
+        deliveryMode: result.data.deliveryMode,
+        phone: cleanPhone,
+        previousBalance: resolvedPrevious,
+        remainingBalance: resolvedRemaining,
+      };
+    }
+
+    const errMsg = result.data?.message || result.raw || `HTTP status ${result.statusCode}`;
+    console.warn(`[QuazLink] ⚠️ WhatsApp dispatch returned error for payment #${id}:`, errMsg);
+
+    try {
+      await pool.query(
+        `UPDATE cash_in
+         SET whatsapp_status = 'failed',
+             whatsapp_phone = $1,
+             whatsapp_error = $2
+         WHERE id = $3`,
+        [cleanPhone, errMsg.slice(0, 500), id]
+      );
+    } catch {
+      // ignore non-critical column update error
+    }
+
+    return { success: false, error: errMsg };
+  } catch (netErr) {
+    console.error(`[QuazLink] ❌ Network error dispatching WhatsApp for payment #${id}:`, netErr.message);
+
+    try {
+      await pool.query(
+        `UPDATE cash_in
+         SET whatsapp_status = 'failed',
+             whatsapp_phone = $1,
+             whatsapp_error = $2
+         WHERE id = $3`,
+        [cleanPhone, netErr.message.slice(0, 500), id]
+      );
+    } catch {
+      // ignore non-critical column update error
+    }
+
+    return { success: false, error: netErr.message };
+  }
+}
+
 module.exports = {
   dispatchInvoiceWhatsApp,
   resendInvoiceWhatsApp,
+  dispatchCustomerPaymentWhatsApp,
+  buildCustomerPaymentMessage,
+  buildCustomerPaymentBlock,
+  resolveCustomerPhone,
   normalizeEgyptianPhone,
   maskPhone,
   isFirstWhatsAppForPhone,

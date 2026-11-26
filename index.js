@@ -12791,6 +12791,8 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       notes,
       source_type,
       remaining_amount,
+      previous_balance,
+      send_whatsapp,
     } = req.body;
 
     if (!branch_id || !amount || Number(amount) <= 0) {
@@ -12861,13 +12863,133 @@ app.post("/cash/in", authMiddleware, async (req, res) => {
       ],
     );
 
+    const cashInId = result.rows[0].id;
+    const rawDescText = `${notes || ""} ${description || ""}`;
+    const shouldAutoWhatsApp =
+      source_type === "customer_payment" &&
+      send_whatsapp !== false &&
+      !rawDescText.includes("{{discount_diff}}");
+
     res.json({
       success: true,
-      cash_in_id: result.rows[0].id,
+      cash_in_id: cashInId,
+      customer_id: resolvedCustomerId,
     });
+
+    if (shouldAutoWhatsApp) {
+      const hasPrevBal =
+        previous_balance !== undefined &&
+        previous_balance !== null &&
+        Number.isFinite(Number(previous_balance));
+      const hasRemBal =
+        remaining_amount !== undefined &&
+        remaining_amount !== null &&
+        Number.isFinite(Number(remaining_amount));
+
+      setImmediate(() => {
+        quazlinkService
+          .dispatchCustomerPaymentWhatsApp({
+            cashInId,
+            branchId: Number(branch_id),
+            customerId: resolvedCustomerId,
+            customerName: resolvedCustomerName,
+            amount: Number(amount),
+            transactionDate: transaction_date || getCairoDate(),
+            description: notes || description || "",
+            previousBalance: hasPrevBal ? Number(previous_balance) : undefined,
+            remainingBalance: hasRemBal
+              ? Number(remaining_amount)
+              : hasPrevBal
+                ? Math.round((Number(previous_balance) - Number(amount)) * 100) / 100
+                : undefined,
+          })
+          .catch((err) => {
+            console.error("[QuazLink] Customer payment WhatsApp error:", err.message);
+          });
+      });
+    }
   } catch (err) {
     console.error("CASH IN ERROR:", err);
     res.status(500).json({ error: "فشل إضافة الوارد" });
+  }
+});
+
+app.post("/cash/in/:id/send-whatsapp", authMiddleware, async (req, res) => {
+  try {
+    const cashInId = Number(req.params.id);
+    if (!Number.isInteger(cashInId) || cashInId <= 0) {
+      return res.status(400).json({ error: "معرف السند غير صحيح" });
+    }
+
+    const rowRes = await pool.query(
+      `SELECT id, branch_id, customer_id, customer_name, amount, paid_amount, remaining_amount,
+              to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM-DD') AS tx_date,
+              COALESCE(notes, description) AS desc_text, source_type
+       FROM cash_in WHERE id = $1 LIMIT 1`,
+      [cashInId],
+    );
+
+    if (!rowRes.rows.length) {
+      return res.status(404).json({ error: "السند غير موجود" });
+    }
+
+    const row = rowRes.rows[0];
+    if (
+      Number(row.branch_id) !== Number(req.user.branch_id) &&
+      req.user.role !== "admin"
+    ) {
+      return res.status(403).json({ error: "غير مصرح بإرسال هذا السند" });
+    }
+
+    if (
+      row.source_type !== "customer_payment" ||
+      String(row.desc_text || "").includes("{{discount_diff}}")
+    ) {
+      return res.status(400).json({ error: "هذا القيد ليس سند دفع عميل" });
+    }
+
+    const bodyPrev = req.body?.previous_balance;
+    const bodyRem = req.body?.remaining_balance;
+    const hasPrev =
+      bodyPrev !== undefined && bodyPrev !== null && Number.isFinite(Number(bodyPrev));
+    const hasRem =
+      bodyRem !== undefined && bodyRem !== null && Number.isFinite(Number(bodyRem));
+
+    const result = await quazlinkService.dispatchCustomerPaymentWhatsApp({
+      cashInId: row.id,
+      branchId: Number(row.branch_id),
+      customerId: row.customer_id,
+      customerName: row.customer_name,
+      amount: Number(row.paid_amount ?? row.amount ?? 0),
+      transactionDate: row.tx_date,
+      description: row.desc_text,
+      previousBalance: hasPrev ? Number(bodyPrev) : undefined,
+      remainingBalance: hasRem ? Number(bodyRem) : undefined,
+      force: true,
+    });
+
+    if (!result.success) {
+      const statusCode =
+        result.reason === "no_valid_phone" || result.reason === "not_customer_payment"
+          ? 400
+          : 502;
+      return res.status(statusCode).json({
+        success: false,
+        error: result.error || "فشل إرسال إشعار الواتساب عبر QuazLink",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "تم إرسال تأكيد الدفعة عبر واتساب بنجاح!",
+      phone: result.phone,
+      jobId: result.jobId,
+      previousBalance: result.previousBalance,
+      remainingBalance: result.remainingBalance,
+    });
+  } catch (err) {
+    console.error("[QuazLink] Manual customer payment WhatsApp error:", err.message);
+    res.status(500).json({ error: "فشل إرسال تأكيد الدفعة عبر واتساب" });
   }
 });
 
