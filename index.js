@@ -14404,6 +14404,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
 
   try {
     const itemId = Number(req.params.itemId);
+    const rawCancelQty = req.body?.cancel_quantity;
 
     if (!itemId) {
       return res.status(400).json({ error: "معرف الصنف غير صحيح" });
@@ -14423,6 +14424,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
         sti.to_warehouse_id,
         sti.from_quantity,
         sti.to_quantity,
+        sti.total_price,
         sti.status
       FROM stock_transfer_items sti
       WHERE sti.id = $1
@@ -14440,6 +14442,59 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
     if (item.status === "cancelled") {
       throw new Error("تم إلغاء هذا الصنف مسبقًا");
     }
+
+    const origFromQty = Number(item.from_quantity || 0);
+    const origToQty = Number(item.to_quantity || 0);
+    const origTotalPrice = Number(item.total_price || 0);
+
+    if (origFromQty <= 0 || origToQty <= 0) {
+      throw new Error("كمية الصنف في التحويل غير صالحة للإلغاء");
+    }
+
+    const hasExplicitQty =
+      rawCancelQty !== undefined && rawCancelQty !== null && rawCancelQty !== "";
+    const requestedFromQty = hasExplicitQty ? Number(rawCancelQty) : origFromQty;
+
+    if (
+      !Number.isFinite(requestedFromQty) ||
+      requestedFromQty <= 0 ||
+      requestedFromQty > origFromQty
+    ) {
+      throw new Error(
+        `الكمية المطلوب إلغاؤها غير صحيحة (المتاح في التحويل: ${origFromQty})`,
+      );
+    }
+
+    if (Number.isInteger(origFromQty) && !Number.isInteger(requestedFromQty)) {
+      throw new Error("يجب إدخال كمية صحيحة بدون كسور للإلغاء");
+    }
+
+    const isFullCancel = Math.abs(requestedFromQty - origFromQty) < 1e-6;
+    const cancelFromQty = isFullCancel ? origFromQty : requestedFromQty;
+
+    let cancelToQty = origToQty;
+    if (!isFullCancel) {
+      const rawCancelToQty = (origToQty * cancelFromQty) / origFromQty;
+      const roundedCancelToQty = Math.round(rawCancelToQty);
+      if (
+        Math.abs(rawCancelToQty - roundedCancelToQty) > 1e-6 ||
+        roundedCancelToQty <= 0 ||
+        roundedCancelToQty >= origToQty
+      ) {
+        throw new Error(
+          "لا يمكن إلغاء هذه الكمية جزئيًا لأن التحويل للمخزن المستلم ينتج كسوراً",
+        );
+      }
+      cancelToQty = roundedCancelToQty;
+    }
+
+    const remainingFromQty = isFullCancel
+      ? 0
+      : Math.round((origFromQty - cancelFromQty) * 1000) / 1000;
+    const remainingToQty = isFullCancel ? 0 : origToQty - cancelToQty;
+    const remainingTotalPrice = isFullCancel
+      ? origTotalPrice
+      : Math.round(((origTotalPrice * remainingFromQty) / origFromQty) * 100) / 100;
 
     // 1.5️⃣ اقفل رأس التحويل لتفادي سباق الإلغاء الكلي مع إلغاء الصنف
     const transferLockRes = await client.query(
@@ -14460,23 +14515,23 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       throw new Error("التحويل ملغي بالفعل");
     }
 
-    // 2️⃣ تأكد إن رصيد المخزن الهدف يسمح بالعكس
+    // 2️⃣ تأكد إن رصيد المخزن الهدف يسمح بالعكس (مع قفل الصف)
     const targetProdId = Number(item.target_product_id || item.product_id);
     const targetStockRes = await client.query(
       `
-      SELECT SUM(quantity) AS quantity
+      SELECT quantity
       FROM stock
       WHERE warehouse_id = $1 AND product_id = $2 AND variant_id = 0
+      FOR UPDATE
       `,
       [item.to_warehouse_id, targetProdId],
     );
 
     const availableTargetQty = Number(targetStockRes.rows[0]?.quantity || 0);
-    const requiredTargetQty = Number(item.to_quantity || 0);
 
-    if (availableTargetQty < requiredTargetQty) {
+    if (availableTargetQty < cancelToQty) {
       throw new Error(
-        `لا يمكن إلغاء الصنف: رصيد المخزن المستلم غير كافي (المتاح: ${availableTargetQty}، المطلوب: ${requiredTargetQty})`,
+        `لا يمكن إلغاء الصنف: رصيد المخزن المستلم غير كافي (المتاح: ${availableTargetQty}، المطلوب: ${cancelToQty})`,
       );
     }
 
@@ -14498,7 +14553,7 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = $4
       `,
       [
-        item.from_quantity,
+        cancelFromQty,
         item.from_warehouse_id,
         item.product_id,
         actualVariantId,
@@ -14512,10 +14567,17 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       SET quantity = quantity - $1
       WHERE warehouse_id = $2 AND product_id = $3 AND variant_id = 0
       `,
-      [item.to_quantity, item.to_warehouse_id, targetProdId],
+      [cancelToQty, item.to_warehouse_id, targetProdId],
     );
 
     // 4️⃣ تسجيل حركات المخزن (عكسية)
+
+    const wholesaleMoveNote = isFullCancel
+      ? "إلغاء صنف من تحويل – رجوع للمخزن الأصلي"
+      : `إلغاء جزئي (${cancelFromQty} من ${origFromQty}) لصنف من تحويل – رجوع للمخزن الأصلي`;
+    const retailMoveNote = isFullCancel
+      ? "إلغاء صنف من تحويل – خصم من المخزن المستلم"
+      : `إلغاء جزئي (${cancelToQty} من ${origToQty}) لصنف من تحويل – خصم من المخزن المستلم`;
 
     // دخول للمخزن الأصلي
     await client.query(
@@ -14537,9 +14599,9 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
         item.from_warehouse_id,
         item.product_id,
         actualVariantId,
-        item.from_quantity,
+        cancelFromQty,
         item.id,
-        "إلغاء صنف من تحويل – رجوع للمخزن الأصلي",
+        wholesaleMoveNote,
       ],
     );
 
@@ -14562,49 +14624,83 @@ app.post("/stock-transfers/items/:itemId/cancel", async (req, res) => {
       [
         item.to_warehouse_id,
         targetProdId,
-        item.to_quantity,
+        cancelToQty,
         item.id,
-        "إلغاء صنف من تحويل – خصم من المخزن المستلم",
+        retailMoveNote,
       ],
     );
 
-    // 5️⃣ تحديث حالة الصنف
-    await client.query(
-      `
-      UPDATE stock_transfer_items
-      SET status = 'cancelled'
-      WHERE id = $1
-      `,
-      [itemId],
-    );
-
-    // لو مفيش أي بنود نشطة بعد الإلغاء، اقفل رأس التحويل تلقائيًا
-    const remainingActiveItemsRes = await client.query(
-      `
-      SELECT COUNT(*)::int AS cnt
-      FROM stock_transfer_items
-      WHERE transfer_id = $1
-        AND COALESCE(status, 'active') = 'active'
-      `,
-      [item.transfer_id],
-    );
-
-    if ((remainingActiveItemsRes.rows[0]?.cnt || 0) === 0) {
+    // 5️⃣ تحديث حالة / كميات الصنف
+    if (isFullCancel) {
       await client.query(
         `
-        UPDATE stock_transfers
+        UPDATE stock_transfer_items
         SET status = 'cancelled'
         WHERE id = $1
         `,
+        [itemId],
+      );
+
+      // لو مفيش أي بنود نشطة بعد الإلغاء، اقفل رأس التحويل تلقائيًا
+      const remainingActiveItemsRes = await client.query(
+        `
+        SELECT COUNT(*)::int AS cnt
+        FROM stock_transfer_items
+        WHERE transfer_id = $1
+          AND COALESCE(status, 'active') = 'active'
+        `,
         [item.transfer_id],
+      );
+
+      if ((remainingActiveItemsRes.rows[0]?.cnt || 0) === 0) {
+        await client.query(
+          `
+          UPDATE stock_transfers
+          SET status = 'cancelled'
+          WHERE id = $1
+          `,
+          [item.transfer_id],
+        );
+      }
+    } else {
+      await client.query(
+        `
+        UPDATE stock_transfer_items
+        SET from_quantity = $1,
+            to_quantity = $2,
+            total_price = $3
+        WHERE id = $4
+        `,
+        [remainingFromQty, remainingToQty, remainingTotalPrice, itemId],
       );
     }
 
     await client.query("COMMIT");
 
+    const broadcast = req.app?.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("data:stock", {
+        action: isFullCancel
+          ? "transfer_item_cancelled"
+          : "transfer_item_partial_cancelled",
+        transfer_id: item.transfer_id,
+        item_id: itemId,
+        cancelled_from_quantity: cancelFromQty,
+        cancelled_to_quantity: cancelToQty,
+        ts: Date.now(),
+      });
+    }
+
     res.json({
       success: true,
-      message: "تم إلغاء الصنف بنجاح",
+      partial: !isFullCancel,
+      cancelled_from_quantity: cancelFromQty,
+      cancelled_to_quantity: cancelToQty,
+      remaining_from_quantity: remainingFromQty,
+      remaining_to_quantity: remainingToQty,
+      message: isFullCancel
+        ? "تم إلغاء الصنف بالكامل بنجاح"
+        : `تم إلغاء ${cancelFromQty} من ${origFromQty} بنجاح (المتبقي في التحويل: ${remainingFromQty})`,
     });
   } catch (err) {
     await client.query("ROLLBACK");
