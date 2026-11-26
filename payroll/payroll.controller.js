@@ -1,5 +1,21 @@
 const pool = require("../db");
 
+let stopColsEnsured = false;
+
+async function ensureEmployeeStopColumns() {
+  if (stopColsEnsured) return;
+  try {
+    await pool.query(`
+      ALTER TABLE payroll_employees
+        ADD COLUMN IF NOT EXISTS stopped_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS stop_reason TEXT
+    `);
+    stopColsEnsured = true;
+  } catch (err) {
+    console.warn("[Payroll] Could not ensure employee stop columns:", err.message);
+  }
+}
+
 /**
  * Generate a consistent permission number matching cash_out standards
  */
@@ -73,6 +89,7 @@ function formatJobTitleWithPrefix(jobTitle) {
  */
 async function getEmployees(req, res) {
   try {
+    await ensureEmployeeStopColumns();
     const branchId = Number(req.query.branch_id) || 1;
     const status = req.query.status || "all";
 
@@ -91,7 +108,10 @@ async function getEmployees(req, res) {
       query += ` AND e.status = $2`;
     }
 
-    query += ` GROUP BY e.id ORDER BY e.id ASC`;
+    query += `
+      GROUP BY e.id
+      ORDER BY CASE WHEN e.status = 'active' THEN 0 ELSE 1 END ASC, e.id ASC
+    `;
 
     const result = await pool.query(query, params);
     res.json({ success: true, employees: result.rows });
@@ -160,6 +180,7 @@ async function createEmployee(req, res) {
  */
 async function updateEmployee(req, res) {
   try {
+    await ensureEmployeeStopColumns();
     const empId = Number(req.params.id);
     const {
       branch_id,
@@ -172,11 +193,21 @@ async function updateEmployee(req, res) {
       status,
       hire_date,
       notes,
+      stop_reason,
     } = req.body;
 
     if (!empId) {
       return res.status(400).json({ error: "معرف العامل غير صحيح" });
     }
+
+    if (status !== undefined && status !== null && !["active", "inactive"].includes(status)) {
+      return res.status(400).json({ error: "حالة العامل غير صالحة (يجب أن تكون active أو inactive)" });
+    }
+
+    const cleanStopReason =
+      stop_reason !== undefined && stop_reason !== null && String(stop_reason).trim()
+        ? String(stop_reason).trim()
+        : null;
 
     const result = await pool.query(
       `
@@ -192,6 +223,16 @@ async function updateEmployee(req, res) {
         status = COALESCE($8, status),
         hire_date = COALESCE($9::date, hire_date),
         notes = COALESCE($10, notes),
+        stopped_at = CASE
+          WHEN $8 = 'inactive' THEN COALESCE(stopped_at, NOW())
+          WHEN $8 = 'active' THEN NULL
+          ELSE stopped_at
+        END,
+        stop_reason = CASE
+          WHEN $8 = 'inactive' THEN COALESCE($12, stop_reason, 'تصفية حساب وإيقاف العمل')
+          WHEN $8 = 'active' THEN NULL
+          ELSE COALESCE($12, stop_reason)
+        END,
         updated_at = NOW()
       WHERE id = $11
       RETURNING *
@@ -208,6 +249,7 @@ async function updateEmployee(req, res) {
         hire_date || null,
         notes !== undefined ? notes : null,
         empId,
+        cleanStopReason,
       ],
     );
 
@@ -215,7 +257,19 @@ async function updateEmployee(req, res) {
       return res.status(404).json({ error: "العامل غير موجود" });
     }
 
-    res.json({ success: true, employee: result.rows[0] });
+    const updated = result.rows[0];
+    const broadcast = req.app?.get("broadcastRealtime");
+    if (typeof broadcast === "function") {
+      broadcast("data:payroll", {
+        action: "employee_updated",
+        branch_id: updated.branch_id,
+        employee_id: updated.id,
+        status: updated.status,
+        ts: Date.now(),
+      });
+    }
+
+    res.json({ success: true, employee: updated });
   } catch (err) {
     console.error("updateEmployee error:", err);
     res.status(500).json({ error: "فشل في تعديل بيانات العامل", details: err.message });
@@ -296,9 +350,9 @@ async function createAdvance(req, res) {
 
     await client.query("BEGIN");
 
-    // 1. Verify employee exists and belongs to branch
+    // 1. Verify employee exists, belongs to branch, and is active
     const empRes = await client.query(
-      "SELECT id, name, branch_id FROM payroll_employees WHERE id = $1 AND branch_id = $2",
+      "SELECT id, name, job_title, branch_id, status FROM payroll_employees WHERE id = $1 AND branch_id = $2",
       [safeEmpId, safeBranchId],
     );
     if (empRes.rows.length === 0) {
@@ -306,6 +360,12 @@ async function createAdvance(req, res) {
       return res.status(404).json({ error: "العامل غير موجود في هذا الفرع" });
     }
     const emp = empRes.rows[0];
+    if (emp.status !== "active") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `العامل [${emp.name}] موقوف / تم تصفية حسابه ولا يمكن تسجيل سلفة له. أعد تفعيله أولاً من سجل العمال إذا عاد للعمل.`,
+      });
+    }
 
     // 2. Optionally insert into cash_out if paid out of branch treasury
     let cashOutId = null;
@@ -529,11 +589,16 @@ async function createAdjustment(req, res) {
 
     // Verify employee exists and is active
     const empCheck = await pool.query(
-      "SELECT id, name, branch_id FROM payroll_employees WHERE id = $1 AND branch_id = $2",
+      "SELECT id, name, branch_id, status FROM payroll_employees WHERE id = $1 AND branch_id = $2",
       [empId, safeBranchId],
     );
     if (empCheck.rows.length === 0) {
       return res.status(404).json({ error: "العامل غير موجود في هذا الفرع" });
+    }
+    if (empCheck.rows[0].status !== "active") {
+      return res.status(400).json({
+        error: `العامل [${empCheck.rows[0].name}] موقوف / تم تصفية حسابه ولا يمكن تسجيل حافز أو خصم جديد له.`,
+      });
     }
 
     // Check if employee has an already paid record covering this date
@@ -1357,6 +1422,15 @@ async function confirmPayrollPayout(req, res) {
 
       // Enforce strict payroll day guard if paying cash for current cycle (Admins can override for early settlement)
       const isAdmin = Number(user.id) === 7 || user.role === "admin";
+      const activeEmpCheck = await client.query(
+        `SELECT id, name, status FROM payroll_employees WHERE id = $1 LIMIT 1`,
+        [empId],
+      );
+      if (activeEmpCheck.rows[0] && activeEmpCheck.rows[0].status !== "active") {
+        throw new Error(
+          `العامل [${activeEmpCheck.rows[0].name}] موقوف / تم تصفية حسابه ولا يمكن احتساب أو صرف راتبه.`,
+        );
+      }
       if (empScope !== "carry_forward" && !dayCheck.isPayrollDay && !isAdmin && !item.admin_override) {
         throw new Error(
           `غير مصرح بصرف راتب الفترة الحالية للعامل [${item.name || empId}] قبل موعد الصرف الرسمي (${dayCheck.reason})`
@@ -1936,6 +2010,11 @@ async function toggleAttendance(req, res) {
       return res.status(404).json({ error: "العامل غير موجود" });
     }
     const emp = empRes.rows[0];
+    if (emp.status !== "active") {
+      return res.status(400).json({
+        error: `العامل [${emp.name}] موقوف / تم تصفية حسابه ولا يمكن تسجيل حضور أو غياب له.`,
+      });
+    }
 
     // 2. Check if period covering this date is already paid
     const paidCheck = await client.query(
