@@ -502,7 +502,7 @@ async function computeHeavyAggregatesAsOf(asOfDate) {
         )::numeric AS net_delta
       FROM stock_movements sm
       LEFT JOIN invoices i ON i.id = sm.invoice_id
-      WHERE COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date) > $1::date
+      WHERE COALESCE(i.invoice_date, sm.created_at::date) > $1::date
         AND (i.id IS NULL OR i.is_void IS NOT TRUE)
       GROUP BY sm.warehouse_id, sm.product_id, COALESCE(sm.variant_id, 0)
     ),
@@ -1217,6 +1217,66 @@ function generateBucketKeys(windowFrom, windowTo, granularity) {
   return keys;
 }
 
+let validPgTimezonesPromise = null;
+const SAFE_IANA_TZ_REGEX = /^[A-Za-z0-9_+/.-]{1,64}$/;
+
+async function getValidPgTimezones() {
+  if (!validPgTimezonesPromise) {
+    validPgTimezonesPromise = pool
+      .query(`SELECT name FROM pg_timezone_names`)
+      .then((res) => new Set(res.rows.map((r) => r.name)))
+      .catch((err) => {
+        validPgTimezonesPromise = null;
+        throw err;
+      });
+  }
+  return validPgTimezonesPromise;
+}
+
+function parseClientTzOffsetMinutes(rawOffset) {
+  if (rawOffset === undefined || rawOffset === null || rawOffset === "") return null;
+  const num = Number(rawOffset);
+  if (!Number.isInteger(num) || num < -720 || num > 840) return null;
+  return num;
+}
+
+// `created_at` columns are `timestamp without time zone` written in Africa/Cairo session timezone (see db.js).
+// Convert from Africa/Cairo instant to the open device's timezone/offset so hourly buckets match device time.
+async function resolveHourlyDeviceContext(req) {
+  const rawTz = typeof req.query.tz === "string" ? req.query.tz.trim() : "";
+  const offsetMins = parseClientTzOffsetMinutes(req.query.tz_offset);
+
+  if (rawTz && SAFE_IANA_TZ_REGEX.test(rawTz)) {
+    try {
+      const validTzs = await getValidPgTimezones();
+      if (validTzs.has(rawTz)) {
+        return {
+          cacheKey: `tz:${rawTz}`,
+          toDeviceTsExpr: (col) =>
+            rawTz === "Africa/Cairo"
+              ? col
+              : `((${col} AT TIME ZONE 'Africa/Cairo') AT TIME ZONE '${rawTz}')`,
+        };
+      }
+    } catch {
+      // Fall through to numeric UTC offset or Cairo default
+    }
+  }
+
+  if (offsetMins !== null) {
+    return {
+      cacheKey: `off:${offsetMins}`,
+      toDeviceTsExpr: (col) =>
+        `((${col} AT TIME ZONE 'Africa/Cairo') AT TIME ZONE 'UTC' + (${offsetMins} * INTERVAL '1 minute'))`,
+    };
+  }
+
+  return {
+    cacheKey: "tz:Africa/Cairo",
+    toDeviceTsExpr: (col) => col,
+  };
+}
+
 async function getOwnerTrends(req, res) {
   try {
     const periodParam = req.query.period || "today";
@@ -1248,7 +1308,11 @@ async function getOwnerTrends(req, res) {
       else granularity = "day";
     }
 
-    const cacheKey = `${windowFrom}_${windowTo}_${granularity}_${dateRange.from}_${dateRange.to}`;
+    const isHourly = granularity === "hour";
+    const deviceTzCtx = isHourly ? await resolveHourlyDeviceContext(req) : null;
+    const deviceTzKey = deviceTzCtx ? deviceTzCtx.cacheKey : "daily";
+
+    const cacheKey = `${windowFrom}_${windowTo}_${granularity}_${dateRange.from}_${dateRange.to}_${deviceTzKey}`;
     const now = Date.now();
     if (!forceRefresh) {
       const cached = ownerTrendsCache.get(cacheKey);
@@ -1273,29 +1337,28 @@ async function getOwnerTrends(req, res) {
     }
 
     const bucketKeys = generateBucketKeys(windowFrom, windowTo, granularity);
-    const isHourly = granularity === "hour";
 
     const invBucketExpr = isHourly
-      ? `to_char((created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo'), 'HH24') || ':00'`
+      ? `to_char(${deviceTzCtx.toDeviceTsExpr("created_at")}, 'HH24') || ':00'`
       : granularity === "month"
       ? `to_char(invoice_date, 'YYYY-MM')`
       : `to_char(invoice_date, 'YYYY-MM-DD')`;
 
     const ciBucketExpr = isHourly
-      ? `to_char((created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo'), 'HH24') || ':00'`
+      ? `to_char(${deviceTzCtx.toDeviceTsExpr("created_at")}, 'HH24') || ':00'`
       : granularity === "month"
       ? `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM')`
       : `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM-DD')`;
 
     const coBucketExpr = isHourly
-      ? `to_char((created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo'), 'HH24') || ':00'`
+      ? `to_char(${deviceTzCtx.toDeviceTsExpr("created_at")}, 'HH24') || ':00'`
       : granularity === "month"
       ? `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM')`
       : `to_char(COALESCE(transaction_date, created_at::date), 'YYYY-MM-DD')`;
 
     const smBucketExpr = granularity === "month"
-      ? `to_char(COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date), 'YYYY-MM')`
-      : `to_char(COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date), 'YYYY-MM-DD')`;
+      ? `to_char(COALESCE(i.invoice_date, sm.created_at::date), 'YYYY-MM')`
+      : `to_char(COALESCE(i.invoice_date, sm.created_at::date), 'YYYY-MM-DD')`;
 
     const [
       openingInRes,
@@ -1413,8 +1476,8 @@ async function getOwnerTrends(req, res) {
              JOIN products p ON p.id = sm.product_id
              LEFT JOIN product_variants pv ON pv.id = NULLIF(COALESCE(sm.variant_id, 0), 0)
              LEFT JOIN invoices i ON i.id = sm.invoice_id
-             WHERE COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date) >= $1::date
-               AND COALESCE(i.invoice_date, (sm.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Cairo')::date) <= $2::date
+             WHERE COALESCE(i.invoice_date, sm.created_at::date) >= $1::date
+               AND COALESCE(i.invoice_date, sm.created_at::date) <= $2::date
                AND (i.id IS NULL OR i.is_void IS NOT TRUE)
                AND p.is_active = true
              GROUP BY sm.warehouse_id, bucket`,
